@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         FTP Advisor
 // @namespace    http://tampermonkey.net/
-// @version      7.0
+// @version      7.1
 // @description  Comprehensive tactical advisor for From the Pavilion cricket game (v7.0: full UI redesign with modern navy+gold theme, reusable createPanel() helper, stat badges, rec cards, and component library; v6.6: added a Youth Development Curve check on the Training page; v6.5: fixed finance parsing, removed gold captain highlight, fatigue-aware bowling spell length; v6.4: unstyled panels fixed; v6.3: tactics advisor now loads on game.htm?gameId=...; v6.2: club.htm data-status dashboard; v6.1: training uses age-decay/skill-slowdown/talent-bonus data from the user's FTP_Training model)
 // @author       You
 // @license      MIT
@@ -1123,10 +1123,15 @@
         const primary = Math.max(player.batting || 0, player.bowling || 0);
 
         // 1. Primary skill (0-5 points) — main factor
-        // Expert(9)=3, Outstanding(10)=3.5, Exceptional(11)=4, Spectacular(12)=4.5, WC+(13+)=5
+        // Expert(9)=3, Outstanding(10)=3.5, Spectacular(11)=4, Exceptional(12)=4.3, WC+(13+)=5
         // Below Expert: Reliable(7)=2, Accomplished(8)=2.5, Capable(6)=1.5, etc.
+        // Growth tapers above Spectacular(11): at the elite tail, one more
+        // skill tier is real but marginal on-field impact, and shouldn't
+        // outweigh a large gap in Rating/price/wage between two players
+        // who are both already comfortably elite (see ratingScore below).
         let primaryScore;
         if (primary >= 13) primaryScore = 5;
+        else if (primary >= 11) primaryScore = 4 + (primary - 11) * 0.3;
         else if (primary >= 9) primaryScore = 3 + (primary - 9) * 0.5;
         else if (primary >= 7) primaryScore = 2 + (primary - 7) * 0.25;
         else primaryScore = Math.max(0, primary * 0.3);
@@ -1179,8 +1184,21 @@
         const scoutCheck = checkScoutBenchmark(player);
         const scoutScore = scoutCheck.hasBenchmark && scoutCheck.passed ? 0.7 : 0;
 
+        // 7. Rating (0-1.5 points) — FTP's own hidden overall-quality
+        // score. Two players can look near-identical on the visible
+        // skill columns (or one can even edge the other on Primary) but
+        // differ meaningfully in hidden attributes that only surface in
+        // Rating. Band is 20,000 (typical senior transfer floor) to
+        // 55,000 (top-tier) — without this, ranking was blind to Rating
+        // entirely and could favor a lower-rated, pricier player over a
+        // higher-rated, cheaper one on a single skill-tier technicality.
+        let ratingScore = 0;
+        if (player.rating > 0) {
+            ratingScore = Math.max(0, Math.min(1.5, (player.rating - 20000) / 35000 * 1.5));
+        }
+
         // Total before cost adjustment
-        let total = primaryScore + surplusScore + ageScore + talentScore + fitScore + scoutScore;
+        let total = primaryScore + surplusScore + ageScore + talentScore + fitScore + scoutScore + ratingScore;
 
         // 7. Cost tiebreaker (-0.5 to 0.3) — optimize for quality per price.
         // Primary skill is the direct quality gate (the base, above), so
@@ -1201,9 +1219,9 @@
         }
 
         // Normalize to 1-10 scale
-        // Max possible ≈ 5 + 2 + 1.5 + 1 + 0.5 + 0.7 + 0.5 = 11.2
+        // Max possible ≈ 5 + 2 + 1.5 + 1 + 0.5 + 0.7 + 1.5 + 0.5 = 12.7
         // Min possible ≈ 0
-        const rank = Math.round(Math.max(1, Math.min(10, total * (10 / 11.2))));
+        const rank = Math.round(Math.max(1, Math.min(10, total * (10 / 12.7))));
         return rank;
     }
 
@@ -3726,9 +3744,9 @@ table.ftp-table {
 .ftp-rec {
   background: var(--vj-card); border: 1px solid var(--vj-border);
   border-left: 3px solid var(--vj-blue); border-radius: var(--vj-radius-sm);
-  padding: 10px 12px; margin: 6px 0; transition: all var(--vj-transition);
+  padding: 8px 10px; margin: 4px 0; transition: all var(--vj-transition);
 }
-.ftp-rec:hover { box-shadow: var(--vj-shadow); }
+.ftp-rec:hover { box-shadow: var(--vj-shadow); transform: translateX(1px); border-left-width: 4px; }
 .ftp-rec.critical { border-left-color: var(--vj-red); background: var(--vj-red-bg); border-color: var(--vj-red-border); }
 .ftp-rec.high { border-left-color: var(--vj-amber); background: var(--vj-amber-bg); border-color: var(--vj-amber-border); }
 .ftp-rec.medium { border-left-color: var(--vj-blue); background: var(--vj-blue-bg); border-color: var(--vj-blue-border); }
@@ -3743,7 +3761,7 @@ table.ftp-table {
 /* Stat rows */
 .ftp-stat-row {
   display: flex; justify-content: space-between; align-items: center;
-  padding: 5px 0; font-size: 11.5px; border-bottom: 1px solid var(--vj-border-light);
+  padding: 3px 0; font-size: 11.5px; border-bottom: 1px solid var(--vj-border-light);
 }
 .ftp-stat-row:last-child { border-bottom: none; }
 .ftp-stat-label { color: var(--vj-text-secondary); }
@@ -4392,7 +4410,7 @@ table.ftp-table {
         if (!hasSkills) {
             document.getElementById('ftp-training-stats').innerHTML = `
                 <div class="ftp-alert danger">
-                    <div><strong>No skill data available!</strong><div class="vj-text-xs vj-mt-4">The training page does NOT show player skills. You must visit the <a href="seniors.htm?squadViewId=2&teamId=1173" style="color:var(--vj-blue);">Senior Squad</a> or <a href="youths.htm?teamId=1173" style="color:var(--vj-blue);">Youth Squad</a> page FIRST to cache skill data.</div></div>
+                    <div><strong>No skill data available!</strong><div class="vj-text-xs vj-mt-4">The training page does NOT show player skills. You must visit the <a href="seniors.htm?squadViewId=2&teamId=${TEAM_ID}" style="color:var(--vj-blue);">Senior Squad</a> or <a href="youths.htm?teamId=${TEAM_ID}" style="color:var(--vj-blue);">Youth Squad</a> page FIRST to cache skill data.</div></div>
                 </div>`;
             document.getElementById('ftp-training-recs').innerHTML = '';
             document.getElementById('ftp-academy-rec').innerHTML = '';
@@ -5302,18 +5320,18 @@ table.ftp-table {
                             if (p.price) detailParts.push(`Price $${p.price.toLocaleString()}`);
                             if (detailsFetched && p.talents && p.talents.length > 0) detailParts.push(`<span style="color:var(--vj-gold);">${p.talents.join(', ')}</span>`);
 
-                            html += `<div class="ftp-rec low" style="padding:8px 10px;">
+                            html += `<div class="ftp-rec low" style="padding:6px 8px;margin:3px 0;">
                                 <div class="vj-flex-between">
                                     <span class="vj-fw-700" style="font-size:12px;">#${i+1} ${p.name} <span class="vj-text-xs vj-text-muted">(${p.age}yo)</span></span>
                                     <div style="display:flex;gap:4px;align-items:center;">
                                         <span class="ftp-stat-badge ${badgeClass}">${ev.verdict.toUpperCase()}</span>
                                     </div>
                                 </div>
-                                <div class="vj-text-xs vj-text-muted vj-mt-4" style="line-height:1.8;">
+                                <div class="vj-text-xs vj-text-muted" style="line-height:1.4;margin-top:2px;">
                                     ${detailParts.join(' \u00B7 ')}
                                 </div>
-                                ${ev.warnings.length > 0 ? `<div class="vj-text-xs vj-text-muted vj-mt-4" style="color:var(--vj-red);">\u26A0 ${ev.warnings.join(' \u00B7 ')}</div>` : ''}
-                                ${ev.strengths.length > 0 ? `<div class="vj-text-xs vj-text-muted vj-mt-4" style="color:var(--vj-green);">\u2713 ${ev.strengths.join(' \u00B7 ')}</div>` : ''}
+                                ${ev.warnings.length > 0 ? `<div class="vj-text-xs vj-text-muted" style="color:var(--vj-red);line-height:1.4;margin-top:2px;">\u26A0 ${ev.warnings.join(' \u00B7 ')}</div>` : ''}
+                                ${ev.strengths.length > 0 ? `<div class="vj-text-xs vj-text-muted" style="color:var(--vj-green);line-height:1.4;margin-top:2px;">\u2713 ${ev.strengths.join(' \u00B7 ')}</div>` : ''}
                             </div>`;
                         });
                     }
