@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         FTP Advisor
 // @namespace    http://tampermonkey.net/
-// @version      7.2
+// @version      7.3
 // @description  Comprehensive tactical advisor for From the Pavilion cricket game (v7.0: full UI redesign with modern navy+gold theme, reusable createPanel() helper, stat badges, rec cards, and component library; v6.6: added a Youth Development Curve check on the Training page; v6.5: fixed finance parsing, removed gold captain highlight, fatigue-aware bowling spell length; v6.4: unstyled panels fixed; v6.3: tactics advisor now loads on game.htm?gameId=...; v6.2: club.htm data-status dashboard; v6.1: training uses age-decay/skill-slowdown/talent-bonus data from the user's FTP_Training model)
 // @author       You
 // @license      MIT
@@ -667,17 +667,10 @@
     // ============================================================
     // CENTRALIZED DATA FETCHERS
     // ============================================================
-    // NOTE: opponent squad pages (viewing another team's seniors.htm/
-    // youths.htm) very likely don't expose the same 9 exact td.skills
-    // columns your own squad page does — FTP probably only shows
-    // name/age/bowler type for teams you don't own, gating exact skill
-    // numbers behind an in-game scout mechanic. Previously this function
-    // hard-discarded (returned null for) ANY row without all 9 skill
-    // cells, which silently turned every opponent scout into 0 players.
-    // Now a row with a valid player link is always kept — skills just
-    // come back as 0/unknown (via skillLabel's atrocious=0 default) when
-    // not visible, same defensive pattern as parseTransferRow's lazy
-    // wage/experience fields. hasFullSkills flags which case you're in.
+    // Your own squad page (squadViewId=2 grid view) shows the full
+    // 9-column skill breakdown: endurance, batting, bowling, technique,
+    // power, keeping, fielding, captaincy, experience — each tagged
+    // td.skills, in that fixed order.
     function parsePlayerRow(row) {
         const nameLink = row.querySelector('a.player');
         if (!nameLink) return null;
@@ -686,7 +679,6 @@
         const bowlerTypeSpan = row.querySelector('span.bowlerType');
         const bowlerType = bowlerTypeSpan ? bowlerTypeSpan.textContent.trim() : '';
         const skillCells = row.querySelectorAll('td.skills');
-        const hasFullSkills = skillCells.length >= 9;
         const fatigueCell = row.querySelector('td.fatigue');
         const formCell = row.querySelector('td.form');
         const cells = row.querySelectorAll('td');
@@ -707,7 +699,7 @@
             bowlerCategory: BOWLER_CATEGORY[bowlerType] || 'none',
             bowlerPace: BOWLER_PACE[bowlerType] || 0,
             isLeftHanded: isLeftHanded, age: age,
-            hasFullSkills: hasFullSkills,
+            hasFullSkills: true,
             endurance: parseSkill(skillCells[0]?.textContent),
             batting: parseSkill(skillCells[1]?.textContent),
             bowling: parseSkill(skillCells[2]?.textContent),
@@ -717,6 +709,63 @@
             fielding: parseSkill(skillCells[6]?.textContent),
             captaincy: parseSkill(skillCells[7]?.textContent),
             experience: parseSkill(skillCells[8]?.textContent),
+            fatigue: parseFatigue(fatigueCell?.textContent),
+            form: parseSkill(formCell?.textContent),
+            isSenior: row.classList.contains('senior'),
+            isYouth: row.classList.contains('youth')
+        };
+    }
+
+    // Opponent squad pages (viewing another team's seniors.htm/youths.htm)
+    // expose a deliberately reduced, DIFFERENT column set — confirmed
+    // against live markup from a scouted opponent (team 1904):
+    // Player · Age · Nat · BT · Exp · Fatg · Form · Wage · Rating.
+    // Batting/bowling/technique/power/keeping/fielding/captaincy are not
+    // shown at all — this is the game's scouting limitation, not a
+    // scraping gap. Note the ONE td.skills cell here is Experience, not
+    // Endurance like on your own squad page — reusing parsePlayerRow's
+    // fixed skillCells[0..8] mapping against this markup silently
+    // returned 0 players for every opponent (skillCells.length was never
+    // 9). This parser targets the actual reduced layout directly.
+    function parseOpponentPlayerRow(row) {
+        const nameLink = row.querySelector('a.player');
+        if (!nameLink) return null;
+        const playerId = nameLink.href.match(/playerId=(\d+)/)?.[1];
+        const name = nameLink.textContent.trim();
+        const bowlerTypeSpan = row.querySelector('span.bowlerType');
+        const bowlerType = bowlerTypeSpan ? bowlerTypeSpan.textContent.trim() : '';
+        const experienceCell = row.querySelector('td.skills');
+        const fatigueCell = row.querySelector('td.fatigue');
+        const formCell = row.querySelector('td.form');
+        const cells = row.querySelectorAll('td');
+
+        let age = 99, wage = 0, rating = 0;
+        cells.forEach(cell => {
+            const text = cell.textContent.trim();
+            const ageMatch = text.match(/^(\d{1,2})(?:\.\d+)?$/);
+            const wageMatch = text.match(/^\$([\d,]+)/);
+            const ratingMatch = text.match(/^([\d,]{4,})$/);
+            if (ageMatch) {
+                const val = parseInt(ageMatch[1], 10);
+                if (val >= 16 && val <= 50 && age === 99) age = val;
+            } else if (wageMatch) {
+                wage = parseInt(wageMatch[1].replace(/,/g, ''), 10) || 0;
+            } else if (ratingMatch) {
+                rating = parseInt(ratingMatch[1].replace(/,/g, ''), 10) || 0;
+            }
+        });
+
+        return {
+            id: playerId, name: name,
+            bowlerType: bowlerType,
+            bowlerCategory: BOWLER_CATEGORY[bowlerType] || 'none',
+            bowlerPace: BOWLER_PACE[bowlerType] || 0,
+            isLeftHanded: false, age: age,
+            hasFullSkills: false,
+            wage: wage, rating: rating,
+            endurance: 0, batting: 0, bowling: 0, technique: 0, power: 0,
+            keeping: 0, fielding: 0, captaincy: 0,
+            experience: parseSkill(experienceCell?.textContent),
             fatigue: parseFatigue(fatigueCell?.textContent),
             form: parseSkill(formCell?.textContent),
             isSenior: row.classList.contains('senior'),
@@ -756,7 +805,13 @@
 
                         rows.forEach(row => {
                             if (!row.querySelector('td')) return;
-                            const p = parsePlayerRow(row);
+                            // Own-team pages have 9 td.skills cells (full
+                            // breakdown); opponent pages have exactly 1
+                            // (Experience only) — auto-detect per row so
+                            // this works for both without needing the
+                            // caller to know which kind of page it is.
+                            const hasFullSkillGrid = row.querySelectorAll('td.skills').length >= 9;
+                            const p = hasFullSkillGrid ? parsePlayerRow(row) : parseOpponentPlayerRow(row);
                             if (p) players.push(p);
                         });
                         resolve(players);
@@ -1648,15 +1703,34 @@
             const fatigueCell = row.querySelector('td.fatigue');
             const formCell = row.querySelector('td.form');
 
+            // Opponent squad pages only expose Player/Age/Nat/BT/Exp/Fatg/
+            // Form/Wage/Rating — no batting/bowling/technique/etc. (see
+            // parseOpponentPlayerRow for the full explanation).
+            let age = 99, wage = 0;
+            cells.forEach(cell => {
+                const text = cell.textContent.trim();
+                const ageMatch = text.match(/^(\d{1,2})(?:\.\d+)?$/);
+                const wageMatch = text.match(/^\$([\d,]+)/);
+                if (ageMatch) {
+                    const val = parseInt(ageMatch[1], 10);
+                    if (val >= 16 && val <= 50 && age === 99) age = val;
+                } else if (wageMatch) {
+                    wage = parseInt(wageMatch[1].replace(/,/g, ''), 10) || 0;
+                }
+            });
+
             const ratingText = cells[cells.length - 1]?.textContent.trim() || '';
             const rating = parseInt(ratingText.replace(/,/g, '')) || 0;
 
             players.push({
                 id: playerId,
                 name: name,
+                age: age,
                 bowlerType: bowlerType,
                 bowlerCategory: BOWLER_CATEGORY[bowlerType] || 'none',
                 bowlerPace: BOWLER_PACE[bowlerType] || 0,
+                hasFullSkills: false,
+                wage: wage,
                 experience: experience,
                 fatigue: parseFatigue(fatigueCell?.textContent),
                 form: parseSkill(formCell?.textContent),
