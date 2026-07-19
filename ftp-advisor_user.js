@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         FTP Advisor
 // @namespace    http://tampermonkey.net/
-// @version      7.1
+// @version      7.2
 // @description  Comprehensive tactical advisor for From the Pavilion cricket game (v7.0: full UI redesign with modern navy+gold theme, reusable createPanel() helper, stat badges, rec cards, and component library; v6.6: added a Youth Development Curve check on the Training page; v6.5: fixed finance parsing, removed gold captain highlight, fatigue-aware bowling spell length; v6.4: unstyled panels fixed; v6.3: tactics advisor now loads on game.htm?gameId=...; v6.2: club.htm data-status dashboard; v6.1: training uses age-decay/skill-slowdown/talent-bonus data from the user's FTP_Training model)
 // @author       You
 // @license      MIT
@@ -667,6 +667,17 @@
     // ============================================================
     // CENTRALIZED DATA FETCHERS
     // ============================================================
+    // NOTE: opponent squad pages (viewing another team's seniors.htm/
+    // youths.htm) very likely don't expose the same 9 exact td.skills
+    // columns your own squad page does — FTP probably only shows
+    // name/age/bowler type for teams you don't own, gating exact skill
+    // numbers behind an in-game scout mechanic. Previously this function
+    // hard-discarded (returned null for) ANY row without all 9 skill
+    // cells, which silently turned every opponent scout into 0 players.
+    // Now a row with a valid player link is always kept — skills just
+    // come back as 0/unknown (via skillLabel's atrocious=0 default) when
+    // not visible, same defensive pattern as parseTransferRow's lazy
+    // wage/experience fields. hasFullSkills flags which case you're in.
     function parsePlayerRow(row) {
         const nameLink = row.querySelector('a.player');
         if (!nameLink) return null;
@@ -675,7 +686,7 @@
         const bowlerTypeSpan = row.querySelector('span.bowlerType');
         const bowlerType = bowlerTypeSpan ? bowlerTypeSpan.textContent.trim() : '';
         const skillCells = row.querySelectorAll('td.skills');
-        if (skillCells.length < 9) return null;
+        const hasFullSkills = skillCells.length >= 9;
         const fatigueCell = row.querySelector('td.fatigue');
         const formCell = row.querySelector('td.form');
         const cells = row.querySelectorAll('td');
@@ -696,6 +707,7 @@
             bowlerCategory: BOWLER_CATEGORY[bowlerType] || 'none',
             bowlerPace: BOWLER_PACE[bowlerType] || 0,
             isLeftHanded: isLeftHanded, age: age,
+            hasFullSkills: hasFullSkills,
             endurance: parseSkill(skillCells[0]?.textContent),
             batting: parseSkill(skillCells[1]?.textContent),
             bowling: parseSkill(skillCells[2]?.textContent),
@@ -3037,8 +3049,12 @@
             cacheHtml += '<div class="ftp-stat-row"><span class="ftp-stat-label">Opponent</span><span class="vj-text-xs vj-text-muted">No opponent detected</span></div>';
         } else if (!opponentCache) {
             cacheHtml += '<div class="ftp-stat-row"><span class="ftp-stat-label">Opponent</span><span class="ftp-stat-badge red">Not loaded</span></div>';
+        } else if (opponentCache.players.length === 0) {
+            cacheHtml += `<div class="ftp-stat-row"><span class="ftp-stat-label">Opponent</span><span class="ftp-stat-badge red">0 players \u2014 squad page returned no rows</span></div>`;
         } else {
-            cacheHtml += `<div class="ftp-stat-row"><span class="ftp-stat-label">Opponent</span><span class="ftp-stat-badge green">${getCacheAgeText(opponentCache.ageDays)} \u00B7 ${opponentCache.players.length} players</span></div>`;
+            const fullSkillCount = opponentCache.players.filter(p => p.hasFullSkills).length;
+            const skillsNote = fullSkillCount === 0 ? ' \u00B7 skills hidden (opponent view)' : fullSkillCount < opponentCache.players.length ? ` \u00B7 ${fullSkillCount}/${opponentCache.players.length} with skills` : '';
+            cacheHtml += `<div class="ftp-stat-row"><span class="ftp-stat-label">Opponent</span><span class="ftp-stat-badge green">${getCacheAgeText(opponentCache.ageDays)} \u00B7 ${opponentCache.players.length} players${skillsNote}</span></div>`;
         }
 
         document.getElementById('ftp-data-status').innerHTML += cacheHtml;
@@ -5867,11 +5883,19 @@ table.ftp-table {
                     .filter(k => k.indexOf(OPPONENT_TIMESTAMP_PREFIX) === 0)
                     .map(k => k.slice(OPPONENT_TIMESTAMP_PREFIX.length));
                 if (opponentIds.length) {
-                    let oppHtml = '<table class="ftp-table"><thead><tr><th>Team</th><th>Last Updated</th><th>Status</th></tr></thead><tbody>';
+                    let oppHtml = '<table class="ftp-table"><thead><tr><th>Team</th><th>Players</th><th>Last Updated</th><th>Status</th></tr></thead><tbody>';
                     opponentIds.forEach(id => {
                         const age = getDataAgeText(OPPONENT_TIMESTAMP_PREFIX + id);
                         const stale = isStale(OPPONENT_TIMESTAMP_PREFIX + id, STALE_OPPONENT_HOURS);
-                        oppHtml += `<tr><td>Team ${id}</td><td class="vj-text-xs vj-text-muted">${age}</td><td><span class="ftp-stat-badge ${stale ? 'amber' : 'green'}">${stale ? 'Stale' : 'Fresh'}</span></td></tr>`;
+                        const cached = loadOpponentCache(id);
+                        const count = cached ? cached.players.length : 0;
+                        const fullSkillCount = cached ? cached.players.filter(p => p.hasFullSkills).length : 0;
+                        const playersCell = count === 0
+                            ? '<span class="ftp-stat-badge red">0 found</span>'
+                            : fullSkillCount === 0
+                                ? `${count} <span class="vj-text-xs vj-text-muted">(skills hidden)</span>`
+                                : `${count}`;
+                        oppHtml += `<tr><td>Team ${id}</td><td>${playersCell}</td><td class="vj-text-xs vj-text-muted">${age}</td><td><span class="ftp-stat-badge ${stale ? 'amber' : 'green'}">${stale ? 'Stale' : 'Fresh'}</span></td></tr>`;
                     });
                     oppHtml += '</tbody></table>';
                     oppEl.innerHTML = oppHtml;
