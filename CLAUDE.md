@@ -21,6 +21,8 @@ Do this for every shipped change unless told otherwise — there's no separate r
 - Lookup tables / constants: top of file — `SKILL_MAP`, `FATIGUE_MAP`, `PITCH_EFFECTS`, `AGE_SCOUT_THRESHOLDS`
 - Team config (auto-detected): `getTeamId()`, `detectMyTeamIdFromPage()`
 - Pro-tier scaffold — **exists but unwired, gates no feature**: `isProUser()`, `validateLicense()`
+- AI-recommendations scaffold — **exists but unwired, needs a provider/key decision from the user first**: `buildAIContextSnapshot()`, `getAICentralRecommendation()`
+- Form/Experience multiplier curves (real game data, from `FTP_Training 5.2.xlsx`'s Form-Exp tab) — **reference only, not wired into scoring yet**: `FORM_MULTIPLIER`, `EXPERIENCE_MULTIPLIER`
 - Page routing: `detectPageType()`
 - Caching: `_saveCache` / `_loadCacheWithAge` (GM_setValue/GM_getValue), staleness constants at top
 - Squad parsing: `parsePlayerRow()` (own squad, full skill grid) vs `parseOpponentPlayerRow()` (opponent squad, reduced columns — see gotcha)
@@ -37,3 +39,4 @@ Do this for every shipped change unless told otherwise — there's no separate r
 
 ## Known tech debt (diagnosed, deliberately not fixed)
 - Player "rec card" markup (name/age header, verdict badge, stat line, warnings) is duplicated across ~6 render sites (training, sell lists, academy, youth recruit, transfer results, opponent scouting). Consolidating into one shared helper is worth doing but needs live-browser verification across all 6 pages first — don't do it blind in a single pass.
+- `FTP_Training 5.2.xlsx` (`G:\My Drive\FTP_Training 5.2.xlsx`) has a "Player 1/2/3" week-by-week training simulator far beyond what's in the script: ~90 columns × 15 weeks × 3 age-blocks per player, driven by per-academy-level quadratic regression curves (`Refs` tab, columns S:Z and similar blocks) *and* a hidden `DB` lookup grid roughly 190 columns × 10 rows of precomputed training-gain values. Porting this faithfully is a real multi-session reverse-engineering project, not a quick add — don't attempt a blind one-pass port; extract and validate against the sheet's own cached values first (`data_only=True`/raw XML `<v>` cells), since wrong training predictions cost the user real in-game weeks.

@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         FTP Advisor
 // @namespace    http://tampermonkey.net/
-// @version      7.4
+// @version      7.5
 // @description  Comprehensive tactical advisor for From the Pavilion cricket game (v7.0: full UI redesign with modern navy+gold theme, reusable createPanel() helper, stat badges, rec cards, and component library; v6.6: added a Youth Development Curve check on the Training page; v6.5: fixed finance parsing, removed gold captain highlight, fatigue-aware bowling spell length; v6.4: unstyled panels fixed; v6.3: tactics advisor now loads on game.htm?gameId=...; v6.2: club.htm data-status dashboard; v6.1: training uses age-decay/skill-slowdown/talent-bonus data from the user's FTP_Training model)
 // @author       You
 // @license      MIT
@@ -131,6 +131,100 @@
         });
     }
 
+    // ============================================================
+    // AI CENTRAL RECOMMENDATIONS (scaffold — not wired to any UI yet)
+    // Architecture: every existing recommend*() function
+    // (recommendLineup, recommendTraining, recommendTossDecision, etc.)
+    // already computes a rule-based recommendation from real game data.
+    // The AI layer should sit ON TOP of that, not replace it — feed the
+    // same structured data plus the rule-based verdict as context, and
+    // let an LLM synthesize/explain/cross-check, rather than becoming a
+    // black box that recomputes everything itself. Deterministic scoring
+    // stays the source of truth (free, instant, auditable); the LLM is
+    // for what it's actually good at — natural-language synthesis across
+    // many signals at once.
+    //
+    // Three real decisions block wiring this up further — not things I
+    // can decide unilaterally:
+    // 1. WHICH provider/endpoint (Anthropic/OpenAI/etc) — the request
+    //    shape below is a placeholder, not a real API contract.
+    // 2. WHERE the API key lives. GM_setValue is local, unencrypted
+    //    storage — fine for a user's own key, NOT safe to hardcode a
+    //    shared key into a public script. Realistic options: (a) user
+    //    pastes their own key via a one-time prompt (same pattern as
+    //    getTeamId()), or (b) a thin proxy server you control holding
+    //    the real key, which would also double as the Pro-tier license
+    //    gate above — "AI recommendations" could BE the paid feature.
+    // 3. Cost. LLM calls cost money per request — must be opt-in and
+    //    user-triggered, never automatic on page load.
+    // ============================================================
+    const AI_API_KEY_CACHE = 'ftp_ai_api_key';
+    const AI_ENDPOINT_URL = 'REPLACE_WITH_LLM_ENDPOINT';
+
+    function getStoredAIKey() {
+        return GM_getValue(AI_API_KEY_CACHE, null);
+    }
+
+    /**
+     * Single assembly point for AI context. Summarizes the same inputs
+     * the rule-based advisors already compute (not raw scraped player
+     * arrays — too large/noisy) so every future AI feature shares one
+     * context shape instead of re-deriving it.
+     */
+    function buildAIContextSnapshot({ squadStats, matchContext, opponentAnalysis, financeInfo, ruleBasedRecommendation } = {}) {
+        return {
+            squad: squadStats ? {
+                count: squadStats.count, avgPrimary: squadStats.avgPrimary,
+                avgTechnique: squadStats.avgTechnique, avgFielding: squadStats.avgFielding,
+                bowlerCount: squadStats.bowlerCount, batterCount: squadStats.batterCount,
+                allrounderCount: squadStats.allrounderCount, keeperCount: squadStats.keeperCount
+            } : null,
+            match: matchContext ? {
+                format: matchContext.matchType, pitch: matchContext.pitchType,
+                weather: matchContext.weather, venue: matchContext.venue
+            } : null,
+            opposition: opponentAnalysis ? {
+                relativeStrength: opponentAnalysis.relativeStrength,
+                keyBowler: opponentAnalysis.keyBowler ? opponentAnalysis.keyBowler.name : null
+            } : null,
+            finances: financeInfo ? {
+                availableFunds: financeInfo.availableFunds, weeklyNet: financeInfo.weeklyNet
+            } : null,
+            // The deterministic advisor's own output — the AI reasons
+            // ABOUT this, it does not recompute it from scratch.
+            ruleBasedRecommendation: ruleBasedRecommendation || null
+        };
+    }
+
+    /**
+     * Stub — not called from anywhere yet. Sends a context snapshot and
+     * a plain-string question to the configured endpoint. Left generic
+     * so whatever UI is built on top decides what to ask (explain this
+     * lineup, critique this transfer target, season strategy chat, etc).
+     */
+    function getAICentralRecommendation(prompt, contextSnapshot) {
+        return new Promise((resolve, reject) => {
+            const apiKey = getStoredAIKey();
+            if (!apiKey) { reject(new Error('No AI API key configured')); return; }
+            GM_xmlhttpRequest({
+                method: 'POST',
+                url: AI_ENDPOINT_URL,
+                headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${apiKey}` },
+                data: JSON.stringify({ prompt, context: contextSnapshot }),
+                timeout: 30000,
+                onload: (response) => {
+                    try {
+                        resolve(JSON.parse(response.responseText));
+                    } catch (e) {
+                        reject(new Error('Invalid response from AI endpoint'));
+                    }
+                },
+                onerror: () => reject(new Error('AI endpoint request failed')),
+                ontimeout: () => reject(new Error('AI endpoint request timed out'))
+            });
+        });
+    }
+
     const CACHE_KEY = 'ftp_squad_cache';
     const CACHE_TIMESTAMP_KEY = 'ftp_squad_cache_ts';
     const OPPONENT_CACHE_PREFIX = 'ftp_opponent_';
@@ -192,6 +286,33 @@
         7: 'Reliable', 6: 'Capable', 5: 'Reasonable', 4: 'Average',
         3: 'Ordinary', 2: 'Poor', 1: 'Dreadful', 0: 'Atrocious'
     };
+
+    // ============================================================
+    // FORM / EXPERIENCE MULTIPLIERS
+    // Real percentage curves from the user's FTP_Training model
+    // (Form-Exp tab), not just ad-hoc linear weights. Verbatim from the
+    // sheet — nothing here is interpolated or invented.
+    // Reference data only, NOT YET wired into calculateBattingScore/
+    // BowlingScore — those have linear weights tuned over many prior
+    // versions, and swapping in a multiplicative model needs live-game
+    // verification first, not a blind mid-session rewrite.
+    //
+    // FORM_MULTIPLIER: indices 0-10 (Atrocious..Outstanding) only — the
+    // source sheet has NO data above Outstanding. Do not extrapolate;
+    // callers should clamp index at 10 for Spectacular+ until real data
+    // is available for those tiers.
+    // EXPERIENCE_MULTIPLIER: full 0-15 range, matches SKILL_MAP.
+    //
+    // A Fatigue curve also exists in the sheet (1.00 down to 0.45) but
+    // is NOT included here: the sheet has 12 distinct fatigue rows
+    // ("rested" AND "rest" as separate levels, 1.00 vs 0.98) while
+    // FATIGUE_MAP treats "rested"/"rest" as the same level (10) — an
+    // unresolved mismatch. Get clarification before adding it rather
+    // than guessing an index mapping that could silently corrupt
+    // allocateBowlingSpells' fatigue-aware logic.
+    // ============================================================
+    const FORM_MULTIPLIER = [0.70, 0.73, 0.76, 0.79, 0.82, 0.85, 0.88, 0.91, 0.94, 0.97, 1.00];
+    const EXPERIENCE_MULTIPLIER = [1.00, 1.06, 1.11, 1.16, 1.19, 1.22, 1.25, 1.28, 1.31, 1.33, 1.35, 1.36, 1.37, 1.38, 1.39, 1.40];
 
     // ============================================================
     // BOWLER TYPE CATEGORIES
