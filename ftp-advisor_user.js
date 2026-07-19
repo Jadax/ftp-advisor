@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         FTP Advisor
 // @namespace    http://tampermonkey.net/
-// @version      7.6
+// @version      7.7
 // @description  Comprehensive tactical advisor for From the Pavilion cricket game (v7.0: full UI redesign with modern navy+gold theme, reusable createPanel() helper, stat badges, rec cards, and component library; v6.6: added a Youth Development Curve check on the Training page; v6.5: fixed finance parsing, removed gold captain highlight, fatigue-aware bowling spell length; v6.4: unstyled panels fixed; v6.3: tactics advisor now loads on game.htm?gameId=...; v6.2: club.htm data-status dashboard; v6.1: training uses age-decay/skill-slowdown/talent-bonus data from the user's FTP_Training model)
 // @author       You
 // @license      MIT
@@ -996,9 +996,15 @@
         { name: 'deluxe',     num: 10, cost: 210000, label: 'Deluxe' }
     ];
 
-    // Training speed multiplier per academy level (estimated from wiki + forum data)
-    // Level 4 (satisfactory) = 1.0x baseline. Each level above/below shifts speed ~10%.
-    const ACADEMY_SPEED = [0.55, 0.6, 0.7, 0.8, 0.9, 1.0, 1.1, 1.2, 1.3, 1.4, 1.5];
+    // Training speed multiplier per academy level. Previously an
+    // estimate ([0.55...1.5], deluxe = 2.7x minimal) that the user
+    // confirmed against their own live Academy page does NOT match
+    // what the game actually shows. Replaced with the verified curve
+    // from FTP_Training 5.2.xlsx's DB!AK598:AL608 table (looked up by
+    // exact academy name, not a guess): a clean 1 + 0.03 per level,
+    // minimal = 1.0x baseline, deluxe = 1.3x. Index 0 = minimal,
+    // index 10 = deluxe, matching ACADEMY_LEVELS' `num` field.
+    const ACADEMY_SPEED = [1.00, 1.03, 1.06, 1.09, 1.12, 1.15, 1.18, 1.21, 1.24, 1.27, 1.30];
 
     // ============================================================
     // AGE-BASED SKILL THRESHOLDS for transfer evaluation
@@ -2201,7 +2207,7 @@
         const totalPlayers = seniorCount + youthCount;
 
         // Benefits of upgrade: faster training for ALL players
-        const currentSpeed = ACADEMY_SPEED[level] || 0.55;
+        const currentSpeed = ACADEMY_SPEED[level] || 1.00;
         const nextSpeed = nextLevel ? ACADEMY_SPEED[level + 1] : currentSpeed;
         const speedGain = nextSpeed - currentSpeed;
 
@@ -4360,9 +4366,9 @@ table.ftp-table {
     // separately corrected for here; folded into the age-multiplier
     // curve below like everything else.
     // estimateWeeklyTrainingGain() rescales these against
-    // ACADEMY_SPEED's own reference point (index 5 = "good" = 1.0), so
-    // they combine correctly with that already-shipped multiplier
-    // instead of double-counting the academy effect.
+    // ACADEMY_SPEED[0] (minimal = 1.0x, the reference point these
+    // base rates were measured at), so they combine correctly with
+    // that multiplier instead of double-counting the academy effect.
     // ============================================================
     const TRAINING_BASE_RATES = {
         batting:       { endurance: 25, batting: 75, technique: 55 },
@@ -4559,7 +4565,7 @@ table.ftp-table {
 
         const FATIGUE_TRAINING_PENALTY = { 5: 15, 4: 30, 3: 45, 2: 60, 1: 75, 0: 90 };
         const academyInfo = squadContext?.academyInfo || null;
-        const academySpeed = ACADEMY_SPEED[academyInfo ? academyInfo.levelNum : 0] || 0.55;
+        const academySpeed = ACADEMY_SPEED[academyInfo ? academyInfo.levelNum : 0] || 1.00;
 
         // 1. REST if exhausted/shattered/clinically dead
         if (player.fatigue <= 2) {
@@ -4747,7 +4753,7 @@ table.ftp-table {
         const youth = players.filter(p => p.age < 21);
         const aging = players.filter(p => p.age >= 30);
         const efficiency = players.length <= 25 ? 100 : Math.max(0, 100 - ((players.length - 25) * 7.5));
-        const academySpeed = academyInfo ? (ACADEMY_SPEED[academyInfo.levelNum] || 0.55) : 0.55;
+        const academySpeed = academyInfo ? (ACADEMY_SPEED[academyInfo.levelNum] || 1.00) : 1.00;
         const academyLevel = academyInfo ? academyInfo.level : 'unknown';
 
         let statsHtml = `
@@ -4798,7 +4804,7 @@ table.ftp-table {
         const levelName = academyInfo ? academyInfo.level : 'unknown';
         const levelLabel = ACADEMY_LEVELS[level] ? ACADEMY_LEVELS[level].label : levelName;
         const color = levelColors[level] || '#666';
-        const speed = academyInfo ? (ACADEMY_SPEED[level] || 0.55) : 0.55;
+        const speed = academyInfo ? (ACADEMY_SPEED[level] || 1.00) : 1.00;
         const boxClass = level <= 2 ? 'danger' : level <= 4 ? 'warn' : 'success';
 
         let html = '';
@@ -4878,7 +4884,7 @@ table.ftp-table {
             document.getElementById('ftp-academy-detail').innerHTML = '<div class="ftp-alert danger">No academy data. Visit this page again after data loads.</div>';
         } else {
             const level = academyInfo.levelNum;
-            const speed = ACADEMY_SPEED[level] || 0.55;
+            const speed = ACADEMY_SPEED[level] || 1.00;
             const nextLevel = level < 10 ? ACADEMY_LEVELS[level + 1] : null;
             const prevLevel = level > 0 ? ACADEMY_LEVELS[level - 1] : null;
             const boxClass = level <= 2 ? 'danger' : level <= 4 ? 'warn' : 'success';
@@ -4902,7 +4908,7 @@ table.ftp-table {
                     <td>${lvl.num}</td>
                     <td>${lvl.label}</td>
                     <td>$${lvl.cost.toLocaleString()}</td>
-                    <td>${Math.round((ACADEMY_SPEED[lvl.num] || 0.55) * 100)}%</td>
+                    <td>${Math.round((ACADEMY_SPEED[lvl.num] || 1.00) * 100)}%</td>
                     <td>${upgradeCost}</td>
                 </tr>`;
             }
