@@ -13,9 +13,9 @@
 // @grant        GM_deleteValue
 // @grant        GM_addStyle
 // @connect      www.fromthepavilion.org
-// @updateURL    REPLACE_WITH_HOSTED_RAW_URL/ftp-advisor_user.js
-// @downloadURL  REPLACE_WITH_HOSTED_RAW_URL/ftp-advisor_user.js
-// @supportURL   REPLACE_WITH_ISSUES_URL
+// @updateURL    https://raw.githubusercontent.com/Jadax/ftp-advisor/main/ftp-advisor_user.js
+// @downloadURL  https://raw.githubusercontent.com/Jadax/ftp-advisor/main/ftp-advisor_user.js
+// @supportURL   https://github.com/Jadax/ftp-advisor/issues
 // ==/UserScript==
 
 (function() {
