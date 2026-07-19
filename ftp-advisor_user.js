@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         FTP Advisor
 // @namespace    http://tampermonkey.net/
-// @version      7.8
+// @version      7.9
 // @description  Comprehensive tactical advisor for From the Pavilion cricket game (v7.0: full UI redesign with modern navy+gold theme, reusable createPanel() helper, stat badges, rec cards, and component library; v6.6: added a Youth Development Curve check on the Training page; v6.5: fixed finance parsing, removed gold captain highlight, fatigue-aware bowling spell length; v6.4: unstyled panels fixed; v6.3: tactics advisor now loads on game.htm?gameId=...; v6.2: club.htm data-status dashboard; v6.1: training uses age-decay/skill-slowdown/talent-bonus data from the user's FTP_Training model)
 // @author       You
 // @license      MIT
@@ -4426,6 +4426,69 @@ table.ftp-table {
         return Math.ceil(1000 / weeklyPoints);
     }
 
+    /**
+     * Multi-week training planner. Re-derives the weekly gain every
+     * week (not just once) because skill-slowdown depends on the
+     * player's CURRENT level, which can cross a threshold mid-
+     * simulation — the same dynamic the spreadsheet's week-by-week
+     * table captures, computed here from the verified per-week formula
+     * instead of the workbook's own precomputed cell grid (that grid
+     * — DB!$DB$6:$GL$15 — was not extracted; see CLAUDE.md). Starts
+     * each skill at the TOP of the player's current level (0 progress),
+     * same conservative assumption as weeksToNextLevel().
+     * Returns { finalSkills, finalProgress, levelUps, weeks }, or null
+     * for an unknown/rest program.
+     */
+    /**
+     * "12wk outlook: Reasonable → Capable (wk8), 34% into Capable" —
+     * turns a simulateTrainingPlan() result for one skill into one
+     * short line for a rec card.
+     */
+    function formatTrainingOutlook(projection, primarySkill, currentValue) {
+        if (!projection || !primarySkill) return '';
+        const startLabel = skillLabel(Math.round(currentValue || 0));
+        const endLevel = projection.finalSkills[primarySkill];
+        const endLabel = skillLabel(endLevel);
+        const progressPct = Math.round(((projection.finalProgress[primarySkill] || 0) / 1000) * 100);
+        if (startLabel === endLabel) {
+            return `${projection.weeks}wk outlook: stays ${endLabel} (${progressPct}% to next level)`;
+        }
+        const arrivals = projection.levelUps.filter(l => l.skill === primarySkill);
+        const arrivalWeek = arrivals.length ? arrivals[arrivals.length - 1].week : null;
+        return `${projection.weeks}wk outlook: ${startLabel} → ${endLabel}${arrivalWeek ? ` (wk${arrivalWeek})` : ''}, ${progressPct}% into ${endLabel}`;
+    }
+
+    function simulateTrainingPlan(player, programKey, weeks, academySpeed) {
+        const rates = TRAINING_BASE_RATES[programKey];
+        if (!rates) return null;
+        const state = {};
+        for (const skill of Object.keys(rates)) {
+            state[skill] = { level: Math.min(15, Math.round(player[skill] || 0)), progress: 0 };
+        }
+        const levelUps = [];
+        for (let week = 1; week <= weeks; week++) {
+            const simPlayer = Object.assign({}, player);
+            for (const skill of Object.keys(state)) simPlayer[skill] = state[skill].level;
+            const gains = estimateWeeklyTrainingGain(programKey, simPlayer, academySpeed);
+            for (const skill of Object.keys(state)) {
+                if (state[skill].level >= 15) continue; // Legendary — capped
+                state[skill].progress += (gains && gains[skill]) || 0;
+                while (state[skill].progress >= 1000 && state[skill].level < 15) {
+                    state[skill].progress -= 1000;
+                    state[skill].level += 1;
+                    levelUps.push({ week, skill, newLevel: state[skill].level });
+                }
+            }
+        }
+        const finalSkills = {};
+        const finalProgress = {};
+        for (const skill of Object.keys(state)) {
+            finalSkills[skill] = state[skill].level;
+            finalProgress[skill] = state[skill].progress;
+        }
+        return { finalSkills, finalProgress, levelUps, weeks };
+    }
+
     // ============================================================
     // TRAINING RECOMMENDATION ENGINE
     // ============================================================
@@ -4631,7 +4694,12 @@ table.ftp-table {
             rec.weeklyGain = estimateWeeklyTrainingGain(rec.program, player, academySpeed);
             const programDef = TRAINING_PROGRAMS[rec.program];
             if (rec.weeklyGain && programDef && programDef.primary) {
+                rec.primarySkill = programDef.primary;
                 rec.weeksToNextLevel = weeksToNextLevel(rec.weeklyGain[programDef.primary]);
+                // 12-week outlook: keeps training this program and shows
+                // where the primary skill actually lands, not just the
+                // next single level-up.
+                rec.projection = simulateTrainingPlan(player, rec.program, 12, academySpeed);
             }
         }
 
@@ -4791,6 +4859,7 @@ table.ftp-table {
                 <div class="ftp-rec-current">Now: ${currentProg} \u00B7 Bat ${skillLabel(p.batting).slice(0,3)} \u00B7 Bowl ${skillLabel(p.bowling).slice(0,3)} \u00B7 Tech ${skillLabel(p.technique).slice(0,3)} \u00B7 Field ${skillLabel(p.fielding).slice(0,3)} \u00B7 End ${skillLabel(p.endurance).slice(0,3)}${p.keeping > 0 ? ` \u00B7 Keep ${skillLabel(p.keeping).slice(0,3)}` : ''}</div>
                 <div class="ftp-rec-program">\u2192 ${TRAINING_PROGRAM_LABELS[rec.program] || rec.program}${rec.weeksToNextLevel ? ` <span class="vj-text-xs vj-text-muted">(~${rec.weeksToNextLevel}wk to next level)</span>` : ''}</div>
                 ${gains ? `<div class="ftp-rec-gains">${gains.gains.join(' | ')}</div>` : ''}
+                ${rec.projection && rec.primarySkill ? `<div class="ftp-rec-gains" style="color:var(--vj-blue);">\ud83d\udcc5 ${formatTrainingOutlook(rec.projection, rec.primarySkill, p[rec.primarySkill])}</div>` : ''}
                 <div class="ftp-rec-reason">${rec.reason}</div>
                 ${rec.warnings.length > 0 ? `<div class="ftp-rec-warnings">\u26A0 ${rec.warnings.join(' \u00B7 ')}</div>` : ''}
             </div>`;
