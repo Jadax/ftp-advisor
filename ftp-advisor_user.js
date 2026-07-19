@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         FTP Advisor
 // @namespace    http://tampermonkey.net/
-// @version      7.5
+// @version      7.6
 // @description  Comprehensive tactical advisor for From the Pavilion cricket game (v7.0: full UI redesign with modern navy+gold theme, reusable createPanel() helper, stat badges, rec cards, and component library; v6.6: added a Youth Development Curve check on the Training page; v6.5: fixed finance parsing, removed gold captain highlight, fatigue-aware bowling spell length; v6.4: unstyled panels fixed; v6.3: tactics advisor now loads on game.htm?gameId=...; v6.2: club.htm data-status dashboard; v6.1: training uses age-decay/skill-slowdown/talent-bonus data from the user's FTP_Training model)
 // @author       You
 // @license      MIT
@@ -163,6 +163,19 @@
 
     function getStoredAIKey() {
         return GM_getValue(AI_API_KEY_CACHE, null);
+    }
+
+    // One-time prompt, same pattern as getTeamId(). Not wired to any
+    // button yet — provider/endpoint (AI_ENDPOINT_URL) is still a
+    // placeholder, so there's nothing for a stored key to call yet.
+    // Call this from a settings UI once a provider is chosen.
+    function promptForAIKey() {
+        const entered = prompt('FTP Advisor: paste your LLM API key (stored locally via GM_setValue, only ever sent to the configured AI endpoint):');
+        if (entered && entered.trim()) {
+            GM_setValue(AI_API_KEY_CACHE, entered.trim());
+            return true;
+        }
+        return false;
     }
 
     /**
@@ -4337,6 +4350,71 @@ table.ftp-table {
     };
 
     // ============================================================
+    // TRAINING BASE RATES — weekly skill-point gain (out of 1000
+    // points = 1 full skill level), at Minimal Academy (ACADEMY_SPEED
+    // index 0), 100% training, no talents — from the "Base Level
+    // Training" table in the user's FTP_Training model
+    // (Refs!I26:Q37). Cross-checked against that table's own per-row
+    // SUM total column. Baseline age in the source is 19 for most
+    // programs, 23-27 for Fitness/Strength (per its footnote) — not
+    // separately corrected for here; folded into the age-multiplier
+    // curve below like everything else.
+    // estimateWeeklyTrainingGain() rescales these against
+    // ACADEMY_SPEED's own reference point (index 5 = "good" = 1.0), so
+    // they combine correctly with that already-shipped multiplier
+    // instead of double-counting the academy effect.
+    // ============================================================
+    const TRAINING_BASE_RATES = {
+        batting:       { endurance: 25, batting: 75, technique: 55 },
+        bowling:       { endurance: 25, bowling: 75, technique: 55 },
+        battingtech:   { endurance: 25, batting: 55, technique: 85 },
+        bowlingtech:   { endurance: 25, bowling: 55, technique: 85 },
+        allrounder:    { endurance: 25, batting: 53, bowling: 53, technique: 46 },
+        keeping:       { endurance: 25, technique: 55, keeping: 160, fielding: 40 },
+        keeperbatting: { endurance: 25, batting: 60, technique: 55, keeping: 80, fielding: 30 },
+        fielding:      { endurance: 25, technique: 30, fielding: 220 },
+        fitness:       { endurance: 65, power: 190 },
+        strength:      { endurance: 200, power: 70 },
+        rest:          {}
+    };
+
+    /**
+     * Estimated weekly gain (points out of 1000/level) for a training
+     * program, folding in every multiplier the script already tracks:
+     * academy speed, age curve, a matching training talent, and skill
+     * slowdown above Outstanding. Returns null for unknown programs.
+     */
+    function estimateWeeklyTrainingGain(programKey, player, academySpeed) {
+        const rates = TRAINING_BASE_RATES[programKey];
+        if (!rates) return null;
+        const ageMult = getAgeTrainingMultiplier(player.age);
+        const academyRatio = academySpeed / ACADEMY_SPEED[0];
+        const talents = player.talents || [];
+        const isProdigy = talents.some(t => t.toLowerCase().includes('prodigy'));
+        const result = {};
+        for (const [skill, basePoints] of Object.entries(rates)) {
+            const ageM = skill === 'power' ? ageMult.power : skill === 'endurance' ? ageMult.endurance : ageMult.primary;
+            const hasGiftedMatch = isProdigy || talents.some(t => t.toLowerCase().includes('gifted') && t.toLowerCase().includes(skill));
+            const talentM = hasGiftedMatch ? (1 + TRAINING_TALENT_BONUS) : 1;
+            const slowdownM = getSkillSlowdownMultiplier(player[skill] || 0);
+            result[skill] = Math.round(basePoints * academyRatio * ageM * talentM * slowdownM);
+        }
+        return result;
+    }
+
+    /**
+     * Friendly "~N weeks to next level" from a weekly point gain. The
+     * game doesn't expose sub-level precision, so this assumes the
+     * player is starting from the very top of their current level
+     * (needs the full 1000 points) — a conservative (slower-than-
+     * average) estimate, not a best case.
+     */
+    function weeksToNextLevel(weeklyPoints) {
+        if (!weeklyPoints || weeklyPoints <= 0) return null;
+        return Math.ceil(1000 / weeklyPoints);
+    }
+
+    // ============================================================
     // TRAINING RECOMMENDATION ENGINE
     // ============================================================
 
@@ -4534,6 +4612,17 @@ table.ftp-table {
         else if (player.age < 30) _recommendSeniorTraining(rec, player, ctx);
         else _recommendAgingTraining(rec, player, ctx);
 
+        // Estimated weekly point gain + weeks-to-next-level, from the
+        // FTP_Training model's base rates combined with the multipliers
+        // already computed above (academy/age/talent/slowdown).
+        if (rec.program !== 'rest') {
+            rec.weeklyGain = estimateWeeklyTrainingGain(rec.program, player, academySpeed);
+            const programDef = TRAINING_PROGRAMS[rec.program];
+            if (rec.weeklyGain && programDef && programDef.primary) {
+                rec.weeksToNextLevel = weeksToNextLevel(rec.weeklyGain[programDef.primary]);
+            }
+        }
+
         return rec;
     }
 
@@ -4688,7 +4777,7 @@ table.ftp-table {
             recsHtml += `<div class="ftp-rec ${rec.priority}">
                 <div class="vj-flex-between"><span class="ftp-rec-name">${priorityIcon} ${p.name} <span class="vj-text-xs vj-text-muted">(${p.age})</span></span><span class="vj-text-xs ${isAlreadyCorrect ? 'vj-text-muted' : ''}">${isAlreadyCorrect ? '\u2705' : '\u27A1'}</span></div>
                 <div class="ftp-rec-current">Now: ${currentProg} \u00B7 Bat ${skillLabel(p.batting).slice(0,3)} \u00B7 Bowl ${skillLabel(p.bowling).slice(0,3)} \u00B7 Tech ${skillLabel(p.technique).slice(0,3)} \u00B7 Field ${skillLabel(p.fielding).slice(0,3)} \u00B7 End ${skillLabel(p.endurance).slice(0,3)}${p.keeping > 0 ? ` \u00B7 Keep ${skillLabel(p.keeping).slice(0,3)}` : ''}</div>
-                <div class="ftp-rec-program">\u2192 ${TRAINING_PROGRAM_LABELS[rec.program] || rec.program}</div>
+                <div class="ftp-rec-program">\u2192 ${TRAINING_PROGRAM_LABELS[rec.program] || rec.program}${rec.weeksToNextLevel ? ` <span class="vj-text-xs vj-text-muted">(~${rec.weeksToNextLevel}wk to next level)</span>` : ''}</div>
                 ${gains ? `<div class="ftp-rec-gains">${gains.gains.join(' | ')}</div>` : ''}
                 <div class="ftp-rec-reason">${rec.reason}</div>
                 ${rec.warnings.length > 0 ? `<div class="ftp-rec-warnings">\u26A0 ${rec.warnings.join(' \u00B7 ')}</div>` : ''}
