@@ -4,6 +4,8 @@ A Tampermonkey userscript that turns [From the Pavilion](https://www.fromthepavi
 
 No more guessing whether to bowl or bat first. No more training a player's technique for six weeks when their endurance was the real bottleneck. No more transfer targets that look great until you notice the wage.
 
+> ☕ **If this project saved you time or made your life a little easier, consider [buying me a coffee](https://ko-fi.com/jadax).** It helps me maintain this project, fix bugs, and build new features — always appreciated, never expected. ❤️
+
 ---
 
 ## ✨ What it does
@@ -73,9 +75,3 @@ It's a single-file script (`ftp-advisor_user.js`), so pull requests are easy to 
 ## 📄 License
 
 MIT — do whatever you'd like with it.
-
-## ☕ Support
-
-If this project saved you time or made your life a little easier, consider buying me a coffee. ☕ Your support helps me maintain this project, fix bugs, and build new features. Support is always appreciated but never expected.
-
-❤️ https://ko-fi.com/jadax
