@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         FTP Advisor
 // @namespace    http://tampermonkey.net/
-// @version      7.7
+// @version      7.8
 // @description  Comprehensive tactical advisor for From the Pavilion cricket game (v7.0: full UI redesign with modern navy+gold theme, reusable createPanel() helper, stat badges, rec cards, and component library; v6.6: added a Youth Development Curve check on the Training page; v6.5: fixed finance parsing, removed gold captain highlight, fatigue-aware bowling spell length; v6.4: unstyled panels fixed; v6.3: tactics advisor now loads on game.htm?gameId=...; v6.2: club.htm data-status dashboard; v6.1: training uses age-decay/skill-slowdown/talent-bonus data from the user's FTP_Training model)
 // @author       You
 // @license      MIT
@@ -545,10 +545,16 @@
         return Math.pow(1 - SKILL_SLOWDOWN_PER_LEVEL, levelsAbove);
     }
 
-    // Training Talent bonus (Refs!I18:J23): a matching Training Talent
-    // (e.g. "Gifted (Batting)") gives a flat +15% training rate on that
-    // specific skill, on top of age/academy/slowdown multipliers.
-    const TRAINING_TALENT_BONUS = 0.15;
+    // Training Talent bonus: a matching Training Talent (e.g. "Gifted
+    // (Batting)") or Prodigy (all skills) gives a flat training-rate
+    // bonus on top of age/academy/slowdown multipliers. Previously
+    // cited as "Refs!I18:J23" = 0.15, but that range is actually the
+    // Skills Slowdown table (also coincidentally 0.15/level) — a
+    // citation mix-up, not the talent bonus at all. Verified instead
+    // from FTP_Training 5.2.xlsx's DB tab: 315 consistent occurrences
+    // of a flat x1.2 multiplier (+20%) across every Prodigy/Gifted
+    // formula checked, for every academy level and training program.
+    const TRAINING_TALENT_BONUS = 0.20;
 
     // ============================================================
     // YOUTH DEVELOPMENT CURVE (user-specified benchmarks)
@@ -5777,7 +5783,7 @@ table.ftp-table {
                 <div class="vj-fw-700">What to Buy:</div>
                 <div>\u2022 Young players (16-20) \u2014 they train faster and develop longer</div>
                 <div>\u2022 Prime seniors (21-27) \u2014 peak performance years, immediate impact</div>
-                <div>\u2022 Players with <span class="vj-fw-700">Gifted</span> or <span class="vj-fw-700">Prodigy</span> talents \u2014 +15% training speed per matching talent</div>
+                <div>\u2022 Players with <span class="vj-fw-700">Gifted</span> or <span class="vj-fw-700">Prodigy</span> talents \u2014 +20% training speed per matching talent</div>
                 <div>\u2022 <span class="vj-fw-700">Fast bowlers</span> and <span class="vj-fw-700">wrist spinners</span> \u2014 rarest types, highest match impact</div>
                 <div>\u2022 Players with <span class="vj-fw-700">high Technique</span> relative to primary \u2014 technique amplifies all performances</div>
                 <div>\u2022 Players with <span class="vj-fw-700">Natural Leader</span> talent \u2014 captaincy helps wicket-taking</div>
