@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         FTP Advisor
 // @namespace    http://tampermonkey.net/
-// @version      7.3
+// @version      7.4
 // @description  Comprehensive tactical advisor for From the Pavilion cricket game (v7.0: full UI redesign with modern navy+gold theme, reusable createPanel() helper, stat badges, rec cards, and component library; v6.6: added a Youth Development Curve check on the Training page; v6.5: fixed finance parsing, removed gold captain highlight, fatigue-aware bowling spell length; v6.4: unstyled panels fixed; v6.3: tactics advisor now loads on game.htm?gameId=...; v6.2: club.htm data-status dashboard; v6.1: training uses age-decay/skill-slowdown/talent-bonus data from the user's FTP_Training model)
 // @author       You
 // @license      MIT
@@ -1149,12 +1149,16 @@
             score += 1; strengths.push(`Rare bowler type: ${player.bowlerType}`);
         }
 
-        // Squad balance bonus: fills a gap
-        if (primaryName === 'bowling' && squadStats.bowlerCount < 4) {
-            score += 1; strengths.push('Squad needs more specialist bowlers');
-        }
-        if ((player.keeping || 0) >= 6 && squadStats.keeperCount < 2) {
-            score += 1; strengths.push('Squad needs a backup wicketkeeper');
+        // Squad balance bonus: fills a gap (squadStats is null if no
+        // cached squad has a senior/21+ player yet — e.g. first run, or
+        // a squad that's entirely youth)
+        if (squadStats) {
+            if (primaryName === 'bowling' && squadStats.bowlerCount < 4) {
+                score += 1; strengths.push('Squad needs more specialist bowlers');
+            }
+            if ((player.keeping || 0) >= 6 && squadStats.keeperCount < 2) {
+                score += 1; strengths.push('Squad needs a backup wicketkeeper');
+            }
         }
 
         // "The base" — age-specific primary/technique/experience/fielding
