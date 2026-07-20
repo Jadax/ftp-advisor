@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         FTP Advisor
 // @namespace    http://tampermonkey.net/
-// @version      8.0
+// @version      8.1
 // @description  Comprehensive tactical advisor for From the Pavilion cricket game (v7.0: full UI redesign with modern navy+gold theme, reusable createPanel() helper, stat badges, rec cards, and component library; v6.6: added a Youth Development Curve check on the Training page; v6.5: fixed finance parsing, removed gold captain highlight, fatigue-aware bowling spell length; v6.4: unstyled panels fixed; v6.3: tactics advisor now loads on game.htm?gameId=...; v6.2: club.htm data-status dashboard; v6.1: training uses age-decay/skill-slowdown/talent-bonus data from the user's FTP_Training model)
 // @author       You
 // @license      MIT
@@ -435,7 +435,17 @@
     // a player must meet 100% of the fields defined for their age.
     // ============================================================
     const AGE_SCOUT_THRESHOLDS = {
-        16: { rating: 20000, primary: 4, technique: 2, experience: 2, fielding: 2 },
+        // experience: 1 (Dreadful), not 2 (Poor) — a freshly recruited
+        // 16yo hasn't played senior/youth minutes yet, so Experience
+        // starts low regardless of underlying quality; it accrues from
+        // playing, not recruitment. Confirmed against a real recruit
+        // (27,531 rating, Reasonable technique, Average fielding — a
+        // clearly strong prospect) who sat at exactly Dreadful
+        // experience and was being wrongly flagged for release under
+        // the old Poor floor. Matches the looser of the user's two
+        // saved 16yo searches ("dread exp" vs "poor exp") — this was
+        // the correct one, not a screenshot transcription error.
+        16: { rating: 20000, primary: 4, technique: 2, experience: 1, fielding: 2 },
         17: { rating: 23000, primary: 5, technique: 4, experience: 2, fielding: 2 },
         18: { rating: 24500, primary: 6, technique: 6, experience: 2, fielding: 3 },
         19: { primary: 8, technique: 7, experience: 3, fielding: 4 },
