@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         FTP Advisor
 // @namespace    http://tampermonkey.net/
-// @version      7.9
+// @version      8.0
 // @description  Comprehensive tactical advisor for From the Pavilion cricket game (v7.0: full UI redesign with modern navy+gold theme, reusable createPanel() helper, stat badges, rec cards, and component library; v6.6: added a Youth Development Curve check on the Training page; v6.5: fixed finance parsing, removed gold captain highlight, fatigue-aware bowling spell length; v6.4: unstyled panels fixed; v6.3: tactics advisor now loads on game.htm?gameId=...; v6.2: club.htm data-status dashboard; v6.1: training uses age-decay/skill-slowdown/talent-bonus data from the user's FTP_Training model)
 // @author       You
 // @license      MIT
@@ -667,6 +667,9 @@
         }
         if (window.location.href.includes('club.htm')) {
             return 'club';
+        }
+        if (window.location.href.includes('player.htm')) {
+            return 'player';
         }
         return 'other';
     }
@@ -6286,6 +6289,206 @@ table.ftp-table {
     }
 
     // ============================================================
+    // PLAYER DETAIL ADVISOR — player.htm (any single player: a new
+    // youth recruit, an opponent's player, a transfer target, or one
+    // of your own squad). Not verified against a live copy of this
+    // exact page markup — it extends fetchPlayerPageDetails()'s
+    // already-proven label-driven th/td scan (confirmed working in
+    // production for Experience/Captaincy/Talents) to the rest of the
+    // skill grid, rather than guessing new selectors from scratch. If
+    // skills come back all-zero, the UI says so explicitly instead of
+    // rendering a false verdict — see the hasFullSkills check below.
+    // ============================================================
+
+    // Maps FTP's bowler-type description text ("Right arm Fast medium")
+    // to the short code used everywhere else in the script, as a
+    // fallback when span.bowlerType (the same widget used on squad
+    // pages) isn't present on this page for some reason.
+    const BOWLER_TYPE_PHRASES = [
+        [/right arm fast medium/i, 'rfm'], [/left arm fast medium/i, 'lfm'],
+        [/right arm fast(?!\s*medium)/i, 'rf'], [/left arm fast(?!\s*medium)/i, 'lf'],
+        [/right arm medium/i, 'rm'], [/left arm medium/i, 'lm'],
+        [/right arm finger spin/i, 'rfs'], [/left arm finger spin/i, 'lfs'],
+        [/right arm wrist spin/i, 'rws'], [/left arm wrist spin/i, 'lws']
+    ];
+
+    function scrapePlayerDetailPage() {
+        const doc = document;
+        const nameEl = doc.querySelector('h1, .panel h2, .panel .padded h2');
+        const name = nameEl ? nameEl.textContent.trim() : 'This player';
+
+        const bowlerTypeSpan = doc.querySelector('span.bowlerType');
+        let bowlerType = bowlerTypeSpan ? bowlerTypeSpan.textContent.trim().toLowerCase() : '';
+
+        // Age/rating/wage live in one free-text paragraph, same place
+        // fetchPlayerPageDetails() already reads wage from.
+        let age = null, rating = 0, wage = 0;
+        const paddedPs = doc.querySelectorAll('.panel .padded p');
+        if (paddedPs.length > 0) {
+            const infoText = paddedPs[0].textContent;
+            const ageMatch = infoText.match(/(\d{1,2})y(\d{1,2})w/);
+            if (ageMatch) age = parseInt(ageMatch[1], 10) + parseInt(ageMatch[2], 10) / 52;
+            const ratingMatch = infoText.match(/([\d,]+)\s*rating/i);
+            if (ratingMatch) rating = parseInt(ratingMatch[1].replace(/,/g, ''), 10) || 0;
+            const wageMatch = infoText.match(/\$([\d,]+)\s*wage/i);
+            if (wageMatch) wage = parseInt(wageMatch[1].replace(/,/g, ''), 10) || 0;
+            if (!bowlerType) {
+                for (const [re, code] of BOWLER_TYPE_PHRASES) {
+                    if (re.test(infoText)) { bowlerType = code; break; }
+                }
+            }
+        }
+
+        const player = {
+            id: (window.location.href.match(/playerId=(\d+)/) || [])[1],
+            name, age: age || 0, rating, wage,
+            bowlerType, bowlerCategory: BOWLER_CATEGORY[bowlerType] || 'none', bowlerPace: BOWLER_PACE[bowlerType] || 0,
+            batting: 0, bowling: 0, keeping: 0, technique: 0, power: 0, fielding: 0, endurance: 0,
+            experience: 0, captaincy: 0, talents: [], price: 0
+        };
+
+        const skillLabelMap = {
+            batting: 'batting', bowling: 'bowling', keeping: 'keeping', technique: 'technique',
+            power: 'power', fielding: 'fielding', endurance: 'endurance', captaincy: 'captaincy', experience: 'experience'
+        };
+        let skillFieldsFound = 0;
+        doc.querySelectorAll('th').forEach(th => {
+            const label = th.textContent.trim().toLowerCase();
+            const td = th.nextElementSibling;
+            if (!td || td.tagName !== 'TD') return;
+            const key = skillLabelMap[label];
+            if (key) {
+                player[key] = parseSkill(td.textContent.trim().toLowerCase());
+                skillFieldsFound++;
+            } else if (label === 'talents' && player.talents.length === 0) {
+                const spans = td.querySelectorAll('span.popuphelp');
+                spans.forEach(span => {
+                    const title = span.getAttribute('title') || '';
+                    const t = title.split('|')[0].trim();
+                    if (t) player.talents.push(t);
+                });
+                if (player.talents.length === 0) {
+                    const text = td.textContent.trim();
+                    if (text && text !== 'None') player.talents = text.split(',').map(t => t.trim()).filter(Boolean);
+                }
+            }
+        });
+
+        player.hasFullSkills = skillFieldsFound >= 5; // batting/bowling/technique/power/fielding at minimum
+        return player;
+    }
+
+    /**
+     * Ranks this candidate against squad players in the same age
+     * bracket (exact age first, falls back to all seniors if nobody
+     * matches — a small squad may have no exact-age peer). Returns the
+     * peers sorted worst-rank-first, i.e. best-sell-candidate-first, so
+     * a caller can show "if you sign this player, here's who to move
+     * on, starting with the clearest cut."
+     */
+    function comparePlayerToSquadPeers(candidate, squadPlayers) {
+        const squadStats = computeSquadStats(squadPlayers);
+        const candidateAge = Math.round(candidate.age);
+        let peers = squadPlayers.filter(p => Math.round(p.age) === candidateAge && p.age >= 21);
+        let groupLabel = `age ${candidateAge}`;
+        if (peers.length === 0) {
+            peers = squadPlayers.filter(p => p.age >= 21);
+            groupLabel = 'all seniors (no exact age match in squad)';
+        }
+        const candidateRank = calculateRank(candidate, squadStats);
+        const ranked = peers
+            .map(p => ({ player: p, rank: calculateRank(p, squadStats) }))
+            .sort((a, b) => a.rank - b.rank);
+        const wouldReplace = ranked.filter(r => candidateRank > r.rank);
+        return { candidateRank, groupLabel, wouldReplace, allPeers: ranked, squadStats };
+    }
+
+    function createPlayerAdvisorUI() {
+        createPanel({
+            title: 'Player Advisor', icon: '\u{1F464}',
+            buttons: [{ id: 'ftp-refresh', label: '↻', title: 'Refresh' }],
+            sections: [
+                { id: 'ftp-player-verdict', label: 'Recommendation', icon: '⚖️', iconColor: 'blue',
+                  content: '<div class="vj-text-sm vj-text-muted">Loading...</div>' },
+                { id: 'ftp-player-compare', label: 'Squad Comparison', icon: '\u{1F504}', iconColor: 'purple' }
+            ]
+        });
+        document.getElementById('ftp-refresh').addEventListener('click', updatePlayerAdvisor);
+    }
+
+    function updatePlayerAdvisor() {
+        const verdictEl = document.getElementById('ftp-player-verdict');
+        const compareEl = document.getElementById('ftp-player-compare');
+        const player = scrapePlayerDetailPage();
+
+        if (!player.hasFullSkills) {
+            verdictEl.innerHTML = `<div class="ftp-alert warning"><span>⚠</span><div>Couldn't read this player's skill grid from the page — got ${player.name || 'a player'} but too few skill fields matched. The evaluation below would be unreliable, so it's been skipped. If this keeps happening, the page markup may differ from what this was built against.</div></div>`;
+            compareEl.innerHTML = '';
+            return;
+        }
+
+        const cache = loadPlayerCache();
+        const squadPlayers = cache ? cache.players : [];
+        const squadStats = computeSquadStats(squadPlayers);
+        const isYouth = Math.round(player.age) < 21;
+        const evalResult = evaluateTransferTarget(player, squadStats);
+        const rank = calculateRank(player, squadStats);
+        const keepVerdict = evalResult.verdict === 'poor' || evalResult.verdict === 'weak' ? 'RELEASE' : 'KEEP';
+        const badgeClass = keepVerdict === 'KEEP' ? 'green' : 'red';
+
+        let html = `<div class="vj-flex-between vj-mb-4">
+                <span class="vj-fw-700" style="font-size:14px;">${player.name} <span class="vj-text-xs vj-text-muted">(${Math.round(player.age)}yo)</span></span>
+                <span class="ftp-stat-badge ${badgeClass}" style="font-size:13px;">${keepVerdict}</span>
+            </div>
+            <div class="vj-text-xs vj-text-muted vj-mb-4">Verdict: ${evalResult.verdict.toUpperCase()} · Rank ${rank}/10 · ${Math.max(player.batting, player.bowling) ? (player.batting >= player.bowling ? 'Bat' : 'Bowl') + ' ' + skillLabel(Math.max(player.batting, player.bowling)) : ''} · Tech ${skillLabel(player.technique)} · Field ${skillLabel(player.fielding)}</div>`;
+
+        if (evalResult.strengths.length > 0) {
+            html += `<div class="vj-text-xs vj-mt-4" style="color:var(--vj-green);">✓ ${evalResult.strengths.join(' · ')}</div>`;
+        }
+        if (evalResult.warnings.length > 0) {
+            html += `<div class="vj-text-xs vj-mt-4" style="color:var(--vj-red);">⚠ ${evalResult.warnings.join(' · ')}</div>`;
+        }
+        if (isYouth) {
+            const yd = evaluateYouthDevelopment(player);
+            if (yd) {
+                html += `<div class="vj-text-xs vj-mt-8"><span class="vj-fw-700">16-20 development curve:</span> ${yd.overallStatus === 'behind' ? '<span style="color:var(--vj-red);">Behind curve</span>' : '<span style="color:var(--vj-green);">On track</span>'}</div>`;
+            }
+        }
+        verdictEl.innerHTML = html;
+
+        // Squad comparison — who this player would realistically replace.
+        // Most useful for 21+ (peer-age comparison against your senior
+        // squad); youth are development bets, not direct swaps, so this
+        // section is skipped for them rather than forcing a comparison
+        // that doesn't mean much yet.
+        if (!isYouth && squadPlayers.length > 0) {
+            const cmp = comparePlayerToSquadPeers(player, squadPlayers);
+            let cHtml = `<div class="vj-text-xs vj-text-muted vj-mb-4">Compared against ${cmp.groupLabel} in your squad (${cmp.allPeers.length} player${cmp.allPeers.length === 1 ? '' : 's'}). This player ranks ${cmp.candidateRank}/10.</div>`;
+            if (cmp.wouldReplace.length > 0) {
+                cHtml += `<div class="vj-fw-700 vj-mb-4">Would replace (best sell first):</div>`;
+                cmp.wouldReplace.forEach(r => {
+                    cHtml += `<div class="ftp-stat-row"><span class="ftp-stat-label">${r.player.name}</span><span class="ftp-stat-value">Rank ${r.rank}/10</span></div>`;
+                });
+            } else {
+                cHtml += `<div class="vj-text-sm vj-text-muted">Doesn't clearly outrank anyone in this group — not an obvious replacement for your current squad.</div>`;
+            }
+            compareEl.innerHTML = cHtml;
+        } else if (isYouth) {
+            compareEl.innerHTML = '<div class="vj-text-xs vj-text-muted">Squad comparison is shown for senior (21+) players only — a 16-20yo is a development bet, not a like-for-like swap yet.</div>';
+        } else {
+            compareEl.innerHTML = '<div class="vj-text-xs vj-text-muted">No squad data cached yet — visit your Senior Squad page once to enable comparison.</div>';
+        }
+
+        // Feeds the same evaluation into the AI-recommendations scaffold's
+        // context assembly (buildAIContextSnapshot) so that plumbing is
+        // exercised end-to-end even though no AI call is wired up yet —
+        // see AI_ENDPOINT_URL in the scaffold above.
+        window._ftpLastPlayerContext = buildAIContextSnapshot({
+            squadStats, ruleBasedRecommendation: { player: player.name, keepVerdict, verdict: evalResult.verdict, rank }
+        });
+    }
+
+    // ============================================================
     // INIT — every page fetches fresh data first, then shows advisor
     // ============================================================
     async function init() {
@@ -6406,6 +6609,10 @@ table.ftp-table {
             createClubStatusUI();
             updateClubStatusUI();
             _attachRefreshBtn(async () => { await fetchAllData({ force: true }); updateClubStatusUI(); });
+        } else if (pageType === 'player') {
+            createPlayerAdvisorUI();
+            updatePlayerAdvisor();
+            _attachRefreshBtn(updatePlayerAdvisor);
         }
     }
 
