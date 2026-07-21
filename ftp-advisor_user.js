@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         FTP Advisor
 // @namespace    http://tampermonkey.net/
-// @version      8.4
+// @version      8.5
 // @description  Comprehensive tactical advisor for From the Pavilion cricket game (v7.0: full UI redesign with modern navy+gold theme, reusable createPanel() helper, stat badges, rec cards, and component library; v6.6: added a Youth Development Curve check on the Training page; v6.5: fixed finance parsing, removed gold captain highlight, fatigue-aware bowling spell length; v6.4: unstyled panels fixed; v6.3: tactics advisor now loads on game.htm?gameId=...; v6.2: club.htm data-status dashboard; v6.1: training uses age-decay/skill-slowdown/talent-bonus data from the user's FTP_Training model)
 // @author       You
 // @license      MIT
@@ -4559,7 +4559,12 @@ table.ftp-table {
             // horizon (e.g. 16 -> 20) should see the age-training
             // multiplier decline over time (Refs' Age/Primary/Power/
             // Endur. curve), not stay frozen at the player's age today.
-            simPlayer.age = player.age + (week - 1) / 52;
+            // 14 weeks per age-year, not 52 — confirmed by the official
+            // manual ("players age weekly, becoming one year older every
+            // fourteen weeks") and matches the workbook's own Player-tab
+            // layout (Wk0-Wk14 per age column). Using 52 here understated
+            // aging by ~3.7x in every previous version of this simulation.
+            simPlayer.age = player.age + (week - 1) / 14;
             const gains = estimateWeeklyTrainingGain(programKey, simPlayer, academySpeed);
             for (const skill of Object.keys(state)) {
                 if (state[skill].level >= 15) continue; // Legendary — capped
@@ -4604,9 +4609,11 @@ table.ftp-table {
      * deliberate simplification, not an oversight — document it in any
      * UI that shows this plan's output.
      *
-     * Returns { finalSkills, finalProgress, levelUps, timeline, weeks }
-     * where timeline is [{ program, fromWeek, toWeek }] — the actual
-     * program-switch history, e.g. Fielding wk1-8, Batting wk9-140, ...
+     * Returns { finalSkills, finalProgress, levelUps, timeline, weeklyPrograms, weeks }
+     * where timeline is [{ program, fromWeek, toWeek }] (compressed
+     * program-switch history) and weeklyPrograms is a 1-indexed array
+     * (weeklyPrograms[1] = week 1's program) for a genuine week-by-week
+     * breakdown, e.g. the Player Advisor's training table.
      */
     function simulateAdaptiveTrainingPlan(player, weeks, academySpeed, squadContext) {
         const state = {};
@@ -4616,17 +4623,20 @@ table.ftp-table {
 
         const levelUps = [];
         const timeline = [];
+        const weeklyPrograms = [null];
         let currentProgram = null;
         let programStartWeek = 1;
 
         for (let week = 1; week <= weeks; week++) {
             const simPlayer = Object.assign({}, player);
             ADAPTIVE_PLAN_SKILLS.forEach(skill => { simPlayer[skill] = state[skill].level; });
-            simPlayer.age = player.age + (week - 1) / 52;
+            // 14 weeks per age-year (see simulateTrainingPlan) — not 52.
+            simPlayer.age = player.age + (week - 1) / 14;
             simPlayer.fatigue = week === 1 ? player.fatigue : 8;
 
             const rec = recommendTraining(simPlayer, squadContext);
             const program = rec.program;
+            weeklyPrograms.push(program);
 
             if (program !== currentProgram) {
                 if (currentProgram !== null) timeline.push({ program: currentProgram, fromWeek: programStartWeek, toWeek: week - 1 });
@@ -4654,7 +4664,7 @@ table.ftp-table {
             finalSkills[skill] = state[skill].level;
             finalProgress[skill] = state[skill].progress;
         });
-        return { finalSkills, finalProgress, levelUps, timeline, weeks };
+        return { finalSkills, finalProgress, levelUps, timeline, weeklyPrograms, weeks };
     }
 
     // ============================================================
@@ -6578,46 +6588,14 @@ table.ftp-table {
         return { candidateRank, groupLabel, wouldReplace, allPeers: ranked, squadStats };
     }
 
-    /**
-     * Training-potential grid for a youth player: for each training
-     * program relevant to their role, projects where the program's
-     * primary skill lands at several horizons (12wk, 26wk, 1yr, and
-     * "to age 20" — the end of their development window). Reuses
-     * simulateTrainingPlan() (same verified per-week formula as the
-     * Training page's "12wk outlook") run separately per horizon —
-     * cheap pure arithmetic, no reason to complicate it with snapshotting.
-     * This assumes training ONE program continuously for the whole
-     * horizon with no rest/fatigue weeks — a real plan would switch
-     * programs over time (e.g. fielding first, then primary), so treat
-     * the longer columns as a ceiling estimate for that program alone,
-     * not a forecast of the advisor's actual staged recommendation.
-     */
-    function buildTrainingPotentialGrid(player, academySpeed, longHorizonWeeks, longHorizonLabel) {
-        const pd = _detectPlayerContext(player);
-        const programs = ['fielding'];
-        if (pd.isAllrounder) programs.push('allrounder');
-        else if (pd.isKeeper) programs.push('keeping');
-        else if (pd.isBowler) programs.push('bowling', 'bowlingtech');
-        else programs.push('batting', 'battingtech');
-
-        const horizons = [12, 26, 52];
-        const horizonLabels = ['12wk', '26wk', '1yr'];
-        if (longHorizonWeeks && longHorizonWeeks > 52) {
-            horizons.push(longHorizonWeeks);
-            horizonLabels.push(longHorizonLabel || 'long-term');
-        }
-
-        const rows = programs.map(programKey => {
-            const programDef = TRAINING_PROGRAMS[programKey];
-            const primary = programDef.primary;
-            const cells = horizons.map(w => {
-                const proj = simulateTrainingPlan(player, programKey, w, academySpeed);
-                return proj ? skillLabel(proj.finalSkills[primary]) : '—';
-            });
-            return { label: TRAINING_PROGRAM_LABELS[programKey], cells };
-        });
-        return { horizonLabels, rows };
-    }
+    // Short training-program codes matching the workbook's own
+    // abbreviations (Refs!C27:C37) — used for the compact week-by-week
+    // badges on the Player Advisor.
+    const TRAINING_PROGRAM_SHORT_CODE = {
+        batting: 'Bt', bowling: 'Bw', battingtech: 'BtT', bowlingtech: 'BwT',
+        allrounder: 'AR', keeping: 'K', keeperbatting: 'KB', fielding: 'Fd',
+        fitness: 'Ft', strength: 'S', rest: 'R'
+    };
 
     function createPlayerAdvisorUI() {
         createPanel({
@@ -6691,16 +6669,36 @@ table.ftp-table {
 
             let tHtml = `<div class="vj-text-xs vj-text-muted vj-mb-4">Recommended now: <span class="vj-fw-700">${TRAINING_PROGRAM_LABELS[trainingRec.program] || trainingRec.program}</span>${trainingRec.projection && trainingRec.primarySkill ? ` — ${formatTrainingOutlook(trainingRec.projection, trainingRec.primarySkill, player[trainingRec.primarySkill])}` : ''}</div>`;
 
-            const planWeeks = isYouth ? Math.max(52, Math.round(Math.max(1, 20 - player.age) * 52)) : (player.age >= 30 ? 52 : 104);
-            const planLabel = isYouth ? 'Development plan to age 20' : (player.age >= 30 ? '1yr training outlook' : '2yr training outlook');
+            // 14 weeks per age-year (official manual + workbook's own
+            // Wk0-Wk14-per-age-column layout) — not 52. Youth horizon
+            // runs to age 20; senior/aging get a shorter, still-real
+            // window since there's no fixed development window left.
+            const planWeeks = isYouth ? Math.max(14, Math.round(Math.max(1, 20 - player.age) * 14)) : (player.age >= 30 ? 14 : 28);
+            const planLabel = isYouth ? 'Development plan to age 20' : (player.age >= 30 ? '1 age-year training outlook' : '2 age-year training outlook');
 
             // Adaptive plan — the actual staged advice (fielding first,
             // then primary skill for youth; maintenance-focused for
             // aging players, etc), re-decided every simulated week via
-            // recommendTraining() itself, not one program locked in forever.
+            // recommendTraining() itself. No single program is ever
+            // locked in for the whole horizon — nobody actually trains
+            // one skill for months, so this was removed as a comparison.
             const plan = simulateAdaptiveTrainingPlan(player, planWeeks, academySpeed, squadContext);
             tHtml += `<div class="vj-fw-700 vj-mb-4">${planLabel}</div>`;
             tHtml += `<div class="vj-text-xs vj-mb-4">${plan.timeline.map(t => `<span class="vj-fw-700">${TRAINING_PROGRAM_LABELS[t.program] || t.program}</span> (wk${t.fromWeek}${t.toWeek > t.fromWeek ? `-${t.toWeek}` : ''})`).join(' → ')}</div>`;
+
+            // Week-by-week breakdown — one badge per simulated week,
+            // showing exactly which program that week uses (matching the
+            // workbook's own Wk0-Wk14 layout), not just the compressed
+            // summary above.
+            tHtml += `<div class="vj-text-xs vj-fw-700 vj-mb-4">Week by week:</div>`;
+            tHtml += `<div style="display:flex;flex-wrap:wrap;gap:3px;margin-bottom:10px;">`;
+            for (let w = 1; w <= plan.weeks; w++) {
+                const prog = plan.weeklyPrograms[w];
+                const code = TRAINING_PROGRAM_SHORT_CODE[prog] || '?';
+                tHtml += `<span class="ftp-stat-badge neutral" style="font-size:9px;padding:2px 4px;" title="Week ${w}: ${TRAINING_PROGRAM_LABELS[prog] || prog}">${w}:${code}</span>`;
+            }
+            tHtml += `</div>`;
+
             tHtml += `<div style="overflow-x:auto;"><table class="ftp-table"><thead><tr><th>Skill</th><th>Now</th><th>Projected</th></tr></thead><tbody>`;
             ADAPTIVE_PLAN_SKILLS.forEach(skill => {
                 const before = skillLabel(Math.round(player[skill] || 0));
@@ -6709,18 +6707,10 @@ table.ftp-table {
                 tHtml += `<tr><td style="text-transform:capitalize;">${skill}</td><td>${before}</td><td>${before === after ? after : `<span class="vj-fw-700">${after}</span>`}</td></tr>`;
             });
             tHtml += '</tbody></table></div>';
-            tHtml += `<div class="vj-text-xs vj-text-muted vj-mt-4">Assumes ${academyNote}, week 1's real fatigue then a healthy baseline after (fatigue/matches aren't simulated), and re-picks the training program every week using the same staged logic as the live recommendation above — this is the realistic plan, not a single-program ceiling.</div>`;
-
-            // Single-program comparison — kept as a secondary "what if
-            // I specialized in just this the whole time" reference.
-            const grid = buildTrainingPotentialGrid(player, academySpeed, planWeeks, planLabel.match(/\d+yr/) ? planLabel.match(/\d+yr/)[0] : 'to age 20');
-            tHtml += `<div class="vj-fw-700 vj-mt-8 vj-mb-4">If you specialized in one program (ceiling comparison)</div>`;
-            tHtml += `<div style="overflow-x:auto;"><table class="ftp-table"><thead><tr><th>Program</th>${grid.horizonLabels.map(h => `<th>${h}</th>`).join('')}</tr></thead><tbody>`;
-            grid.rows.forEach(r => {
-                tHtml += `<tr><td>${r.label}</td>${r.cells.map(c => `<td>${c}</td>`).join('')}</tr>`;
-            });
-            tHtml += '</tbody></table></div>';
-            tHtml += `<div class="vj-text-xs vj-text-muted vj-mt-4">Each row assumes training that ONE program continuously the whole time — nobody actually trains like this, it's here to show the ceiling for a single focus vs the realistic mixed plan above.</div>`;
+            tHtml += `<div class="vj-text-xs vj-text-muted vj-mt-4">Assumes ${academyNote}, week 1's real fatigue then a healthy baseline after (match fatigue isn't simulated — no match schedule to drive it), and re-picks the training program every week using the same staged logic as the live recommendation above.</div>`;
+            if (player.age >= 29) {
+                tHtml += `<div class="vj-text-xs vj-mt-4" style="color:var(--vj-amber);">⚠ The workbook notes skills actively DECLINE weekly from age 30 (not just train slower), doubling at 31, with endurance declining twice as fast as other skills — confirmed real but no exact rate was found, so this projection does NOT subtract for it and likely overstates outcomes for this player.</div>`;
+            }
             trainingEl.innerHTML = tHtml;
         }
 
