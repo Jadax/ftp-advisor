@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         FTP Advisor
 // @namespace    http://tampermonkey.net/
-// @version      8.1
+// @version      8.2
 // @description  Comprehensive tactical advisor for From the Pavilion cricket game (v7.0: full UI redesign with modern navy+gold theme, reusable createPanel() helper, stat badges, rec cards, and component library; v6.6: added a Youth Development Curve check on the Training page; v6.5: fixed finance parsing, removed gold captain highlight, fatigue-aware bowling spell length; v6.4: unstyled panels fixed; v6.3: tactics advisor now loads on game.htm?gameId=...; v6.2: club.htm data-status dashboard; v6.1: training uses age-decay/skill-slowdown/talent-bonus data from the user's FTP_Training model)
 // @author       You
 // @license      MIT
@@ -6354,7 +6354,8 @@ table.ftp-table {
             name, age: age || 0, rating, wage,
             bowlerType, bowlerCategory: BOWLER_CATEGORY[bowlerType] || 'none', bowlerPace: BOWLER_PACE[bowlerType] || 0,
             batting: 0, bowling: 0, keeping: 0, technique: 0, power: 0, fielding: 0, endurance: 0,
-            experience: 0, captaincy: 0, talents: [], price: 0
+            experience: 0, captaincy: 0, talents: [], price: 0,
+            fatigue: 10, form: 4, currentTraining: null // safe neutral defaults if not found on page
         };
 
         const skillLabelMap = {
@@ -6370,6 +6371,10 @@ table.ftp-table {
             if (key) {
                 player[key] = parseSkill(td.textContent.trim().toLowerCase());
                 skillFieldsFound++;
+            } else if (label === 'fatigue') {
+                player.fatigue = parseFatigue(td.textContent.trim().toLowerCase());
+            } else if (label === 'form') {
+                player.form = parseSkill(td.textContent.trim().toLowerCase());
             } else if (label === 'talents' && player.talents.length === 0) {
                 const spans = td.querySelectorAll('span.popuphelp');
                 spans.forEach(span => {
@@ -6413,6 +6418,44 @@ table.ftp-table {
         return { candidateRank, groupLabel, wouldReplace, allPeers: ranked, squadStats };
     }
 
+    /**
+     * Training-potential grid for a youth player: for each training
+     * program relevant to their role, projects where the program's
+     * primary skill lands at several horizons (12wk, 26wk, 1yr, and
+     * "to age 20" — the end of their development window). Reuses
+     * simulateTrainingPlan() (same verified per-week formula as the
+     * Training page's "12wk outlook") run separately per horizon —
+     * cheap pure arithmetic, no reason to complicate it with snapshotting.
+     * This assumes training ONE program continuously for the whole
+     * horizon with no rest/fatigue weeks — a real plan would switch
+     * programs over time (e.g. fielding first, then primary), so treat
+     * the longer columns as a ceiling estimate for that program alone,
+     * not a forecast of the advisor's actual staged recommendation.
+     */
+    function buildTrainingPotentialGrid(player, academySpeed) {
+        const pd = _detectPlayerContext(player);
+        const programs = ['fielding'];
+        if (pd.isAllrounder) programs.push('allrounder');
+        else if (pd.isKeeper) programs.push('keeping');
+        else if (pd.isBowler) programs.push('bowling', 'bowlingtech');
+        else programs.push('batting', 'battingtech');
+
+        const yearsToTwenty = Math.max(1, 20 - player.age);
+        const horizons = [12, 26, 52, Math.round(yearsToTwenty * 52)];
+        const horizonLabels = ['12wk', '26wk', '1yr', 'to age 20'];
+
+        const rows = programs.map(programKey => {
+            const programDef = TRAINING_PROGRAMS[programKey];
+            const primary = programDef.primary;
+            const cells = horizons.map(w => {
+                const proj = simulateTrainingPlan(player, programKey, w, academySpeed);
+                return proj ? skillLabel(proj.finalSkills[primary]) : '—';
+            });
+            return { label: TRAINING_PROGRAM_LABELS[programKey], cells };
+        });
+        return { horizonLabels, rows };
+    }
+
     function createPlayerAdvisorUI() {
         createPanel({
             title: 'Player Advisor', icon: '\u{1F464}',
@@ -6420,6 +6463,7 @@ table.ftp-table {
             sections: [
                 { id: 'ftp-player-verdict', label: 'Recommendation', icon: '⚖️', iconColor: 'blue',
                   content: '<div class="vj-text-sm vj-text-muted">Loading...</div>' },
+                { id: 'ftp-player-training', label: 'Training Potential', icon: '\u{1F4C8}', iconColor: 'teal' },
                 { id: 'ftp-player-compare', label: 'Squad Comparison', icon: '\u{1F504}', iconColor: 'purple' }
             ]
         });
@@ -6465,6 +6509,33 @@ table.ftp-table {
             }
         }
         verdictEl.innerHTML = html;
+
+        // Training potential — youth only. Reuses the same verified
+        // per-week formula as the Training page's "12wk outlook"
+        // (estimateWeeklyTrainingGain/simulateTrainingPlan), not a new
+        // model, so it stays consistent with whatever those get fixed
+        // to later.
+        const trainingEl = document.getElementById('ftp-player-training');
+        if (trainingEl) {
+            if (isYouth) {
+                const academyInfo = loadAcademyCache();
+                const academySpeed = ACADEMY_SPEED[academyInfo ? academyInfo.levelNum : 0] || 1.00;
+                const squadContext = { size: squadPlayers.length, academyInfo, financeInfo: loadFinanceCache() };
+                const trainingRec = recommendTraining(player, squadContext);
+                const grid = buildTrainingPotentialGrid(player, academySpeed);
+
+                let tHtml = `<div class="vj-text-xs vj-text-muted vj-mb-4">Recommended now: <span class="vj-fw-700">${TRAINING_PROGRAM_LABELS[trainingRec.program] || trainingRec.program}</span>${trainingRec.projection && trainingRec.primarySkill ? ` — ${formatTrainingOutlook(trainingRec.projection, trainingRec.primarySkill, player[trainingRec.primarySkill])}` : ''}</div>`;
+                tHtml += `<div style="overflow-x:auto;"><table class="ftp-table"><thead><tr><th>Program</th>${grid.horizonLabels.map(h => `<th>${h}</th>`).join('')}</tr></thead><tbody>`;
+                grid.rows.forEach(r => {
+                    tHtml += `<tr><td>${r.label}</td>${r.cells.map(c => `<td>${c}</td>`).join('')}</tr>`;
+                });
+                tHtml += '</tbody></table></div>';
+                tHtml += `<div class="vj-text-xs vj-text-muted vj-mt-4">Each row assumes training that program continuously${academyInfo ? ` at your current ${academyInfo.level} academy` : ' (academy level unknown — visit the Academy page to cache it for a more accurate estimate)'}, no rest weeks. Longer columns are a ceiling for sticking with one program, not a forecast of switching programs over time the way the actual advice above might.</div>`;
+                trainingEl.innerHTML = tHtml;
+            } else {
+                trainingEl.innerHTML = '<div class="vj-text-xs vj-text-muted">Training potential is shown for youth (16-20) only — seniors are past most of their development window.</div>';
+            }
+        }
 
         // Squad comparison — who this player would realistically replace.
         // Most useful for 21+ (peer-age comparison against your senior
