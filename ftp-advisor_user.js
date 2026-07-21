@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         FTP Advisor
 // @namespace    http://tampermonkey.net/
-// @version      8.5
+// @version      8.6
 // @description  Comprehensive tactical advisor for From the Pavilion cricket game (v7.0: full UI redesign with modern navy+gold theme, reusable createPanel() helper, stat badges, rec cards, and component library; v6.6: added a Youth Development Curve check on the Training page; v6.5: fixed finance parsing, removed gold captain highlight, fatigue-aware bowling spell length; v6.4: unstyled panels fixed; v6.3: tactics advisor now loads on game.htm?gameId=...; v6.2: club.htm data-status dashboard; v6.1: training uses age-decay/skill-slowdown/talent-bonus data from the user's FTP_Training model)
 // @author       You
 // @license      MIT
@@ -978,6 +978,147 @@
         });
     }
 
+    /**
+     * Parses one player block from a squadViewId=1 ("Overall Summary")
+     * page — a fundamentally different DOM shape than the squadViewId=2
+     * grid table (parsePlayerRow/parseOpponentPlayerRow): one
+     * <div class="padded senior|youth"> per player, not a <tr>.
+     * Confirmed via real HTML from both the user's own squad AND an
+     * opponent's squad: THIS view exposes Talents (span.popuphelp,
+     * title="Name|Description") for BOTH — the grid view used
+     * everywhere else never has talents at all, for anyone. Own-squad
+     * blocks additionally include a skills table with each player's
+     * current training program; opponent blocks only have the two info
+     * <p> lines (no skill numbers — same opponent-scouting limitation
+     * documented elsewhere, this view doesn't lift it).
+     */
+    function parseSummaryViewBlock(block) {
+        const nameLink = block.querySelector('h3 a');
+        if (!nameLink) return null;
+        const playerId = (nameLink.href.match(/playerId=(\d+)/) || [])[1];
+        // Opponent pages prefix the name with a squad number ("01. Name")
+        const name = nameLink.textContent.replace(/^\d+\.\s*/, '').trim();
+
+        const ps = block.querySelectorAll(':scope > p');
+        const infoText = ps[0] ? ps[0].textContent : '';
+        const statsText = ps[1] ? ps[1].textContent : '';
+
+        const ageMatch = infoText.match(/(\d+)\s*years?\s*(\d+)\s*weeks?\s*old/i);
+        // 14 weeks/age-year — see simulateTrainingPlan's own comment for the source.
+        const age = ageMatch ? parseInt(ageMatch[1], 10) + parseInt(ageMatch[2], 10) / 14 : 0;
+        const ratingMatch = infoText.match(/([\d,]+)\s*rating/i);
+        const rating = ratingMatch ? parseInt(ratingMatch[1].replace(/,/g, ''), 10) : 0;
+        const wageMatch = infoText.match(/\$([\d,]+)\s*wage/i);
+        const wage = wageMatch ? parseInt(wageMatch[1].replace(/,/g, ''), 10) : 0;
+        const isLeftHanded = /left hand batsman/i.test(infoText);
+
+        let bowlerType = '';
+        for (const [re, code] of BOWLER_TYPE_PHRASES) {
+            if (re.test(infoText)) { bowlerType = code; break; }
+        }
+
+        const talents = [];
+        block.querySelectorAll('span.popuphelp').forEach(span => {
+            const title = span.getAttribute('title') || '';
+            const t = title.split('|')[0].trim();
+            if (t) talents.push(t);
+        });
+
+        const expMatch = statsText.match(/([a-z]+)\s*experience/i);
+        const formMatch = statsText.match(/([a-z]+)\s*form/i);
+        const fatigueMatch = statsText.match(/([a-z]+)\s*fatigue/i);
+        const captMatch = statsText.match(/([a-z]+)\s*captaincy/i);
+
+        const player = {
+            id: playerId, name, age, rating, wage,
+            isLeftHanded, bowlerType,
+            bowlerCategory: BOWLER_CATEGORY[bowlerType] || 'none',
+            bowlerPace: BOWLER_PACE[bowlerType] || 0,
+            talents,
+            experience: expMatch ? parseSkill(expMatch[1]) : 0,
+            form: formMatch ? parseSkill(formMatch[1]) : 0,
+            fatigue: fatigueMatch ? parseFatigue(fatigueMatch[1]) : 0,
+            captaincy: captMatch ? parseSkill(captMatch[1]) : 0,
+            isSenior: block.classList.contains('senior'),
+            isYouth: block.classList.contains('youth'),
+            hasFullSkills: false,
+            batting: 0, bowling: 0, keeping: 0, technique: 0, power: 0, fielding: 0, endurance: 0,
+            currentTraining: null
+        };
+
+        // Own-squad blocks additionally have a skills table with a
+        // "Training" cell (current training program).
+        const skillsTable = block.querySelector('table.data');
+        if (skillsTable) {
+            const skillLabelMap = { batting: 'batting', bowling: 'bowling', keeping: 'keeping', technique: 'technique', power: 'power', fielding: 'fielding', endurance: 'endurance' };
+            let found = 0;
+            skillsTable.querySelectorAll('th').forEach(th => {
+                const label = th.textContent.trim().toLowerCase();
+                const td = th.nextElementSibling;
+                if (!td || td.tagName !== 'TD') return;
+                if (label === 'training') {
+                    player.currentTraining = td.textContent.trim();
+                } else if (skillLabelMap[label]) {
+                    player[skillLabelMap[label]] = parseSkill(td.textContent.trim().toLowerCase());
+                    found++;
+                }
+            });
+            player.hasFullSkills = found >= 5;
+        }
+
+        return player;
+    }
+
+    function scrapeSummaryView(doc) {
+        const blocks = doc.querySelectorAll('#standardsummary .padded');
+        const players = [];
+        blocks.forEach(b => {
+            const p = parseSummaryViewBlock(b);
+            if (p) players.push(p);
+        });
+        return players;
+    }
+
+    function fetchSquadSummaryView(url) {
+        return new Promise((resolve) => {
+            GM_xmlhttpRequest({
+                method: 'GET',
+                url: url,
+                timeout: 15000,
+                onload: (response) => {
+                    if (response.status !== 200) { resolve([]); return; }
+                    try {
+                        const doc = new DOMParser().parseFromString(response.responseText, 'text/html');
+                        resolve(scrapeSummaryView(doc));
+                    } catch (e) {
+                        resolve([]);
+                    }
+                },
+                onerror: () => resolve([]),
+                ontimeout: () => resolve([])
+            });
+        });
+    }
+
+    /**
+     * Merges Talents (and current training, where available) from a
+     * squadViewId=1 fetch into the squadViewId=2-sourced player objects
+     * that carry the full skill grid — combining the two views' data
+     * rather than picking one over the other, since neither alone is
+     * complete (grid has skills but no talents; summary has talents
+     * but only own-squad has skills).
+     */
+    function mergeTalentsIntoPlayers(players, summaryPlayers) {
+        const byId = new Map(summaryPlayers.map(p => [p.id, p]));
+        players.forEach(p => {
+            const s = byId.get(p.id);
+            if (!s) return;
+            p.talents = s.talents;
+            if (s.currentTraining) p.currentTraining = s.currentTraining;
+            if (s.isLeftHanded) p.isLeftHanded = true;
+        });
+    }
+
     function fetchAcademyFromPage(url) {
         return new Promise((resolve, reject) => {
             GM_xmlhttpRequest({
@@ -1758,11 +1899,19 @@
             promises.push(
                 fetchSquadFromPage(`https://www.fromthepavilion.org/seniors.htm?squadViewId=2&teamId=${TEAM_ID}`)
                     .then(async (seniors) => {
-                        const youth = await fetchSquadFromPage(`https://www.fromthepavilion.org/youths.htm?teamId=${TEAM_ID}`).catch(() => []);
+                        const [youth, summarySeniors, summaryYouth] = await Promise.all([
+                            fetchSquadFromPage(`https://www.fromthepavilion.org/youths.htm?teamId=${TEAM_ID}`).catch(() => []),
+                            // squadViewId=1 is the only view that exposes
+                            // Talents — the grid view (=2) above never has
+                            // them, for own squad or opponents.
+                            fetchSquadSummaryView(`https://www.fromthepavilion.org/seniors.htm?squadViewId=1&teamId=${TEAM_ID}`),
+                            fetchSquadSummaryView(`https://www.fromthepavilion.org/youths.htm?squadViewId=1&teamId=${TEAM_ID}`)
+                        ]);
                         const existing = loadPlayerCache();
                         const map = {};
                         seniors.forEach(p => { map[p.id] = p; });
                         youth.forEach(p => { if (!map[p.id]) map[p.id] = p; });
+                        mergeTalentsIntoPlayers(Object.values(map), [...summarySeniors, ...summaryYouth]);
                         savePlayerCache(Object.values(map));
                         console.log('[FTP Data] Squad refreshed:', Object.values(map).length, 'players');
                     })
@@ -2160,10 +2309,18 @@
     }
 
     async function fetchOpponentSquad(teamId) {
-        // Fetch BOTH senior and youth squads in parallel
-        const [seniors, youth] = await Promise.all([
+        // Fetch BOTH senior and youth squads in parallel, plus the
+        // squadViewId=1 summary view for each — confirmed via real HTML
+        // that opponent summary pages expose Talents (span.popuphelp)
+        // even though the grid view (=2) never does. Skill numbers
+        // still aren't available for opponents either way — that
+        // limitation is the game's own scouting design, not fixed by
+        // this view.
+        const [seniors, youth, summarySeniors, summaryYouth] = await Promise.all([
             fetchSquadFromPage(`https://www.fromthepavilion.org/seniors.htm?squadViewId=2&orderBy=&teamId=${teamId}&playerType=0`).catch(() => []),
-            fetchSquadFromPage(`https://www.fromthepavilion.org/youths.htm?teamId=${teamId}`).catch(() => [])
+            fetchSquadFromPage(`https://www.fromthepavilion.org/youths.htm?teamId=${teamId}`).catch(() => []),
+            fetchSquadSummaryView(`https://www.fromthepavilion.org/seniors.htm?squadViewId=1&orderBy=&teamId=${teamId}&playerType=0`),
+            fetchSquadSummaryView(`https://www.fromthepavilion.org/youths.htm?squadViewId=1&teamId=${teamId}`)
         ]);
 
         // Merge and deduplicate by player ID
@@ -2175,6 +2332,7 @@
                 players.push(p);
             }
         }
+        mergeTalentsIntoPlayers(players, [...summarySeniors, ...summaryYouth]);
         saveOpponentCache(teamId, players);
         return players;
     }
@@ -2571,6 +2729,18 @@
         // Find key bowler (highest experience bowler)
         const keyBowler = [...allBowlers].sort((a, b) => b.experience - a.experience)[0];
 
+        // Opponent talent signals — now possible because fetchOpponentSquad
+        // also pulls squadViewId=1 (Talents aren't in the grid view at all,
+        // for anyone). Seam/Spin Specialist here are the opponent's
+        // BATTERS being good against that bowling type — i.e. a signal for
+        // which of MY bowling types to lean on, not a bowling threat.
+        // Dangerous-delivery talents are real bowling threats regardless
+        // of quantified size (see the triggered-talent scoring notes).
+        const oppSeamSpecialistBatters = playingSquad.filter(p => (p.talents || []).some(t => /seam specialist/i.test(t))).length;
+        const oppSpinSpecialistBatters = playingSquad.filter(p => (p.talents || []).some(t => /spin specialist/i.test(t))).length;
+        const DANGEROUS_BOWLING_TALENTS = /wrongun|flipper|swing|bouncer|yorker|slower ball|arm ball|doosra/i;
+        const dangerousBowlers = allBowlers.filter(p => (p.talents || []).some(t => DANGEROUS_BOWLING_TALENTS.test(t)));
+
         // Compare against my team if provided
         let relativeStrength = 'unknown';
         if (myPlayers && myPlayers.length > 0) {
@@ -2608,7 +2778,11 @@
             // Form: if avg form is high, they're in form
             inForm: avgForm > 7,
             // Total bowler count
-            totalBowlers: allBowlers.length
+            totalBowlers: allBowlers.length,
+            // Opponent talent signals (see comment above keyBowler)
+            oppSeamSpecialistBatters, oppSpinSpecialistBatters,
+            dangerousBowlerCount: dangerousBowlers.length,
+            dangerousBowlerNames: dangerousBowlers.map(p => p.name)
         };
     }
 
@@ -2714,6 +2888,13 @@
                 const hasTalent = (regex) => talents.some(t => regex.test(t));
                 if (hasTalent(/seam specialist/i) && opponentAnalysis.seamerCount > opponentAnalysis.spinnerCount) batScore *= 1.1;
                 if (hasTalent(/spin specialist/i) && opponentAnalysis.spinnerCount > opponentAnalysis.seamerCount) batScore *= 1.1;
+
+                // If more of THEIR batters hold Seam Specialist than Spin
+                // Specialist, they're comparatively less prepared for
+                // spin (and vice versa) — lean on the bowling type their
+                // own talent investment didn't cover.
+                if (opponentAnalysis.oppSeamSpecialistBatters > opponentAnalysis.oppSpinSpecialistBatters && p.bowlerCategory === 'spin') bowlScore *= 1.1;
+                if (opponentAnalysis.oppSpinSpecialistBatters > opponentAnalysis.oppSeamSpecialistBatters && p.bowlerCategory === 'seam') bowlScore *= 1.1;
             }
 
             return {
