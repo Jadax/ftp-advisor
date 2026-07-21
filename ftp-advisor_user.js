@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         FTP Advisor
 // @namespace    http://tampermonkey.net/
-// @version      8.2
+// @version      8.3
 // @description  Comprehensive tactical advisor for From the Pavilion cricket game (v7.0: full UI redesign with modern navy+gold theme, reusable createPanel() helper, stat badges, rec cards, and component library; v6.6: added a Youth Development Curve check on the Training page; v6.5: fixed finance parsing, removed gold captain highlight, fatigue-aware bowling spell length; v6.4: unstyled panels fixed; v6.3: tactics advisor now loads on game.htm?gameId=...; v6.2: club.htm data-status dashboard; v6.1: training uses age-decay/skill-slowdown/talent-bonus data from the user's FTP_Training model)
 // @author       You
 // @license      MIT
@@ -4482,6 +4482,11 @@ table.ftp-table {
         for (let week = 1; week <= weeks; week++) {
             const simPlayer = Object.assign({}, player);
             for (const skill of Object.keys(state)) simPlayer[skill] = state[skill].level;
+            // Age must advance during the simulation — a multi-year
+            // horizon (e.g. 16 -> 20) should see the age-training
+            // multiplier decline over time (Refs' Age/Primary/Power/
+            // Endur. curve), not stay frozen at the player's age today.
+            simPlayer.age = player.age + (week - 1) / 52;
             const gains = estimateWeeklyTrainingGain(programKey, simPlayer, academySpeed);
             for (const skill of Object.keys(state)) {
                 if (state[skill].level >= 15) continue; // Legendary — capped
@@ -4500,6 +4505,83 @@ table.ftp-table {
             finalProgress[skill] = state[skill].progress;
         }
         return { finalSkills, finalProgress, levelUps, weeks };
+    }
+
+    // Skills tracked across the whole adaptive plan (every skill any
+    // training program can touch), independent of which program is
+    // active in a given week.
+    const ADAPTIVE_PLAN_SKILLS = ['endurance', 'batting', 'bowling', 'technique', 'power', 'keeping', 'fielding'];
+
+    /**
+     * Multi-week plan that actually switches training programs over
+     * time, the way a real player would — re-runs the SAME staged
+     * recommendation logic (recommendTraining(), which already decides
+     * "fielding first if < Capable, then primary skill, etc.") fresh
+     * every simulated week against the player's then-current simulated
+     * skills, rather than locking in one program for the whole horizon
+     * (see simulateTrainingPlan() for that simpler version). Age and
+     * academy speed/talent/skill-slowdown multipliers all apply exactly
+     * as they do for a real recommendation, every week.
+     *
+     * Fatigue is NOT dynamically modelled (no match simulation to drive
+     * it) — week 1 uses the player's real current fatigue so "right
+     * now" advice is accurate, but week 2+ assumes a healthy baseline
+     * (8/10, "energetic") so a currently-tired snapshot doesn't lock a
+     * multi-year development plan into permanent Rest. This is a
+     * deliberate simplification, not an oversight — document it in any
+     * UI that shows this plan's output.
+     *
+     * Returns { finalSkills, finalProgress, levelUps, timeline, weeks }
+     * where timeline is [{ program, fromWeek, toWeek }] — the actual
+     * program-switch history, e.g. Fielding wk1-8, Batting wk9-140, ...
+     */
+    function simulateAdaptiveTrainingPlan(player, weeks, academySpeed, squadContext) {
+        const state = {};
+        ADAPTIVE_PLAN_SKILLS.forEach(skill => {
+            state[skill] = { level: Math.min(15, Math.round(player[skill] || 0)), progress: 0 };
+        });
+
+        const levelUps = [];
+        const timeline = [];
+        let currentProgram = null;
+        let programStartWeek = 1;
+
+        for (let week = 1; week <= weeks; week++) {
+            const simPlayer = Object.assign({}, player);
+            ADAPTIVE_PLAN_SKILLS.forEach(skill => { simPlayer[skill] = state[skill].level; });
+            simPlayer.age = player.age + (week - 1) / 52;
+            simPlayer.fatigue = week === 1 ? player.fatigue : 8;
+
+            const rec = recommendTraining(simPlayer, squadContext);
+            const program = rec.program;
+
+            if (program !== currentProgram) {
+                if (currentProgram !== null) timeline.push({ program: currentProgram, fromWeek: programStartWeek, toWeek: week - 1 });
+                currentProgram = program;
+                programStartWeek = week;
+            }
+
+            if (program === 'rest') continue; // no skill gain this week
+            const gains = estimateWeeklyTrainingGain(program, simPlayer, academySpeed);
+            if (!gains) continue;
+            Object.keys(gains).forEach(skill => {
+                if (!state[skill] || state[skill].level >= 15) return;
+                state[skill].progress += gains[skill] || 0;
+                while (state[skill].progress >= 1000 && state[skill].level < 15) {
+                    state[skill].progress -= 1000;
+                    state[skill].level += 1;
+                    levelUps.push({ week, skill, newLevel: state[skill].level });
+                }
+            });
+        }
+        if (currentProgram !== null) timeline.push({ program: currentProgram, fromWeek: programStartWeek, toWeek: weeks });
+
+        const finalSkills = {}, finalProgress = {};
+        ADAPTIVE_PLAN_SKILLS.forEach(skill => {
+            finalSkills[skill] = state[skill].level;
+            finalProgress[skill] = state[skill].progress;
+        });
+        return { finalSkills, finalProgress, levelUps, timeline, weeks };
     }
 
     // ============================================================
@@ -6522,15 +6604,37 @@ table.ftp-table {
                 const academySpeed = ACADEMY_SPEED[academyInfo ? academyInfo.levelNum : 0] || 1.00;
                 const squadContext = { size: squadPlayers.length, academyInfo, financeInfo: loadFinanceCache() };
                 const trainingRec = recommendTraining(player, squadContext);
-                const grid = buildTrainingPotentialGrid(player, academySpeed);
+                const academyNote = academyInfo ? `your current ${academyInfo.level} academy` : 'an unknown academy level (visit the Academy page to cache it for a more accurate estimate)';
 
                 let tHtml = `<div class="vj-text-xs vj-text-muted vj-mb-4">Recommended now: <span class="vj-fw-700">${TRAINING_PROGRAM_LABELS[trainingRec.program] || trainingRec.program}</span>${trainingRec.projection && trainingRec.primarySkill ? ` — ${formatTrainingOutlook(trainingRec.projection, trainingRec.primarySkill, player[trainingRec.primarySkill])}` : ''}</div>`;
+
+                // Adaptive development plan — the actual staged advice
+                // (fielding first, then primary skill, etc), re-decided
+                // every simulated week, not one program locked in forever.
+                const weeksToTwenty = Math.max(52, Math.round(Math.max(1, 20 - player.age) * 52));
+                const plan = simulateAdaptiveTrainingPlan(player, weeksToTwenty, academySpeed, squadContext);
+                tHtml += `<div class="vj-fw-700 vj-mb-4">Development plan to age 20</div>`;
+                tHtml += `<div class="vj-text-xs vj-mb-4">${plan.timeline.map(t => `<span class="vj-fw-700">${TRAINING_PROGRAM_LABELS[t.program] || t.program}</span> (wk${t.fromWeek}${t.toWeek > t.fromWeek ? `-${t.toWeek}` : ''})`).join(' → ')}</div>`;
+                tHtml += `<div style="overflow-x:auto;"><table class="ftp-table"><thead><tr><th>Skill</th><th>Now</th><th>Projected</th></tr></thead><tbody>`;
+                ADAPTIVE_PLAN_SKILLS.forEach(skill => {
+                    const before = skillLabel(Math.round(player[skill] || 0));
+                    const after = skillLabel(plan.finalSkills[skill]);
+                    if (before === after && plan.finalSkills[skill] === Math.round(player[skill] || 0) && (plan.finalProgress[skill] || 0) === 0) return; // untouched skill, skip
+                    tHtml += `<tr><td style="text-transform:capitalize;">${skill}</td><td>${before}</td><td>${before === after ? after : `<span class="vj-fw-700">${after}</span>`}</td></tr>`;
+                });
+                tHtml += '</tbody></table></div>';
+                tHtml += `<div class="vj-text-xs vj-text-muted vj-mt-4">Assumes ${academyNote}, week 1's real fatigue then a healthy baseline after (fatigue/matches aren't simulated), and re-picks the training program every week using the same staged logic as the live recommendation above — this is the realistic plan, not a single-program ceiling.</div>`;
+
+                // Single-program comparison — kept as a secondary "what if
+                // I specialized in just this the whole time" reference.
+                const grid = buildTrainingPotentialGrid(player, academySpeed);
+                tHtml += `<div class="vj-fw-700 vj-mt-8 vj-mb-4">If you specialized in one program (ceiling comparison)</div>`;
                 tHtml += `<div style="overflow-x:auto;"><table class="ftp-table"><thead><tr><th>Program</th>${grid.horizonLabels.map(h => `<th>${h}</th>`).join('')}</tr></thead><tbody>`;
                 grid.rows.forEach(r => {
                     tHtml += `<tr><td>${r.label}</td>${r.cells.map(c => `<td>${c}</td>`).join('')}</tr>`;
                 });
                 tHtml += '</tbody></table></div>';
-                tHtml += `<div class="vj-text-xs vj-text-muted vj-mt-4">Each row assumes training that program continuously${academyInfo ? ` at your current ${academyInfo.level} academy` : ' (academy level unknown — visit the Academy page to cache it for a more accurate estimate)'}, no rest weeks. Longer columns are a ceiling for sticking with one program, not a forecast of switching programs over time the way the actual advice above might.</div>`;
+                tHtml += `<div class="vj-text-xs vj-text-muted vj-mt-4">Each row assumes training that ONE program continuously the whole time — nobody actually trains like this, it's here to show the ceiling for a single focus vs the realistic mixed plan above.</div>`;
                 trainingEl.innerHTML = tHtml;
             } else {
                 trainingEl.innerHTML = '<div class="vj-text-xs vj-text-muted">Training potential is shown for youth (16-20) only — seniors are past most of their development window.</div>';
