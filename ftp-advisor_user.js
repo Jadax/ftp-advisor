@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         FTP Advisor
 // @namespace    http://tampermonkey.net/
-// @version      8.3
+// @version      8.4
 // @description  Comprehensive tactical advisor for From the Pavilion cricket game (v7.0: full UI redesign with modern navy+gold theme, reusable createPanel() helper, stat badges, rec cards, and component library; v6.6: added a Youth Development Curve check on the Training page; v6.5: fixed finance parsing, removed gold captain highlight, fatigue-aware bowling spell length; v6.4: unstyled panels fixed; v6.3: tactics advisor now loads on game.htm?gameId=...; v6.2: club.htm data-status dashboard; v6.1: training uses age-decay/skill-slowdown/talent-bonus data from the user's FTP_Training model)
 // @author       You
 // @license      MIT
@@ -1025,6 +1025,29 @@
     // index 10 = deluxe, matching ACADEMY_LEVELS' `num` field.
     const ACADEMY_SPEED = [1.00, 1.03, 1.06, 1.09, 1.12, 1.15, 1.18, 1.21, 1.24, 1.27, 1.30];
 
+    /**
+     * Real, age-appropriate training speed for a specific player.
+     * Prefers the game's own directly-displayed "Senior/Youth Training
+     * Efficiency %" (scraped from the Academy page, parseAcademyDoc)
+     * over the derived ACADEMY_SPEED curve above — it's live per-team
+     * data straight from the source, not an estimate, and critically
+     * it's the correct AGE-SPECIFIC figure. The official game manual
+     * (rules.htm?rulespage=training) confirms senior and youth academy
+     * effectiveness are tracked separately by the game itself; a single
+     * ACADEMY_SPEED curve applied to every age (as this script did
+     * before) can never capture that distinction, only ACADEMY_SPEED's
+     * derived level-based estimate can, as a fallback before the
+     * Academy page has ever been visited/cached.
+     */
+    function getAcademySpeedForPlayer(player, academyInfo) {
+        if (academyInfo) {
+            const isYouthPlayer = (player.age || 0) < 21;
+            const liveEfficiency = isYouthPlayer ? academyInfo.youthEfficiency : academyInfo.seniorEfficiency;
+            if (liveEfficiency != null) return liveEfficiency / 100;
+        }
+        return ACADEMY_SPEED[academyInfo ? academyInfo.levelNum : 0] || 1.00;
+    }
+
     // ============================================================
     // AGE-BASED SKILL THRESHOLDS for transfer evaluation
     // Derived from community training feedback & forum consensus.
@@ -1167,8 +1190,11 @@
             if (hasTalent(/old ball bowler/i)) { score += 1; strengths.push('Old Ball Bowler — death overs specialist'); }
             if (hasTalent(/^opener$/i)) { score += 1; strengths.push('Opener — bats at top of order'); }
             if (hasTalent(/finisher/i)) { score += 1; strengths.push('Finisher — end-of-innings specialist'); }
-            if (hasTalent(/seam specialist/i)) { score += 1; strengths.push('Seam Specialist'); }
-            if (hasTalent(/spin specialist/i)) { score += 1; strengths.push('Spin Specialist'); }
+            // Batting matchup talents (official manual: "performs better
+            // when batting against seam/spin bowlers") — only meaningful
+            // for a player whose primary skill is batting.
+            if (hasTalent(/seam specialist/i) && (player.batting || 0) >= (player.bowling || 0)) { score += 1; strengths.push('Seam Specialist — better batting vs seam'); }
+            if (hasTalent(/spin specialist/i) && (player.batting || 0) >= (player.bowling || 0)) { score += 1; strengths.push('Spin Specialist — better batting vs spin'); }
 
             // "The base" — age-specific primary/technique/experience/
             // fielding minimums (rating for youth). HARD FILTER: must
@@ -1251,8 +1277,12 @@
         const talents = player.talents || [];
         const hasTalent = (regex) => talents.some(t => regex.test(t));
 
-        // Training talents (long-term value) — less valuable for seniors
-        if (hasTalent(/prodigy/i)) { score += 1; strengths.push('Prodigy — (limited value at this age)'); }
+        // Training talents (long-term value) — less valuable for seniors.
+        // Prodigy specifically: the official game manual confirms it
+        // trains faster "while in the youth squad" only — zero training
+        // benefit once senior, not just "less" — so no score bonus here
+        // (a senior scoring well elsewhere isn't helped by a stale Prodigy tag).
+        if (hasTalent(/prodigy/i)) { strengths.push('Prodigy (no training benefit now senior, but confirms elite youth potential)'); }
         if (hasTalent(/gifted.*batting/i)) { score += 1; strengths.push('Gifted (Batting) — trains batting faster'); }
         if (hasTalent(/gifted.*bowling/i)) { score += 1; strengths.push('Gifted (Bowling) — trains bowling faster'); }
         if (hasTalent(/gifted.*technique/i)) { score += 1; strengths.push('Gifted (Technique) — trains technique faster'); }
@@ -1281,11 +1311,15 @@
         if (hasTalent(/finisher/i) && primaryName === 'batting') {
             score += 1; strengths.push('Finisher — performs better batting at the end of the innings');
         }
-        if (hasTalent(/seam specialist/i)) {
-            score += 1; strengths.push('Seam Specialist — performs better against seam bowling');
+        // Seam/Spin Specialist are BATTING matchup talents (official
+        // manual: "performs better than normal when batting against
+        // seam/spin bowlers") — only meaningful for a player who
+        // actually bats, same gating as Opener/Finisher above.
+        if (hasTalent(/seam specialist/i) && primaryName === 'batting') {
+            score += 1; strengths.push('Seam Specialist — performs better batting against seam bowling');
         }
-        if (hasTalent(/spin specialist/i)) {
-            score += 1; strengths.push('Spin Specialist — performs better against spin bowling');
+        if (hasTalent(/spin specialist/i) && primaryName === 'batting') {
+            score += 1; strengths.push('Spin Specialist — performs better batting against spin bowling');
         }
         if (hasTalent(/safe hands/i)) {
             score += 1; strengths.push('Safe Hands — fielding/keeping bonus');
@@ -2403,6 +2437,16 @@
         // Skilled power: only useful in T20
         if (hasTalent(/skilled.*power/i) && isT20) score += 5;
 
+        // Triggered batting talents — official manual confirms these
+        // exist ("more likely to turn a dot ball into a single/two" /
+        // "...into a four or six") but doesn't quantify the effect.
+        // Small flat bonus per talent, more valuable in T20 where
+        // strike rate matters more than in a longer format — same
+        // conservative-estimate reasoning as the bowling triggered
+        // talents above, better than continuing to ignore them.
+        if (hasTalent(/accumulator/i)) score += isT20 ? 3 : 2;
+        if (hasTalent(/boundary hitter/i)) score += isT20 ? 4 : 2.5;
+
         // Youth bonus: training talents suggest higher ceiling
         if (isYouth) {
             if (hasTalent(/prodigy/i)) score *= 1.10;
@@ -2452,11 +2496,27 @@
         if (hasTalent(/new ball bowler/i)) score *= isT20 ? 1.10 : 1.15;
         // Old Ball Bowler: more valuable in T20 (death overs are critical)
         if (hasTalent(/old ball bowler/i)) score *= isT20 ? 1.15 : 1.10;
-        // Seam/Spin Specialist: flat bonus
-        if (hasTalent(/seam specialist/i) && category === 'seam') score *= 1.15;
-        if (hasTalent(/spin specialist/i) && category === 'spin') score *= 1.15;
+        // NOTE: Seam/Spin Specialist do NOT belong here. Official manual:
+        // "performs better than normal when BATTING against seam/spin
+        // bowlers" — a batting matchup talent, not a bonus to the
+        // player's own bowling. Previously misapplied here; moved to
+        // calculateBattingScore(), conditioned on the opponent's actual
+        // bowling mix (opponentAnalysis.seamerCount/spinnerCount).
         // Skilled bowling: more impactful in T20
         if (hasTalent(/skilled.*bowling/i)) score += isT20 ? 7 : 5;
+
+        // Triggered delivery talents (Wrongun/Flipper/Swing/Bouncer/
+        // Yorker/Slower Ball/Arm Ball/Doosra) — official manual confirms
+        // each exists and is real ("particularly skilled at bowling a
+        // ...") but does NOT quantify the in-match effect size. Previously
+        // ignored entirely, which is worse than a conservative estimate —
+        // applying a small flat bonus per matching talent (roughly half
+        // of the quantified Skilled bonus, reflecting real-but-narrower/
+        // situational value) rather than continuing to treat them as
+        // invisible to scoring.
+        const TRIGGERED_BOWLING_TALENTS = /wrongun|flipper|swing|bouncer|yorker|slower ball|arm ball|doosra/i;
+        const triggeredBowlingCount = talents.filter(t => TRIGGERED_BOWLING_TALENTS.test(t)).length;
+        if (triggeredBowlingCount > 0) score += triggeredBowlingCount * (isT20 ? 3.5 : 2.5);
 
         // Youth bonus: training talents suggest higher ceiling
         if (isYouth) {
@@ -2645,6 +2705,15 @@
                     bowlScore *= 1.1;
                     batScore *= 1.05;
                 }
+                // Seam/Spin Specialist are BATTING matchup talents
+                // (official manual: "performs better than normal when
+                // batting against seam/spin bowlers") — apply based on
+                // which type the OPPONENT actually bowls more of, not
+                // the player's own bowling category.
+                const talents = p.talents || [];
+                const hasTalent = (regex) => talents.some(t => regex.test(t));
+                if (hasTalent(/seam specialist/i) && opponentAnalysis.seamerCount > opponentAnalysis.spinnerCount) batScore *= 1.1;
+                if (hasTalent(/spin specialist/i) && opponentAnalysis.spinnerCount > opponentAnalysis.seamerCount) batScore *= 1.1;
             }
 
             return {
@@ -4415,7 +4484,11 @@ table.ftp-table {
         const ageMult = getAgeTrainingMultiplier(player.age);
         const academyRatio = academySpeed / ACADEMY_SPEED[0];
         const talents = player.talents || [];
-        const isProdigy = talents.some(t => t.toLowerCase().includes('prodigy'));
+        // Prodigy is explicitly youth-only per the official game manual
+        // (rules.htm?rulespage=playerother): "Trains faster in all
+        // skills while in the youth squad." Gifted (X) talents have no
+        // such restriction stated — they apply at any age.
+        const isProdigy = (player.age || 0) < 21 && talents.some(t => t.toLowerCase().includes('prodigy'));
         const result = {};
         for (const [skill, basePoints] of Object.entries(rates)) {
             const ageM = skill === 'power' ? ageMult.power : skill === 'endurance' ? ageMult.endurance : ageMult.primary;
@@ -4729,7 +4802,7 @@ table.ftp-table {
 
         const FATIGUE_TRAINING_PENALTY = { 5: 15, 4: 30, 3: 45, 2: 60, 1: 75, 0: 90 };
         const academyInfo = squadContext?.academyInfo || null;
-        const academySpeed = ACADEMY_SPEED[academyInfo ? academyInfo.levelNum : 0] || 1.00;
+        const academySpeed = getAcademySpeedForPlayer(player, academyInfo);
 
         // 1. REST if exhausted/shattered/clinically dead
         if (player.fatigue <= 2) {
@@ -4922,7 +4995,12 @@ table.ftp-table {
         const youth = players.filter(p => p.age < 21);
         const aging = players.filter(p => p.age >= 30);
         const efficiency = players.length <= 25 ? 100 : Math.max(0, 100 - ((players.length - 25) * 7.5));
-        const academySpeed = academyInfo ? (ACADEMY_SPEED[academyInfo.levelNum] || 1.00) : 1.00;
+        // Squad-wide summary badge — uses the game's own live overall
+        // efficiency (avg of Senior/Youth Training Efficiency %, already
+        // scraped in parseAcademyDoc) rather than the derived ACADEMY_SPEED
+        // curve, since this squad has a real mix of ages the single
+        // level-based estimate can't represent as accurately.
+        const academySpeed = academyInfo ? (academyInfo.trainingEfficiency != null ? academyInfo.trainingEfficiency / 100 : (ACADEMY_SPEED[academyInfo.levelNum] || 1.00)) : 1.00;
         const academyLevel = academyInfo ? academyInfo.level : 'unknown';
 
         let statsHtml = `
@@ -6514,7 +6592,7 @@ table.ftp-table {
      * the longer columns as a ceiling estimate for that program alone,
      * not a forecast of the advisor's actual staged recommendation.
      */
-    function buildTrainingPotentialGrid(player, academySpeed) {
+    function buildTrainingPotentialGrid(player, academySpeed, longHorizonWeeks, longHorizonLabel) {
         const pd = _detectPlayerContext(player);
         const programs = ['fielding'];
         if (pd.isAllrounder) programs.push('allrounder');
@@ -6522,9 +6600,12 @@ table.ftp-table {
         else if (pd.isBowler) programs.push('bowling', 'bowlingtech');
         else programs.push('batting', 'battingtech');
 
-        const yearsToTwenty = Math.max(1, 20 - player.age);
-        const horizons = [12, 26, 52, Math.round(yearsToTwenty * 52)];
-        const horizonLabels = ['12wk', '26wk', '1yr', 'to age 20'];
+        const horizons = [12, 26, 52];
+        const horizonLabels = ['12wk', '26wk', '1yr'];
+        if (longHorizonWeeks && longHorizonWeeks > 52) {
+            horizons.push(longHorizonWeeks);
+            horizonLabels.push(longHorizonLabel || 'long-term');
+        }
 
         const rows = programs.map(programKey => {
             const programDef = TRAINING_PROGRAMS[programKey];
@@ -6592,53 +6673,55 @@ table.ftp-table {
         }
         verdictEl.innerHTML = html;
 
-        // Training potential — youth only. Reuses the same verified
-        // per-week formula as the Training page's "12wk outlook"
-        // (estimateWeeklyTrainingGain/simulateTrainingPlan), not a new
-        // model, so it stays consistent with whatever those get fixed
-        // to later.
+        // Training potential — shown for every age now, not just youth.
+        // Reuses the same verified per-week formula as the Training
+        // page's "12wk outlook" (estimateWeeklyTrainingGain/
+        // simulateTrainingPlan), not a new model, so it stays consistent
+        // with that. Horizon and framing adapt by age: youth get a
+        // development plan to age 20; seniors/aging players get a
+        // shorter, more relevant outlook since there's no fixed
+        // development window left for them.
         const trainingEl = document.getElementById('ftp-player-training');
         if (trainingEl) {
-            if (isYouth) {
-                const academyInfo = loadAcademyCache();
-                const academySpeed = ACADEMY_SPEED[academyInfo ? academyInfo.levelNum : 0] || 1.00;
-                const squadContext = { size: squadPlayers.length, academyInfo, financeInfo: loadFinanceCache() };
-                const trainingRec = recommendTraining(player, squadContext);
-                const academyNote = academyInfo ? `your current ${academyInfo.level} academy` : 'an unknown academy level (visit the Academy page to cache it for a more accurate estimate)';
+            const academyInfo = loadAcademyCache();
+            const academySpeed = getAcademySpeedForPlayer(player, academyInfo);
+            const squadContext = { size: squadPlayers.length, academyInfo, financeInfo: loadFinanceCache() };
+            const trainingRec = recommendTraining(player, squadContext);
+            const academyNote = academyInfo ? `your current ${academyInfo.level} academy (${isYouth ? academyInfo.youthEfficiency : academyInfo.seniorEfficiency}% ${isYouth ? 'youth' : 'senior'} training efficiency)` : 'an unknown academy level (visit the Academy page to cache it for a more accurate estimate)';
 
-                let tHtml = `<div class="vj-text-xs vj-text-muted vj-mb-4">Recommended now: <span class="vj-fw-700">${TRAINING_PROGRAM_LABELS[trainingRec.program] || trainingRec.program}</span>${trainingRec.projection && trainingRec.primarySkill ? ` — ${formatTrainingOutlook(trainingRec.projection, trainingRec.primarySkill, player[trainingRec.primarySkill])}` : ''}</div>`;
+            let tHtml = `<div class="vj-text-xs vj-text-muted vj-mb-4">Recommended now: <span class="vj-fw-700">${TRAINING_PROGRAM_LABELS[trainingRec.program] || trainingRec.program}</span>${trainingRec.projection && trainingRec.primarySkill ? ` — ${formatTrainingOutlook(trainingRec.projection, trainingRec.primarySkill, player[trainingRec.primarySkill])}` : ''}</div>`;
 
-                // Adaptive development plan — the actual staged advice
-                // (fielding first, then primary skill, etc), re-decided
-                // every simulated week, not one program locked in forever.
-                const weeksToTwenty = Math.max(52, Math.round(Math.max(1, 20 - player.age) * 52));
-                const plan = simulateAdaptiveTrainingPlan(player, weeksToTwenty, academySpeed, squadContext);
-                tHtml += `<div class="vj-fw-700 vj-mb-4">Development plan to age 20</div>`;
-                tHtml += `<div class="vj-text-xs vj-mb-4">${plan.timeline.map(t => `<span class="vj-fw-700">${TRAINING_PROGRAM_LABELS[t.program] || t.program}</span> (wk${t.fromWeek}${t.toWeek > t.fromWeek ? `-${t.toWeek}` : ''})`).join(' → ')}</div>`;
-                tHtml += `<div style="overflow-x:auto;"><table class="ftp-table"><thead><tr><th>Skill</th><th>Now</th><th>Projected</th></tr></thead><tbody>`;
-                ADAPTIVE_PLAN_SKILLS.forEach(skill => {
-                    const before = skillLabel(Math.round(player[skill] || 0));
-                    const after = skillLabel(plan.finalSkills[skill]);
-                    if (before === after && plan.finalSkills[skill] === Math.round(player[skill] || 0) && (plan.finalProgress[skill] || 0) === 0) return; // untouched skill, skip
-                    tHtml += `<tr><td style="text-transform:capitalize;">${skill}</td><td>${before}</td><td>${before === after ? after : `<span class="vj-fw-700">${after}</span>`}</td></tr>`;
-                });
-                tHtml += '</tbody></table></div>';
-                tHtml += `<div class="vj-text-xs vj-text-muted vj-mt-4">Assumes ${academyNote}, week 1's real fatigue then a healthy baseline after (fatigue/matches aren't simulated), and re-picks the training program every week using the same staged logic as the live recommendation above — this is the realistic plan, not a single-program ceiling.</div>`;
+            const planWeeks = isYouth ? Math.max(52, Math.round(Math.max(1, 20 - player.age) * 52)) : (player.age >= 30 ? 52 : 104);
+            const planLabel = isYouth ? 'Development plan to age 20' : (player.age >= 30 ? '1yr training outlook' : '2yr training outlook');
 
-                // Single-program comparison — kept as a secondary "what if
-                // I specialized in just this the whole time" reference.
-                const grid = buildTrainingPotentialGrid(player, academySpeed);
-                tHtml += `<div class="vj-fw-700 vj-mt-8 vj-mb-4">If you specialized in one program (ceiling comparison)</div>`;
-                tHtml += `<div style="overflow-x:auto;"><table class="ftp-table"><thead><tr><th>Program</th>${grid.horizonLabels.map(h => `<th>${h}</th>`).join('')}</tr></thead><tbody>`;
-                grid.rows.forEach(r => {
-                    tHtml += `<tr><td>${r.label}</td>${r.cells.map(c => `<td>${c}</td>`).join('')}</tr>`;
-                });
-                tHtml += '</tbody></table></div>';
-                tHtml += `<div class="vj-text-xs vj-text-muted vj-mt-4">Each row assumes training that ONE program continuously the whole time — nobody actually trains like this, it's here to show the ceiling for a single focus vs the realistic mixed plan above.</div>`;
-                trainingEl.innerHTML = tHtml;
-            } else {
-                trainingEl.innerHTML = '<div class="vj-text-xs vj-text-muted">Training potential is shown for youth (16-20) only — seniors are past most of their development window.</div>';
-            }
+            // Adaptive plan — the actual staged advice (fielding first,
+            // then primary skill for youth; maintenance-focused for
+            // aging players, etc), re-decided every simulated week via
+            // recommendTraining() itself, not one program locked in forever.
+            const plan = simulateAdaptiveTrainingPlan(player, planWeeks, academySpeed, squadContext);
+            tHtml += `<div class="vj-fw-700 vj-mb-4">${planLabel}</div>`;
+            tHtml += `<div class="vj-text-xs vj-mb-4">${plan.timeline.map(t => `<span class="vj-fw-700">${TRAINING_PROGRAM_LABELS[t.program] || t.program}</span> (wk${t.fromWeek}${t.toWeek > t.fromWeek ? `-${t.toWeek}` : ''})`).join(' → ')}</div>`;
+            tHtml += `<div style="overflow-x:auto;"><table class="ftp-table"><thead><tr><th>Skill</th><th>Now</th><th>Projected</th></tr></thead><tbody>`;
+            ADAPTIVE_PLAN_SKILLS.forEach(skill => {
+                const before = skillLabel(Math.round(player[skill] || 0));
+                const after = skillLabel(plan.finalSkills[skill]);
+                if (before === after && plan.finalSkills[skill] === Math.round(player[skill] || 0) && (plan.finalProgress[skill] || 0) === 0) return; // untouched skill, skip
+                tHtml += `<tr><td style="text-transform:capitalize;">${skill}</td><td>${before}</td><td>${before === after ? after : `<span class="vj-fw-700">${after}</span>`}</td></tr>`;
+            });
+            tHtml += '</tbody></table></div>';
+            tHtml += `<div class="vj-text-xs vj-text-muted vj-mt-4">Assumes ${academyNote}, week 1's real fatigue then a healthy baseline after (fatigue/matches aren't simulated), and re-picks the training program every week using the same staged logic as the live recommendation above — this is the realistic plan, not a single-program ceiling.</div>`;
+
+            // Single-program comparison — kept as a secondary "what if
+            // I specialized in just this the whole time" reference.
+            const grid = buildTrainingPotentialGrid(player, academySpeed, planWeeks, planLabel.match(/\d+yr/) ? planLabel.match(/\d+yr/)[0] : 'to age 20');
+            tHtml += `<div class="vj-fw-700 vj-mt-8 vj-mb-4">If you specialized in one program (ceiling comparison)</div>`;
+            tHtml += `<div style="overflow-x:auto;"><table class="ftp-table"><thead><tr><th>Program</th>${grid.horizonLabels.map(h => `<th>${h}</th>`).join('')}</tr></thead><tbody>`;
+            grid.rows.forEach(r => {
+                tHtml += `<tr><td>${r.label}</td>${r.cells.map(c => `<td>${c}</td>`).join('')}</tr>`;
+            });
+            tHtml += '</tbody></table></div>';
+            tHtml += `<div class="vj-text-xs vj-text-muted vj-mt-4">Each row assumes training that ONE program continuously the whole time — nobody actually trains like this, it's here to show the ceiling for a single focus vs the realistic mixed plan above.</div>`;
+            trainingEl.innerHTML = tHtml;
         }
 
         // Squad comparison — who this player would realistically replace.
