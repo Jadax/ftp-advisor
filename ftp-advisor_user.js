@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         FTP Advisor
 // @namespace    http://tampermonkey.net/
-// @version      8.6
+// @version      8.7
 // @description  Comprehensive tactical advisor for From the Pavilion cricket game (v7.0: full UI redesign with modern navy+gold theme, reusable createPanel() helper, stat badges, rec cards, and component library; v6.6: added a Youth Development Curve check on the Training page; v6.5: fixed finance parsing, removed gold captain highlight, fatigue-aware bowling spell length; v6.4: unstyled panels fixed; v6.3: tactics advisor now loads on game.htm?gameId=...; v6.2: club.htm data-status dashboard; v6.1: training uses age-decay/skill-slowdown/talent-bonus data from the user's FTP_Training model)
 // @author       You
 // @license      MIT
@@ -4872,8 +4872,12 @@ table.ftp-table {
         const { academySpeed, setProgram } = ctx;
         const { isBowler, isKeeper, isAllrounder, isWristSpinner, hasGiftedBatting, hasGiftedBowling, hasGiftedTechnique, isProdigy } = ctx;
 
-        if (player.fielding < 6) {
-            setProgram('fielding', `Youth: Fielding is ${skillLabel(player.fielding)}. Get fielding to Capable first — early pops are cheap and fast. Improves run-saving, catching, and runout opportunities. Academy speed: ${Math.round(academySpeed * 100)}%.`, 'high');
+        // Target Reliable (7), not Capable (6) — an experienced user's real
+        // training order for a 16yo bowler (fielding->Reliable, then bowling
+        // technique->Reliable, then bowling) confirmed Capable was stopping
+        // fielding development one tier too early.
+        if (player.fielding < 7) {
+            setProgram('fielding', `Youth: Fielding is ${skillLabel(player.fielding)}. Get fielding to Reliable first — early pops are cheap and fast, and this tier is worth pushing past Capable before moving on. Improves run-saving, catching, and runout opportunities. Academy speed: ${Math.round(academySpeed * 100)}%.`, 'high');
             return;
         }
 
@@ -4898,11 +4902,17 @@ table.ftp-table {
 
         const primarySkill = isBowler ? player.bowling : isKeeper ? player.keeping : player.batting;
 
-        if (player.technique < primarySkill - 1) {
+        // Technique-to-Reliable is its own mandatory stage, not just a
+        // catch-up when it lags the primary skill — same real-world feedback
+        // as the fielding target above: build technique to Reliable BEFORE
+        // pouring development into bowling/batting, not only when it's
+        // already fallen behind. Keeper-Batting already trains technique
+        // alongside keeping so it's excluded here.
+        if (!isKeeper && player.technique < 7) {
             if (isBowler) {
-                setProgram('bowlingtech', `Technique (${skillLabel(player.technique)}) is lagging behind bowling (${skillLabel(player.bowling)}). High bowling + low technique = takes wickets but bowls poor deliveries.`, 'high');
+                setProgram('bowlingtech', `Fielding is at target — now build technique (${skillLabel(player.technique)}) to Reliable before bowling. High bowling + low technique = takes wickets but bowls poor deliveries; this order avoids that.`, 'high');
             } else {
-                setProgram('battingtech', `Technique (${skillLabel(player.technique)}) is lagging behind batting (${skillLabel(player.batting)}). High batting + low technique = inconsistent batting.`, 'high');
+                setProgram('battingtech', `Fielding is at target — now build technique (${skillLabel(player.technique)}) to Reliable before batting. High batting + low technique = inconsistent batting; this order avoids that.`, 'high');
             }
             return;
         }

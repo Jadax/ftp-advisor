@@ -33,7 +33,7 @@ Do this for every shipped change unless told otherwise — there's no separate r
 - Squad parsing: `parsePlayerRow()` (own squad, full skill grid, `squadViewId=2`) vs `parseOpponentPlayerRow()` (opponent squad, reduced columns, `squadViewId=2` — see gotcha) vs `parseSummaryViewBlock()`/`scrapeSummaryView()`/`fetchSquadSummaryView()` (`squadViewId=1` — the ONLY view with Talents, for both own squad and opponents; different DOM shape entirely, `<div class="padded senior|youth">` blocks not `<tr>`). `mergeTalentsIntoPlayers()` combines the two views' data. Both `fetchAllData()` (own squad) and `fetchOpponentSquad()` now fetch both views.
 - Transfer scouting: `evaluateTransferTarget()`, `calculateRank()`, `checkScoutBenchmark()`
 - Tactics: `calculateBattingScore()`, `calculateBowlingScore()`, `recommendLineup()`, `allocateBowlingSpells()`, `recommendTossDecision()`
-- Training: `recommendTraining()`, `scrapeTrainingPage()`
+- Training: `recommendTraining()`, `scrapeTrainingPage()`. Youth staging in `_recommendYouthTraining()` (v8.7): Fielding to **Reliable (7)**, not Capable (6) — then Technique (bowling/batting) to Reliable as its own mandatory stage before the primary skill, not just a catch-up when it lags. Sourced from a real experienced user's stated training order for a 16yo bowler ("fielding to reliable, then bowling technique, then bowling") — a genuine community-informed correction, not derived from the Excel workbook. Keeper skips the technique stage since Keeper-Batting already trains technique alongside keeping.
 - UI: `createPanel()` (shared component lib) + `addCommonStyles()`; each game page has its own `createXUI()` / `updateXAdvisor()` pair
 
 ## Known gotchas
