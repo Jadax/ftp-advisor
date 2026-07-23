@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         FTP Advisor
 // @namespace    http://tampermonkey.net/
-// @version      8.7
+// @version      8.8
 // @description  Comprehensive tactical advisor for From the Pavilion cricket game (v7.0: full UI redesign with modern navy+gold theme, reusable createPanel() helper, stat badges, rec cards, and component library; v6.6: added a Youth Development Curve check on the Training page; v6.5: fixed finance parsing, removed gold captain highlight, fatigue-aware bowling spell length; v6.4: unstyled panels fixed; v6.3: tactics advisor now loads on game.htm?gameId=...; v6.2: club.htm data-status dashboard; v6.1: training uses age-decay/skill-slowdown/talent-bonus data from the user's FTP_Training model)
 // @author       You
 // @license      MIT
@@ -1079,23 +1079,32 @@
         return players;
     }
 
-    function fetchSquadSummaryView(url) {
+    // One retry on failure before giving up. Talents only come from this
+    // view (squadViewId=1) — a single dropped request used to silently
+    // wipe every player's talents for that refresh (mergeTalentsIntoPlayers
+    // had nothing to merge), making tactics recommendations flap between
+    // visits purely from network flakiness, not real squad/opponent changes.
+    function fetchSquadSummaryView(url, _isRetry) {
         return new Promise((resolve) => {
             GM_xmlhttpRequest({
                 method: 'GET',
                 url: url,
                 timeout: 15000,
                 onload: (response) => {
-                    if (response.status !== 200) { resolve([]); return; }
+                    if (response.status !== 200) {
+                        if (!_isRetry) { resolve(fetchSquadSummaryView(url, true)); return; }
+                        resolve([]); return;
+                    }
                     try {
                         const doc = new DOMParser().parseFromString(response.responseText, 'text/html');
                         resolve(scrapeSummaryView(doc));
                     } catch (e) {
+                        if (!_isRetry) { resolve(fetchSquadSummaryView(url, true)); return; }
                         resolve([]);
                     }
                 },
-                onerror: () => resolve([]),
-                ontimeout: () => resolve([])
+                onerror: () => { if (!_isRetry) resolve(fetchSquadSummaryView(url, true)); else resolve([]); },
+                ontimeout: () => { if (!_isRetry) resolve(fetchSquadSummaryView(url, true)); else resolve([]); }
             });
         });
     }
@@ -1911,6 +1920,19 @@
                         const map = {};
                         seniors.forEach(p => { map[p.id] = p; });
                         youth.forEach(p => { if (!map[p.id]) map[p.id] = p; });
+                        // Seed talents from the last known-good fetch before
+                        // merging this round's summary-view result. If this
+                        // round's squadViewId=1 fetch still failed after the
+                        // retry (empty array), players keep last-known talents
+                        // instead of silently losing them for this refresh —
+                        // that gap was the real cause of tactics recommendations
+                        // changing on every visit with no real squad change.
+                        if (existing) {
+                            existing.players.forEach(ep => {
+                                const p = map[ep.id];
+                                if (p && ep.talents && !p.talents) p.talents = ep.talents;
+                            });
+                        }
                         mergeTalentsIntoPlayers(Object.values(map), [...summarySeniors, ...summaryYouth]);
                         savePlayerCache(Object.values(map));
                         console.log('[FTP Data] Squad refreshed:', Object.values(map).length, 'players');
@@ -2331,6 +2353,17 @@
                 seen.add(p.id);
                 players.push(p);
             }
+        }
+        // Same fallback as fetchAllData: keep last known-good talents for
+        // this opponent if this round's squadViewId=1 fetch (still) failed,
+        // rather than letting a transient network hiccup wipe them and
+        // silently change lineup/opponent-analysis recommendations.
+        const existingOpp = loadOpponentCache(teamId);
+        if (existingOpp) {
+            existingOpp.players.forEach(ep => {
+                const p = players.find(pl => pl.id === ep.id);
+                if (p && ep.talents && !p.talents) p.talents = ep.talents;
+            });
         }
         mergeTalentsIntoPlayers(players, [...summarySeniors, ...summaryYouth]);
         saveOpponentCache(teamId, players);
@@ -6047,6 +6080,21 @@ table.ftp-table {
                 priorityBuys.sort((a, b) => (verdictOrder[a.eval.verdict] ?? 9) - (verdictOrder[b.eval.verdict] ?? 9) || b.eval.rank - a.eval.rank || (a.price || 0) - (b.price || 0));
 
                 function renderTransferResults(players, totalScanned, ageFilteredCount, verdictFilteredCount, detailsFetched) {
+                    // Requested: 21+ candidates should always show who on the
+                    // current squad they outrank — same peer-comparison logic
+                    // already used on the Player Advisor (player.htm), just
+                    // run here against every search result instead of one
+                    // player at a time. Youth (16-20) stays curve/filter-based
+                    // since there's no same-age squad peer to compare against
+                    // (you can only recruit 16yos — the "peers" for a search
+                    // hit are whoever's now aged into that bracket).
+                    players.forEach(p => {
+                        if (Math.round(p.age) >= 21 && seniorPlayers.length > 0) {
+                            p._peerCompare = comparePlayerToSquadPeers(p, seniorPlayers);
+                        } else {
+                            p._peerCompare = null;
+                        }
+                    });
                     let html = `<div class="vj-flex vj-gap-6 vj-mb-8" style="flex-wrap:wrap;">
                         <span class="ftp-stat-badge green">${players.length} Target${players.length !== 1 ? 's' : ''}</span>
                         <span class="ftp-stat-badge neutral">${totalScanned} Total Scanned</span>
@@ -6079,6 +6127,17 @@ table.ftp-table {
                             if (p.price) detailParts.push(`Price $${p.price.toLocaleString()}`);
                             if (detailsFetched && p.talents && p.talents.length > 0) detailParts.push(`<span style="color:var(--vj-gold);">${p.talents.join(', ')}</span>`);
 
+                            let compareHtml = '';
+                            const cmp = p._peerCompare;
+                            if (cmp) {
+                                if (cmp.wouldReplace.length > 0) {
+                                    const names = cmp.wouldReplace.map(r => r.player.name).join(', ');
+                                    compareHtml = `<div class="vj-text-xs" style="color:var(--vj-green);line-height:1.4;margin-top:2px;">\u2191 Outranks ${cmp.wouldReplace.length} of your ${cmp.groupLabel} squad \u2014 would replace: ${names}</div>`;
+                                } else {
+                                    compareHtml = `<div class="vj-text-xs vj-text-muted" style="line-height:1.4;margin-top:2px;">Doesn't outrank any current ${cmp.groupLabel} player \u2014 depth signing only.</div>`;
+                                }
+                            }
+
                             html += `<div class="ftp-rec low" style="padding:6px 8px;margin:3px 0;">
                                 <div class="vj-flex-between">
                                     <span class="vj-fw-700" style="font-size:12px;">#${i+1} ${p.name} <span class="vj-text-xs vj-text-muted">(${p.age}yo)</span></span>
@@ -6091,6 +6150,7 @@ table.ftp-table {
                                 </div>
                                 ${ev.warnings.length > 0 ? `<div class="vj-text-xs vj-text-muted" style="color:var(--vj-red);line-height:1.4;margin-top:2px;">\u26A0 ${ev.warnings.join(' \u00B7 ')}</div>` : ''}
                                 ${ev.strengths.length > 0 ? `<div class="vj-text-xs vj-text-muted" style="color:var(--vj-green);line-height:1.4;margin-top:2px;">\u2713 ${ev.strengths.join(' \u00B7 ')}</div>` : ''}
+                                ${compareHtml}
                             </div>`;
                         });
                     }
