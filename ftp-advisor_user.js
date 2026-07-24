@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         FTP Advisor
 // @namespace    http://tampermonkey.net/
-// @version      8.9
+// @version      8.10
 // @description  Comprehensive tactical advisor for From the Pavilion cricket game (v7.0: full UI redesign with modern navy+gold theme, reusable createPanel() helper, stat badges, rec cards, and component library; v6.6: added a Youth Development Curve check on the Training page; v6.5: fixed finance parsing, removed gold captain highlight, fatigue-aware bowling spell length; v6.4: unstyled panels fixed; v6.3: tactics advisor now loads on game.htm?gameId=...; v6.2: club.htm data-status dashboard; v6.1: training uses age-decay/skill-slowdown/talent-bonus data from the user's FTP_Training model)
 // @author       You
 // @license      MIT
@@ -323,6 +323,25 @@
         return m ? parseInt(m[1], 10) : 0;
     }
 
+    // Which discipline (batting/bowling/keeping) is this player's actual
+    // primary skill. Transfer scouting (checkScoutBenchmark,
+    // evaluateTransferTarget, calculateRank) used to hardcode
+    // primary = max(batting, bowling) everywhere, which silently judged
+    // wicketkeeper prospects on their bat/bowl numbers and never looked at
+    // keeping at all — a specialist keeper with strong keeping but modest
+    // batting/bowling failed every age/senior minimum check and got
+    // filtered out regardless of how good a keeper they actually were.
+    // Threshold/ordering matches the keeper detection already used for
+    // youth training (getYouthPrimarySkillName) and tactics
+    // (_detectPlayerContext) — keeping only counts as primary once it's
+    // at least Average(4) and actually their best discipline.
+    function getPrimarySkillInfo(player) {
+        const keeping = player.keeping || 0, batting = player.batting || 0, bowling = player.bowling || 0;
+        if (keeping >= 4 && keeping >= batting && keeping >= bowling) return { value: keeping, name: 'keeping' };
+        if (bowling >= batting) return { value: bowling, name: 'bowling' };
+        return { value: batting, name: 'batting' };
+    }
+
     // ============================================================
     // FORM / EXPERIENCE MULTIPLIERS
     // Real percentage curves from the user's FTP_Training model
@@ -504,7 +523,7 @@
         const t = AGE_SCOUT_THRESHOLDS[age] || (age > 27 ? AGE_SCOUT_THRESHOLDS[27] : null);
         if (!t) return { hasBenchmark: false, passed: true, failed: [], met: [] };
 
-        const primary = Math.max(player.batting || 0, player.bowling || 0);
+        const primary = getPrimarySkillInfo(player).value;
         const checks = [
             { name: 'Primary', value: primary, min: t.primary, known: true },
             { name: 'Technique', value: player.technique || 0, min: t.technique, known: true },
@@ -1310,7 +1329,7 @@
         if (isYouth) {
             const targets = AGE_SKILL_EXPECTATIONS[age];
             if (targets) {
-                const primary = Math.max(player.batting || 0, player.bowling || 0);
+                const primary = getPrimarySkillInfo(player).value;
 
                 const skills = [
                     { name: 'Primary', value: primary, target: targets.primary },
@@ -1401,8 +1420,9 @@
         //   24-27: Primary Expert, Technique Expert, Fielding Accomplished, Endurance Reasonable, Experience Reasonable
         const SENIOR_MINS = age <= 23 ? SENIOR_MINS_YOUNG : SENIOR_MINS_VETERAN;
 
-        const primary = Math.max(player.batting || 0, player.bowling || 0);
-        const primaryName = (player.batting || 0) >= (player.bowling || 0) ? 'batting' : 'bowling';
+        const primaryInfo = getPrimarySkillInfo(player);
+        const primary = primaryInfo.value;
+        const primaryName = primaryInfo.name;
 
         const seniorMinChecks = [
             { name: 'Primary', value: primary, min: SENIOR_MINS.primary },
@@ -1525,7 +1545,9 @@
             if (primaryName === 'bowling' && squadStats.bowlerCount < 4) {
                 score += 1; strengths.push('Squad needs more specialist bowlers');
             }
-            if ((player.keeping || 0) >= 6 && squadStats.keeperCount < 2) {
+            if (primaryName === 'keeping' && squadStats.keeperCount < 2) {
+                score += 2; strengths.push('Genuine keeper prospect — squad needs a backup wicketkeeper');
+            } else if ((player.keeping || 0) >= 6 && squadStats.keeperCount < 2) {
                 score += 1; strengths.push('Squad needs a backup wicketkeeper');
             }
         }
@@ -1560,7 +1582,7 @@
         if (!player) return 0;
         const age = Math.round(player.age);
         const isYouth = age < 21;
-        const primary = Math.max(player.batting || 0, player.bowling || 0);
+        const primary = getPrimarySkillInfo(player).value;
 
         // 1. Primary skill (0-5 points) — main factor
         // Expert(9)=3, Outstanding(10)=3.5, Spectacular(11)=4, Exceptional(12)=4.3, WC+(13+)=5
@@ -6137,8 +6159,9 @@ table.ftp-table {
                         players.forEach((p, i) => {
                             const ev = p.eval;
                             const badgeClass = ev.verdict === 'elite' ? 'green' : ev.verdict === 'strong' ? 'green' : 'warn';
-                            const primarySkill = Math.max(p.batting, p.bowling);
-                            const primaryName = p.batting >= p.bowling ? 'Bat' : 'Bowl';
+                            const primaryInfo = getPrimarySkillInfo(p);
+                            const primarySkill = primaryInfo.value;
+                            const primaryName = primaryInfo.name === 'keeping' ? 'Keep' : primaryInfo.name === 'bowling' ? 'Bowl' : 'Bat';
 
                             // Build detail line — show experience/wage only if fetched
                             const detailParts = [
@@ -6147,6 +6170,10 @@ table.ftp-table {
                                 `Field ${skillLabel(p.fielding)}`,
                                 `End ${skillLabel(p.endurance)}`
                             ];
+                            // Keeping isn't always primary but is always worth
+                            // showing for any plausible keeper (Capable+) so
+                            // it doesn't take a per-player detail fetch to see.
+                            if (primaryInfo.name !== 'keeping' && (p.keeping || 0) >= 6) detailParts.push(`Keep ${skillLabel(p.keeping)}`);
                             if (p.bowlerType) detailParts.push(`<span class="vj-fw-700">${p.bowlerType.toUpperCase()}</span>`);
                             if (p.rating) detailParts.push(`Rating ${p.rating.toLocaleString()}`);
                             if (detailsFetched && p.experience != null && p.experience > 0) detailParts.push(`Exp ${skillLabel(p.experience)}`);
