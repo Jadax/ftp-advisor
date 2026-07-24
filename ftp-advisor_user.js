@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         FTP Advisor
 // @namespace    http://tampermonkey.net/
-// @version      8.8
+// @version      8.9
 // @description  Comprehensive tactical advisor for From the Pavilion cricket game (v7.0: full UI redesign with modern navy+gold theme, reusable createPanel() helper, stat badges, rec cards, and component library; v6.6: added a Youth Development Curve check on the Training page; v6.5: fixed finance parsing, removed gold captain highlight, fatigue-aware bowling spell length; v6.4: unstyled panels fixed; v6.3: tactics advisor now loads on game.htm?gameId=...; v6.2: club.htm data-status dashboard; v6.1: training uses age-decay/skill-slowdown/talent-bonus data from the user's FTP_Training model)
 // @author       You
 // @license      MIT
@@ -299,6 +299,29 @@
         7: 'Reliable', 6: 'Capable', 5: 'Reasonable', 4: 'Average',
         3: 'Ordinary', 2: 'Poor', 1: 'Dreadful', 0: 'Atrocious'
     };
+
+    // ============================================================
+    // AGE PARSING — "YY.WW" table cells and "YYyWWw" panel text
+    // The game shows age as years + a week count (0-14, 14 weeks/age-year
+    // per the official manual — see simulateAdaptiveTrainingPlan's own
+    // comment for the source), NOT a base-10 decimal fraction. Naively
+    // parseFloat()'ing a table cell like "20.14" reads it as 20.14 years
+    // (14% into the year) when it's actually 14/14 = 21.0 — a player who
+    // has, for every practical scouting/training purpose, already turned
+    // 21. This under/over-shoots age-bracket filters (AGE_SCOUT_THRESHOLDS,
+    // youth 16-20 curve, senior/aging training paths) right at the
+    // boundary where they matter most. parseGameAge() is the single
+    // correct parser for both formats; every age scrape in the file should
+    // go through it instead of parseFloat/parseInt on raw cell text.
+    function parseGameAge(text) {
+        if (!text) return 0;
+        let m = text.match(/(\d{1,2})\s*y(?:ears?)?\s*(\d{1,2})\s*w(?:eeks?)?/i);
+        if (m) return parseInt(m[1], 10) + parseInt(m[2], 10) / 14;
+        m = text.match(/^\s*(\d{1,2})\.(\d{1,2})\s*$/);
+        if (m) return parseInt(m[1], 10) + parseInt(m[2], 10) / 14;
+        m = text.match(/(\d{1,2})/);
+        return m ? parseInt(m[1], 10) : 0;
+    }
 
     // ============================================================
     // FORM / EXPERIENCE MULTIPLIERS
@@ -839,10 +862,13 @@
         let age = 99;
         for (const cell of cells) {
             const text = cell.textContent.trim();
-            const m = text.match(/^(\d{1,2})(?:\.\d+)?$/);
+            // "YY.WW" — weeks (0-14 of 14/age-year), not a decimal fraction.
+            // parseGameAge() converts correctly; the bare-integer regex
+            // still gates which cell is actually the age column.
+            const m = text.match(/^(\d{1,2})(?:\.\d{1,2})?$/);
             if (m) {
                 const val = parseInt(m[1], 10);
-                if (val >= 16 && val <= 50) { age = val; break; }
+                if (val >= 16 && val <= 50) { age = parseGameAge(text); break; }
             }
         }
 
@@ -900,7 +926,7 @@
             const ratingMatch = text.match(/^([\d,]{4,})$/);
             if (ageMatch) {
                 const val = parseInt(ageMatch[1], 10);
-                if (val >= 16 && val <= 50 && age === 99) age = val;
+                if (val >= 16 && val <= 50 && age === 99) age = parseGameAge(text);
             } else if (wageMatch) {
                 wage = parseInt(wageMatch[1].replace(/,/g, ''), 10) || 0;
             } else if (ratingMatch) {
@@ -2156,7 +2182,9 @@
             return (idx !== undefined && idx < cellTexts.length) ? cellTexts[idx] : '';
         };
 
-        const age = parseFloat(getCell('age')) || 0;
+        // "YY.WW" — weeks out of 14, not a base-10 decimal fraction. See
+        // parseGameAge() for why parseFloat() here was silently wrong.
+        const age = parseGameAge(getCell('age'));
         const ratingText = (getCell('rating') || '').replace(/,/g, '');
         const rating = parseInt(ratingText) || 0;
 
@@ -4564,10 +4592,10 @@ table.ftp-table {
             // Training page columns: Player | Age | Fatigue | Form | Rating | Training Program | Previous Week
             // No skill columns — skills MUST come from squad cache
 
-            // Extract age from second cell (format "25.05")
+            // Extract age from second cell (format "25.05" — weeks out of
+            // 14, not a decimal fraction; see parseGameAge()).
             const ageText = cells[1]?.textContent.trim() || '';
-            const ageMatch = ageText.match(/(\d+)/);
-            const age = ageMatch ? parseInt(ageMatch[1]) : 99;
+            const age = ageText ? parseGameAge(ageText) : 99;
 
             // Extract fatigue from td.fatigue
             const fatigueCell = row.querySelector('td.fatigue');
@@ -6757,8 +6785,12 @@ table.ftp-table {
         const paddedPs = doc.querySelectorAll('.panel .padded p');
         if (paddedPs.length > 0) {
             const infoText = paddedPs[0].textContent;
+            // /14, not /52 — 14 weeks per age-year (see parseGameAge()).
+            // This was the actual bug behind a 20y14w player (=21.0, i.e.
+            // effectively already 21) reading as ~20.27 and getting
+            // evaluated against 20yo thresholds instead of 21+ ones.
             const ageMatch = infoText.match(/(\d{1,2})y(\d{1,2})w/);
-            if (ageMatch) age = parseInt(ageMatch[1], 10) + parseInt(ageMatch[2], 10) / 52;
+            if (ageMatch) age = parseInt(ageMatch[1], 10) + parseInt(ageMatch[2], 10) / 14;
             const ratingMatch = infoText.match(/([\d,]+)\s*rating/i);
             if (ratingMatch) rating = parseInt(ratingMatch[1].replace(/,/g, ''), 10) || 0;
             const wageMatch = infoText.match(/\$([\d,]+)\s*wage/i);

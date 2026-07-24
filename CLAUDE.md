@@ -19,6 +19,7 @@ Do this for every shipped change unless told otherwise — there's no separate r
 
 ## Map (grep these, don't re-read the file)
 - Lookup tables / constants: top of file — `SKILL_MAP`, `FATIGUE_MAP`, `PITCH_EFFECTS`, `AGE_SCOUT_THRESHOLDS`
+- Age parsing: `parseGameAge(text)` (v8.9) — the ONE correct parser for the game's age text, used everywhere age is scraped (`parsePlayerRow`, `parseOpponentPlayerRow`, `parseTransferRow`, `scrapePlayerDetailPage`, the training-page scraper). The game shows age as years + a week count out of 14 (`"25.05"` in tables, `"25y5w"` in detail panels), NOT a base-10 decimal — `parseFloat("20.14")` reads 20.14 (14% into the year) when it's actually 14/14 = 21.0, a player who for scouting/training purposes has already turned 21. Every downstream `Math.round(player.age)` bracket check (age-scout thresholds, 16-20 curve, senior/aging training paths) is correct as-is once fed a true decimal age from this function — no separate rounding logic needed, JS's round-half-up already lands boundary weeks (7+/14) in the next age bracket.
 - Team config (auto-detected): `getTeamId()`, `detectMyTeamIdFromPage()`
 - Pro-tier scaffold — **exists but unwired, gates no feature**: `isProUser()`, `validateLicense()`
 - AI-recommendations scaffold — **exists but unwired**: `buildAIContextSnapshot()`, `getAICentralRecommendation()`, `promptForAIKey()`. Key-storage approach is decided (user's own key, one-time prompt); `AI_ENDPOINT_URL` provider/endpoint is still a placeholder — needs that decision before wiring a UI trigger.
