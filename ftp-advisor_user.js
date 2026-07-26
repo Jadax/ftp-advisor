@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         FTP Advisor
 // @namespace    http://tampermonkey.net/
-// @version      8.10
+// @version      8.11
 // @description  Comprehensive tactical advisor for From the Pavilion cricket game (v7.0: full UI redesign with modern navy+gold theme, reusable createPanel() helper, stat badges, rec cards, and component library; v6.6: added a Youth Development Curve check on the Training page; v6.5: fixed finance parsing, removed gold captain highlight, fatigue-aware bowling spell length; v6.4: unstyled panels fixed; v6.3: tactics advisor now loads on game.htm?gameId=...; v6.2: club.htm data-status dashboard; v6.1: training uses age-decay/skill-slowdown/talent-bonus data from the user's FTP_Training model)
 // @author       You
 // @license      MIT
@@ -1424,15 +1424,22 @@
         const primary = primaryInfo.value;
         const primaryName = primaryInfo.name;
 
+        // Experience is 0 on every transfer-list row until a per-player
+        // page fetch fills it in (same gotcha as checkScoutBenchmark below)
+        // — hard-filtering on it unconditionally failed EVERY 21+ candidate
+        // before "Fetch Experience & Wages" was ever clicked, silently
+        // zeroing out the whole senior results list. Gated on `known` so
+        // it's skipped (not treated as a fail) until the real value loads,
+        // then genuinely enforced afterward.
         const seniorMinChecks = [
-            { name: 'Primary', value: primary, min: SENIOR_MINS.primary },
-            { name: 'Technique', value: player.technique || 0, min: SENIOR_MINS.technique },
-            { name: 'Fielding', value: player.fielding || 0, min: SENIOR_MINS.fielding },
-            { name: 'Endurance', value: player.endurance || 0, min: SENIOR_MINS.endurance },
-            { name: 'Experience', value: player.experience || 0, min: SENIOR_MINS.experience }
+            { name: 'Primary', value: primary, min: SENIOR_MINS.primary, known: true },
+            { name: 'Technique', value: player.technique || 0, min: SENIOR_MINS.technique, known: true },
+            { name: 'Fielding', value: player.fielding || 0, min: SENIOR_MINS.fielding, known: true },
+            { name: 'Endurance', value: player.endurance || 0, min: SENIOR_MINS.endurance, known: true },
+            { name: 'Experience', value: player.experience || 0, min: SENIOR_MINS.experience, known: (player.experience || 0) > 0 }
         ];
 
-        const belowMins = seniorMinChecks.filter(s => s.value < s.min);
+        const belowMins = seniorMinChecks.filter(s => s.known && s.value < s.min);
         const meetsAllMins = belowMins.length === 0;
 
         // ANY skill below minimum = filtered out (poor verdict)
