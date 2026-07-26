@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         FTP Advisor
 // @namespace    http://tampermonkey.net/
-// @version      8.12
+// @version      8.13
 // @description  Comprehensive tactical advisor for From the Pavilion cricket game (v7.0: full UI redesign with modern navy+gold theme, reusable createPanel() helper, stat badges, rec cards, and component library; v6.6: added a Youth Development Curve check on the Training page; v6.5: fixed finance parsing, removed gold captain highlight, fatigue-aware bowling spell length; v6.4: unstyled panels fixed; v6.3: tactics advisor now loads on game.htm?gameId=...; v6.2: club.htm data-status dashboard; v6.1: training uses age-decay/skill-slowdown/talent-bonus data from the user's FTP_Training model)
 // @author       You
 // @license      MIT
@@ -1305,8 +1305,15 @@
             minFielding: min('fielding'),
             avgEndurance: avg('endurance'),
             minEndurance: min('endurance'),
-            avgPrimary: Math.round(seniors.reduce((s, p) => s + Math.max(p.batting || 0, p.bowling || 0), 0) / seniors.length),
-            minPrimary: Math.min(...seniors.map(p => Math.max(p.batting || 0, p.bowling || 0))),
+            // getPrimarySkillInfo(), not max(batting, bowling) — a keeper on
+            // the squad should contribute their keeping skill here, not
+            // whatever mediocre batting/bowling they happen to have, or the
+            // "compare candidate to squad avg primary" bonus in
+            // evaluateTransferTarget compares a keeper candidate's keeping
+            // against a bat/bowl-based average that has nothing to do with
+            // their actual role.
+            avgPrimary: Math.round(seniors.reduce((s, p) => s + getPrimarySkillInfo(p).value, 0) / seniors.length),
+            minPrimary: Math.min(...seniors.map(p => getPrimarySkillInfo(p).value)),
             avgKeep: avg('keeping'),
             bowlerCount: bowlers.length,
             batterCount: batters.length,
@@ -6416,12 +6423,15 @@ table.ftp-table {
 
         const avg = (arr, key) => arr.length > 0 ? arr.reduce((s, p) => s + (p[key] || 0), 0) / arr.length : 0;
         const avgRating = avg(seniors, 'rating');
-        const avgPrimary = avg(seniors.map(p => ({...p, primary: Math.max(p.batting||0, p.bowling||0)})), 'primary');
+        // getPrimarySkillInfo(), not max(batting, bowling) — otherwise a
+        // genuine keeper gets judged (and flagged for sale below) on
+        // mediocre batting/bowling instead of their actual keeping skill.
+        const avgPrimary = avg(seniors.map(p => ({...p, primary: getPrimarySkillInfo(p).value})), 'primary');
 
         const scored = seniors.map(p => {
             let sellScore = 0;
             const reasons = [];
-            const primary = Math.max(p.batting || 0, p.bowling || 0);
+            const primary = getPrimarySkillInfo(p).value;
             const isAllrounder = (p.batting || 0) >= 7 && (p.bowling || 0) >= 7;
 
             // Age penalty — older = more urgent to replace
@@ -6528,7 +6538,7 @@ table.ftp-table {
             } else {
                 // Outside youth window
                 if (p.age > 20) {
-                    const primarySkill = Math.max(p.batting || 0, p.bowling || 0);
+                    const primarySkill = getPrimarySkillInfo(p).value;
                     if (primarySkill < 7) {
                         sellScore += 12;
                         reasons.push(`Age ${p.age} with primary skill only ${primarySkill} — should have progressed more`);
@@ -6981,7 +6991,7 @@ table.ftp-table {
                 <span class="vj-fw-700" style="font-size:14px;">${player.name} <span class="vj-text-xs vj-text-muted">(${Math.round(player.age)}yo)</span></span>
                 <span class="ftp-stat-badge ${badgeClass}" style="font-size:13px;">${keepVerdict}</span>
             </div>
-            <div class="vj-text-xs vj-text-muted vj-mb-4">Verdict: ${evalResult.verdict.toUpperCase()} · Rank ${rank}/10 · ${Math.max(player.batting, player.bowling) ? (player.batting >= player.bowling ? 'Bat' : 'Bowl') + ' ' + skillLabel(Math.max(player.batting, player.bowling)) : ''} · Tech ${skillLabel(player.technique)} · Field ${skillLabel(player.fielding)}</div>`;
+            <div class="vj-text-xs vj-text-muted vj-mb-4">Verdict: ${evalResult.verdict.toUpperCase()} · Rank ${rank}/10 · ${(() => { const pi = getPrimarySkillInfo(player); return pi.value ? (pi.name === 'keeping' ? 'Keep' : pi.name === 'bowling' ? 'Bowl' : 'Bat') + ' ' + skillLabel(pi.value) : ''; })()} · Tech ${skillLabel(player.technique)} · Field ${skillLabel(player.fielding)}</div>`;
 
         if (evalResult.strengths.length > 0) {
             html += `<div class="vj-text-xs vj-mt-4" style="color:var(--vj-green);">✓ ${evalResult.strengths.join(' · ')}</div>`;
