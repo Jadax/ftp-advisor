@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         FTP Advisor
 // @namespace    http://tampermonkey.net/
-// @version      8.11
+// @version      8.12
 // @description  Comprehensive tactical advisor for From the Pavilion cricket game (v7.0: full UI redesign with modern navy+gold theme, reusable createPanel() helper, stat badges, rec cards, and component library; v6.6: added a Youth Development Curve check on the Training page; v6.5: fixed finance parsing, removed gold captain highlight, fatigue-aware bowling spell length; v6.4: unstyled panels fixed; v6.3: tactics advisor now loads on game.htm?gameId=...; v6.2: club.htm data-status dashboard; v6.1: training uses age-decay/skill-slowdown/talent-bonus data from the user's FTP_Training model)
 // @author       You
 // @license      MIT
@@ -523,14 +523,22 @@
         const t = AGE_SCOUT_THRESHOLDS[age] || (age > 27 ? AGE_SCOUT_THRESHOLDS[27] : null);
         if (!t) return { hasBenchmark: false, passed: true, failed: [], met: [] };
 
+        // Primary/Technique/Fielding are "known: value > 0", not
+        // unconditionally true — a real 0 (Atrocious) on ALL of a
+        // candidate's core skills at once almost always means the column
+        // failed to scrape/map (see _mapTransferHeader/parseTransferRow),
+        // not a genuine zero-skill player. Treating a scrape gap as a real
+        // Atrocious rating silently hard-fails every candidate exactly
+        // like the Experience-always-0 bug fixed in v8.11 — same failure
+        // shape, different field.
         const primary = getPrimarySkillInfo(player).value;
         const checks = [
-            { name: 'Primary', value: primary, min: t.primary, known: true },
-            { name: 'Technique', value: player.technique || 0, min: t.technique, known: true },
+            { name: 'Primary', value: primary, min: t.primary, known: primary > 0 },
+            { name: 'Technique', value: player.technique || 0, min: t.technique, known: (player.technique || 0) > 0 },
             { name: 'Experience', value: player.experience || 0, min: t.experience, known: (player.experience || 0) > 0 },
-            { name: 'Fielding', value: player.fielding || 0, min: t.fielding, known: true },
+            { name: 'Fielding', value: player.fielding || 0, min: t.fielding, known: (player.fielding || 0) > 0 },
         ];
-        if (t.power != null) checks.push({ name: 'Power', value: player.power || 0, min: t.power, known: true });
+        if (t.power != null) checks.push({ name: 'Power', value: player.power || 0, min: t.power, known: (player.power || 0) > 0 });
         if (t.rating != null) checks.push({ name: 'Rating', value: player.rating || 0, min: t.rating, known: (player.rating || 0) > 0, isMoney: true });
 
         const fmt = (c, v) => c.isMoney ? v.toLocaleString() : skillLabel(v);
@@ -1337,7 +1345,10 @@
                     { name: 'Fielding', value: player.fielding || 0, target: targets.fielding }
                 ];
 
-                const belowSkills = skills.filter(s => s.value < s.target);
+                // Same "known" reasoning as checkScoutBenchmark: a real 0
+                // across the board almost always means the column didn't
+                // scrape/map, not a genuine Atrocious youth prospect.
+                const belowSkills = skills.filter(s => s.value > 0 && s.value < s.target);
 
                 // ANY skill below target = filtered out
                 if (belowSkills.length > 0) {
@@ -1431,11 +1442,15 @@
         // zeroing out the whole senior results list. Gated on `known` so
         // it's skipped (not treated as a fail) until the real value loads,
         // then genuinely enforced afterward.
+        // Primary/Technique/Fielding/Endurance are also "known: value > 0" —
+        // same reasoning as checkScoutBenchmark's gate: a real 0 across the
+        // board almost always means the column didn't scrape/map that row,
+        // not a genuine Atrocious senior transfer target.
         const seniorMinChecks = [
-            { name: 'Primary', value: primary, min: SENIOR_MINS.primary, known: true },
-            { name: 'Technique', value: player.technique || 0, min: SENIOR_MINS.technique, known: true },
-            { name: 'Fielding', value: player.fielding || 0, min: SENIOR_MINS.fielding, known: true },
-            { name: 'Endurance', value: player.endurance || 0, min: SENIOR_MINS.endurance, known: true },
+            { name: 'Primary', value: primary, min: SENIOR_MINS.primary, known: primary > 0 },
+            { name: 'Technique', value: player.technique || 0, min: SENIOR_MINS.technique, known: (player.technique || 0) > 0 },
+            { name: 'Fielding', value: player.fielding || 0, min: SENIOR_MINS.fielding, known: (player.fielding || 0) > 0 },
+            { name: 'Endurance', value: player.endurance || 0, min: SENIOR_MINS.endurance, known: (player.endurance || 0) > 0 },
             { name: 'Experience', value: player.experience || 0, min: SENIOR_MINS.experience, known: (player.experience || 0) > 0 }
         ];
 
@@ -6130,6 +6145,20 @@ table.ftp-table {
 
                 const verdictFiltered = evaluated.length - ageFiltered - filtered.length;
                 const skipped = evaluated.length - filtered.length;
+
+                // Diagnostics: if a whole age group vanishes with no
+                // obvious reason, this is the fastest way to tell a real
+                // hard-filter miss from a scrape/column-mapping gap
+                // (e.g. the v8.11/v8.12 always-0 bugs) without re-reading
+                // the scoring code each time.
+                const youthEval = evaluated.filter(e => Math.round(e.age) < 21);
+                const seniorEval = evaluated.filter(e => Math.round(e.age) >= 21);
+                console.log(`[FTP Transfer] Scanned ${evaluated.length} (${youthEval.length} youth, ${seniorEval.length} senior). ` +
+                    `Youth pass: ${youthEval.filter(e => e.eval.verdict !== 'poor' && e.eval.verdict !== 'weak').length}/${youthEval.length}. ` +
+                    `Senior pass: ${seniorEval.filter(e => e.eval.verdict !== 'poor' && e.eval.verdict !== 'weak').length}/${seniorEval.length}.`);
+                if (youthEval.length > 0 && youthEval.every(e => e.eval.verdict === 'poor')) {
+                    console.log('[FTP Transfer] Every youth candidate failed. Sample failure reasons:', youthEval.slice(0, 3).map(e => ({ name: e.name, age: e.age, batting: e.batting, bowling: e.bowling, technique: e.technique, fielding: e.fielding, keeping: e.keeping, rating: e.rating, warnings: e.eval.warnings })));
+                }
                 const priorityBuys = filtered;
 
                 // Sort: best buy to worst — ELITE first, then STRONG, then ADEQUATE; within verdict, highest rank first; cheapest first on ties
