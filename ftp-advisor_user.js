@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         FTP Advisor
 // @namespace    http://tampermonkey.net/
-// @version      8.19
+// @version      8.20
 // @description  Comprehensive tactical advisor for From the Pavilion cricket game (v8.18: enhanced opponent scouting report, match-week rest scheduling, bowling allocation opponent-aware; v8.17: phase-specific batting tactics; v8.16: confidence scores, fixture integration; v7.0: full UI redesign)
 // @author       You
 // @license      MIT
@@ -2511,19 +2511,25 @@
                     if (response.status !== 200) return reject(new Error(`HTTP ${response.status}`));
                     const parser = new DOMParser();
                     const doc = parser.parseFromString(response.responseText, 'text/html');
+                    // Same fix as getOpponentTeamId(): "Home" isn't always
+                    // the opponent — check both Home/Away and return
+                    // whichever isn't our own team. The old code returned
+                    // "Home" unconditionally, so a home fixture resolved
+                    // your own team as "the opponent".
                     const allThs = doc.querySelectorAll('th');
+                    let homeId = null, awayId = null;
                     for (const th of allThs) {
-                        if (th.textContent.trim() === 'Home') {
-                            const td = th.nextElementSibling;
-                            if (td) {
-                                const link = td.querySelector('a');
-                                if (link) {
-                                    const match = link.href.match(/teamId=(\d+)/);
-                                    if (match) return resolve(match[1]);
-                                }
-                            }
-                        }
+                        const label = th.textContent.trim();
+                        if (label !== 'Home' && label !== 'Away') continue;
+                        const td = th.nextElementSibling;
+                        const link = td ? td.querySelector('a') : null;
+                        const match = link ? link.href.match(/teamId=(\d+)/) : null;
+                        if (!match) continue;
+                        if (label === 'Home') homeId = match[1];
+                        else awayId = match[1];
                     }
+                    if (homeId && homeId !== String(TEAM_ID)) return resolve(homeId);
+                    if (awayId && awayId !== String(TEAM_ID)) return resolve(awayId);
                     const teamLinks = doc.querySelectorAll('a[href*="teamId="]');
                     for (const link of teamLinks) {
                         const match = link.href.match(/teamId=(\d+)/);
@@ -2732,21 +2738,29 @@
         return context;
     }
 
+    // "Home" is NOT always the opponent — it's whichever team actually
+    // has home advantage for this fixture. Whenever YOUR team is playing
+    // at home, "Home" IS your own team, and blindly returning it as "the
+    // opponent" silently scouted and cached your own squad under the
+    // opponent-cache keys (real bug: opponent scouting reports showing
+    // your own team, e.g. Team 1173 appearing as "the opponent" for a
+    // home fixture). Check both Home and Away rows and return whichever
+    // one isn't your own TEAM_ID.
     function getOpponentTeamId() {
-        // Look in match details for "Home" team (the opponent)
         const allElements = document.querySelectorAll('th');
+        let homeId = null, awayId = null;
         for (const th of allElements) {
-            if (th.textContent.trim() === 'Home') {
-                const td = th.nextElementSibling;
-                if (td) {
-                    const link = td.querySelector('a');
-                    if (link) {
-                        const match = link.href.match(/teamId=(\d+)/);
-                        if (match) return match[1];
-                    }
-                }
-            }
+            const label = th.textContent.trim();
+            if (label !== 'Home' && label !== 'Away') continue;
+            const td = th.nextElementSibling;
+            const link = td ? td.querySelector('a') : null;
+            const match = link ? link.href.match(/teamId=(\d+)/) : null;
+            if (!match) continue;
+            if (label === 'Home') homeId = match[1];
+            else awayId = match[1];
         }
+        if (homeId && homeId !== String(TEAM_ID)) return homeId;
+        if (awayId && awayId !== String(TEAM_ID)) return awayId;
         return null;
     }
 
@@ -7269,9 +7283,17 @@ table.ftp-table {
         if (oppEl) {
             try {
                 const allKeys = (typeof GM_listValues === 'function') ? GM_listValues() : [];
+                // Filter out our own TEAM_ID defensively — a bug in
+                // getOpponentTeamId()/extractOpponentTeamIdFromGame()
+                // (fixed) used to blindly treat "Home" as the opponent,
+                // which is wrong on a home fixture and could have already
+                // cached your own squad under the opponent-cache keys.
+                // This drops any such stale entry from display even if it
+                // was saved before the fix.
                 const opponentIds = allKeys
                     .filter(k => k.indexOf(OPPONENT_TIMESTAMP_PREFIX) === 0)
-                    .map(k => k.slice(OPPONENT_TIMESTAMP_PREFIX.length));
+                    .map(k => k.slice(OPPONENT_TIMESTAMP_PREFIX.length))
+                    .filter(id => id !== String(TEAM_ID));
                 if (opponentIds.length) {
                     const myCache = loadPlayerCache();
                     const myPlayers = myCache ? myCache.players : [];
@@ -7640,6 +7662,13 @@ table.ftp-table {
     async function init() {
         const pageType = detectPageType();
         console.log('[FTP Advisor] Page:', pageType);
+
+        // One-time cleanup: getOpponentTeamId()/extractOpponentTeamIdFromGame()
+        // used to blindly treat "Home" as the opponent, which is wrong on a
+        // home fixture — could have cached your own squad under the
+        // opponent-cache keys, keyed by your own TEAM_ID. That stale entry
+        // would keep showing up in opponent scouting forever otherwise.
+        if (TEAM_ID) cleanupOpponentCache(TEAM_ID);
 
         // --- SCRAPE CURRENT PAGE DATA (if on a data page) ---
         if (pageType === 'squad') {
