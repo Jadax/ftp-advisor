@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         FTP Advisor
 // @namespace    http://tampermonkey.net/
-// @version      8.14
-// @description  Comprehensive tactical advisor for From the Pavilion cricket game (v7.0: full UI redesign with modern navy+gold theme, reusable createPanel() helper, stat badges, rec cards, and component library; v6.6: added a Youth Development Curve check on the Training page; v6.5: fixed finance parsing, removed gold captain highlight, fatigue-aware bowling spell length; v6.4: unstyled panels fixed; v6.3: tactics advisor now loads on game.htm?gameId=...; v6.2: club.htm data-status dashboard; v6.1: training uses age-decay/skill-slowdown/talent-bonus data from the user's FTP_Training model)
+// @version      8.18
+// @description  Comprehensive tactical advisor for From the Pavilion cricket game (v8.18: enhanced opponent scouting report, match-week rest scheduling, bowling allocation opponent-aware; v8.17: phase-specific batting tactics; v8.16: confidence scores, fixture integration; v7.0: full UI redesign)
 // @author       You
 // @license      MIT
 // @match        https://www.fromthepavilion.org/*
@@ -347,10 +347,11 @@
     // Real percentage curves from the user's FTP_Training model
     // (Form-Exp tab), not just ad-hoc linear weights. Verbatim from the
     // sheet — nothing here is interpolated or invented.
-    // Reference data only, NOT YET wired into calculateBattingScore/
-    // BowlingScore — those have linear weights tuned over many prior
-    // versions, and swapping in a multiplicative model needs live-game
-    // verification first, not a blind mid-session rewrite.
+    // Wired into calculateBattingScore/calculateBowlingScore as a
+    // multiplicative modifier on top of the existing linear skill
+    // weights (score *= formMult * expMult) — replaces the old flat
+    // `+ player.form * 1.5` / `+ player.experience * 0.5` additive terms,
+    // which didn't reflect the real game's curves at all.
     //
     // FORM_MULTIPLIER: indices 0-10 (Atrocious..Outstanding) only — the
     // source sheet has NO data above Outstanding. Do not extrapolate;
@@ -865,6 +866,56 @@
         if (ageDays < 7) return `${ageDays}d ago`;
         if (ageDays < 14) return `${ageDays}d ago (stale)`;
         return `${ageDays}d ago (very stale!)`;
+    }
+
+    // ── Confidence scoring ──────────────────────────────────────
+    // Returns { level: 'high'|'medium'|'low', label, reasons[] }
+    // based on data freshness, skill completeness, and context info.
+    function computeConfidence(opts) {
+        const reasons = [];
+        let score = 0; // 0-100
+
+        // Data freshness (0-40 pts)
+        if (opts.cacheAgeHours != null) {
+            if (opts.cacheAgeHours < 2) { score += 40; }
+            else if (opts.cacheAgeHours < 6) { score += 30; reasons.push('Squad data ' + opts.cacheAgeHours + 'hr old'); }
+            else if (opts.cacheAgeHours < 24) { score += 15; reasons.push('Squad data ' + opts.cacheAgeHours + 'hr old — re-scrape for best accuracy'); }
+            else { score += 5; reasons.push('Squad data ' + Math.floor(opts.cacheAgeHours / 24) + 'd+ old — refresh recommended'); }
+        } else {
+            score += 10; reasons.push('No squad cache timestamp available');
+        }
+
+        // Skill completeness (0-30 pts)
+        if (opts.playersWithSkills != null && opts.totalPlayers != null) {
+            const ratio = opts.totalPlayers > 0 ? opts.playersWithSkills / opts.totalPlayers : 0;
+            if (ratio >= 0.9) { score += 30; }
+            else if (ratio >= 0.6) { score += 20; reasons.push(`${opts.playersWithSkills}/${opts.totalPlayers} players have full skill data`); }
+            else if (ratio >= 0.3) { score += 10; reasons.push(`Only ${opts.playersWithSkills}/${opts.totalPlayers} have skill data — some recs may be incomplete`); }
+            else { score += 0; reasons.push(`Few players have skill data (${opts.playersWithSkills}/${opts.totalPlayers})`); }
+        } else {
+            score += 15; // unknown — don't penalize too hard
+        }
+
+        // Context info (0-20 pts)
+        if (opts.hasAcademyInfo) { score += 10; } else { reasons.push('Academy level unknown'); }
+        if (opts.hasFinanceInfo) { score += 5; } else { reasons.push('Finances not cached'); }
+        if (opts.hasOpponentData) { score += 5; } else { reasons.push('No opponent data — tactical recs are generic'); }
+
+        // Match type awareness (0-10 pts)
+        if (opts.matchTypeKnown) { score += 10; } else { reasons.push('Match format unknown — using defaults'); }
+
+        let level, label;
+        if (score >= 70) { level = 'high'; label = 'High confidence'; }
+        else if (score >= 40) { level = 'medium'; label = 'Moderate confidence'; }
+        else { level = 'low'; label = 'Low confidence'; }
+
+        return { level, label, score, reasons };
+    }
+
+    function renderConfidenceBadge(conf) {
+        const colorMap = { high: 'green', medium: 'amber', low: 'red' };
+        const iconMap = { high: '\u2705', medium: '\u26A0', low: '\u26A0\uFE0F' };
+        return `<span class="ftp-stat-badge ${colorMap[conf.level]}" title="${conf.reasons.join('; ')}" style="font-size:9px;cursor:help;">${iconMap[conf.level]} ${conf.label} (${conf.score}%)</span>`;
     }
 
     // ============================================================
@@ -2613,7 +2664,8 @@
             overs: 50,
             venue: 'Unknown',
             isYouthOnly: false,
-            maxAge: 99
+            maxAge: 99,
+            isHome: null
         };
 
         // Find weather, pitch, league from the match details table
@@ -2660,6 +2712,20 @@
                     context.matchType = 'OD';
                     context.overs = 50;
                 }
+            } else if (thText.includes('Home')) {
+                // "Home: [Team Name]" — check if it's our team
+                const homeText = td.textContent.trim();
+                if (homeText && TEAM_ID) {
+                    const homeLink = td.querySelector('a[href*="teamId="]');
+                    if (homeLink) {
+                        const m = homeLink.href.match(/teamId=(\d+)/);
+                        context.isHome = m && m[1] === String(TEAM_ID);
+                    } else {
+                        // Fallback: if no link, check if team name is in the text
+                        // (less reliable but handles cases where the link format differs)
+                        context.isHome = null; // unknown
+                    }
+                }
             }
         });
 
@@ -2687,11 +2753,28 @@
     // ============================================================
     // SCORING FUNCTIONS
     // ============================================================
-    function calculateBattingScore(player, pitchEffect, weatherEffect, isT20, isYouth) {
+    function calculateBattingScore(player, pitchEffect, weatherEffect, isT20, isYouth, isHome) {
+        // Form and Experience use multiplicative curves from the FTP_Training
+        // workbook's Form-Exp tab (real game data), not flat additive weights.
+        // Form index clamped at 10 (Outstanding) — the source sheet has no data
+        // above Outstanding; don't extrapolate.
+        const formIdx = Math.min(10, Math.max(0, player.form || 0));
+        const expIdx = Math.min(15, Math.max(0, player.experience || 0));
+        const formMult = FORM_MULTIPLIER[formIdx] || 1.0;
+        const expMult = EXPERIENCE_MULTIPLIER[expIdx] || 1.0;
         let score = (player.batting * 3) + (player.technique * 2) + (player.power * 1.5) +
-                    (player.experience * 0.5) + (player.form * 1.5) + (player.fatigue * 0.3);
+                    (player.fatigue * 0.3);
+        score *= formMult * expMult;
         score *= pitchEffect.bat;
+        // weatherEffect.bat: direct batting modifier (Hot=0.9, Humid=1.1, etc.)
+        // weatherEffect.fatigue: fatigue drain proxy — (2 - fatigue)/2 reduces
+        // score proportionally to how much weather accelerates tiredness.
+        if (weatherEffect.bat) score *= weatherEffect.bat;
         score *= (2 - weatherEffect.fatigue) / 2;
+        // Home advantage: pitch control (you choose the pitch type) + crowd
+        // support. Small but real — official manual confirms home team gets
+        // 2/3 gate revenue and pitch choice. ~3% bonus is conservative.
+        if (isHome === true) score *= 1.03;
         if (isT20) score += player.power * 1.5;
 
         // Talent bonuses — format-aware
@@ -2726,7 +2809,7 @@
         return score;
     }
 
-    function calculateBowlingScore(player, pitchEffect, weatherEffect, isT20, isYouth) {
+    function calculateBowlingScore(player, pitchEffect, weatherEffect, isT20, isYouth, isHome) {
         const category = player.bowlerCategory;
         const isDesignatedBowler = category !== 'none';
         let pitchMod, weatherMod;
@@ -2740,9 +2823,18 @@
             pitchMod = (pitchEffect.seam + pitchEffect.spin) / 2;
             weatherMod = (weatherEffect.seam + weatherEffect.spin) / 2;
         }
+        // Form and Experience use multiplicative curves (same as batting),
+        // not flat additive weights. Form index clamped at 10.
+        const formIdx = Math.min(10, Math.max(0, player.form || 0));
+        const expIdx = Math.min(15, Math.max(0, player.experience || 0));
+        const formMult = FORM_MULTIPLIER[formIdx] || 1.0;
+        const expMult = EXPERIENCE_MULTIPLIER[expIdx] || 1.0;
         let score = (player.bowling * 3) + (player.technique * 1.5) + (player.endurance * 1) +
-                    (player.experience * 0.5) + (player.form * 1.5) + (player.fatigue * 0.3);
+                    (player.fatigue * 0.3);
+        score *= formMult * expMult;
         score *= pitchMod * weatherMod;
+        // Home advantage: pitch familiarity + crowd support
+        if (isHome === true) score *= 1.03;
         if (category === 'seam') score *= 1.1;
         if (!isDesignatedBowler) score *= 0.75;
 
@@ -2905,6 +2997,7 @@
         const pitchEffect = PITCH_EFFECTS[context.pitch] || PITCH_EFFECTS.Sporting;
         const weatherEffect = WEATHER_EFFECTS[context.weather] || WEATHER_EFFECTS.Sunny;
         const pitch = context.pitch;
+        const weather = context.weather;
         const isT20 = context.matchType === 'T20' || context.matchType === 'YT20';
 
         let decision, reason;
@@ -2959,12 +3052,28 @@
             reason = 'Standard: Bowl first, chase with knowledge of target.';
         }
 
-        // Override with format-specific logic
-        if (isT20 && (pitch === 'Hard' || pitch === 'Crumbling')) {
-            // Still bat first on these even in T20
-        } else if (isT20) {
-            // For other pitches in T20, chasing is often better
-            // Keep the pitch-specific advice though
+        // Weather notes — official manual confirms these effects on
+        // bowling types, which matters for your attack selection.
+        // NOTE: toss decision remains pitch-based. Weather affects
+        // which bowlers to pick, not whether to bat/bowl first.
+        const weatherNotes = [];
+        if (weather === 'Overcast' || weather === 'Cloudy') {
+            weatherNotes.push(`${weather} favours seam bowlers — prioritise seam in your attack.`);
+        } else if (weather === 'Hot') {
+            weatherNotes.push('Hot: seam bowlers perform worse. Lean on spin.');
+        } else if (weather === 'Humid') {
+            weatherNotes.push('Humid: seam bowlers enjoy it, spinners struggle. Lean on seam.');
+        } else if (weather === 'Windy') {
+            weatherNotes.push('Windy: slightly favours spin bowlers.');
+        }
+
+        // T20 override: Hard/Crumbling pitches still bat first even in
+        // T20. All other pitches default to bowl (chase) — the pitch-
+        // specific logic above already handles this correctly, so no
+        // additional override needed.
+
+        if (weatherNotes.length > 0) {
+            reason += ' Weather: ' + weatherNotes.join(' ');
         }
 
         return { decision, reason };
@@ -2980,8 +3089,8 @@
         const isYouth = context.isYouthOnly;
 
         const ranked = availablePlayers.map(p => {
-            let batScore = calculateBattingScore(p, pitchEffect, weatherEffect, isT20, isYouth);
-            let bowlScore = calculateBowlingScore(p, pitchEffect, weatherEffect, isT20, isYouth);
+            let batScore = calculateBattingScore(p, pitchEffect, weatherEffect, isT20, isYouth, context.isHome);
+            let bowlScore = calculateBowlingScore(p, pitchEffect, weatherEffect, isT20, isYouth, context.isHome);
             let keepScore = calculateKeepingScore(p);
 
             if (opponentAnalysis) {
@@ -3112,12 +3221,20 @@
     // ============================================================
     // BATTING ORDER (with LH/RH mixing for partnerships)
     // ============================================================
-    function recommendBattingOrder(lineup) {
+    // FTP game tactics: 2=Normal, 4=Defensive, 5=Aggressive
+    // T20 and OD require different phase strategies — the game engine
+    // penalises defensive batting in T20 (too slow to set a chaseable
+    // total) and aggressive batting early in OD (risk losing wickets
+    // before establishing a platform).
+    function recommendBattingOrder(lineup, context) {
         // Wiki: LH/RH partnerships cause bowler penalty → mix them
         // Opener pairs: try to pair LH + RH
         // Best batsman at #3 or #4 (anchor)
         // Keeper in top 7
         // Bowlers at #8-#11 (tail)
+
+        const isT20 = context && (context.matchType === 'T20' || context.matchType === 'YT20');
+        const isOD = context && (context.matchType === 'OD' || context.matchType === 'YOD');
 
         const hasTalent = (player, regex) => (player.talents || []).some(t => regex.test(t));
         const openerIds = new Set();
@@ -3141,6 +3258,8 @@
         let pos1 = rhBatsmen.find(p => openerIds.has(p.id)) || lhBatsmen.find(p => openerIds.has(p.id));
         if (!pos1) pos1 = rhBatsmen[0] || lhBatsmen[0];
         if (pos1) {
+            // T20 openers: Normal to survive new ball, then accelerate
+            // OD openers: Normal to build platform
             ordered.push({ ...pos1, position: 1, battingTactic: 2 });
             used.add(pos1.id);
         }
@@ -3162,31 +3281,40 @@
         }
 
         // Position 3: Best remaining batsman (anchor)
+        // OD: Defensive (anchor the innings, build a platform)
+        // T20: Normal (accelerate from the start — can't afford to
+        //   dot-ball through the powerplay)
         const remaining = sorted.filter(p => !used.has(p.id));
         if (remaining.length > 0) {
             const anchor = remaining.shift();
-            ordered.push({ ...anchor, position: 3, battingTactic: 4 }); // Defensive to anchor
+            ordered.push({ ...anchor, position: 3, battingTactic: isT20 ? 2 : 4 });
             used.add(anchor.id);
         }
 
         // Position 4-5: Next best, alternate LH/RH
+        // OD: Normal — rotate strike, build partnerships
+        // T20: Aggressive — attack from ball 1 in the middle overs
         while (ordered.length < 5) {
             const nextRH = sorted.find(p => !p.isLeftHanded && !used.has(p.id));
             const nextLH = sorted.find(p => p.isLeftHanded && !used.has(p.id));
             const pick = (ordered.length % 2 === 0 ? nextRH : nextLH) || nextRH || nextLH;
             if (!pick) break;
-            ordered.push({ ...pick, position: ordered.length + 1, battingTactic: 2 });
+            ordered.push({ ...pick, position: ordered.length + 1, battingTactic: isT20 ? 5 : 2 });
             used.add(pick.id);
         }
 
         // Position 6: Keeper + next best
+        // T20: Aggressive (keeper bats in the power-hitting zone)
+        // OD: Normal (keep wickets in hand for the middle overs)
         const keeper = lineup.find(p => p.role === 'WK' && !used.has(p.id));
         if (keeper && ordered.length < 7) {
-            ordered.push({ ...keeper, position: ordered.length + 1, battingTactic: 2 });
+            ordered.push({ ...keeper, position: ordered.length + 1, battingTactic: isT20 ? 5 : 2 });
             used.add(keeper.id);
         }
 
         // Position 7-8: Prefer Finisher talent here
+        // T20: Aggressive — death overs hitting (Finisher talent shines here)
+        // OD: Aggressive for bowlers, Normal for batters — late-order hitting
         let remaining2 = sorted.filter(p => !used.has(p.id));
         while (ordered.length < 8 && remaining2.length > 0) {
             const finisher = remaining2.find(p => finisherIds.has(p.id));
@@ -3199,18 +3327,20 @@
             }
             if (!pick) break;
             const isBowler = pick.bowlerCategory !== 'none' || pick.bowling >= MIN_BOWLING_FOR_BOWLERS;
-            ordered.push({ ...pick, position: ordered.length + 1, battingTactic: isBowler ? 5 : 2 });
+            // T20: everyone aggressive in death overs
+            // OD: bowlers Aggressive (slog), batters Normal (support the hitter)
+            const tactic = isT20 ? 5 : (isBowler ? 5 : 2);
+            ordered.push({ ...pick, position: ordered.length + 1, battingTactic: tactic });
             used.add(pick.id);
         }
 
         // Position 9-11: Bowlers/sloggers (aggressive tactic)
+        // Both formats: Aggressive — tail-enders swing for the boundary
         remaining2 = sorted.filter(p => !used.has(p.id));
         while (ordered.length < 11 && remaining2.length > 0) {
             const p = remaining2.shift();
             if (!p) break;
-            const isBowler = p.bowlerCategory !== 'none' || p.bowling >= MIN_BOWLING_FOR_BOWLERS;
-            const tactic = isBowler ? 5 : 2;
-            ordered.push({ ...p, position: ordered.length + 1, battingTactic: tactic });
+            ordered.push({ ...p, position: ordered.length + 1, battingTactic: 5 });
             used.add(p.id);
         }
 
@@ -3249,10 +3379,23 @@
             const isKeeper = p.role === 'WK' || (p.keeping >= 4 && p.keeping > p.bowling);
             if (isKeeper) return false;
             return p.bowlerCategory !== 'none' || p.bowling >= MIN_BOWLING_FOR_BOWLERS;
-        }).map(p => ({
-            ...p,
-            bowlScore: calculateBowlingScore(p, pitchEffect, weatherEffect, isT20, context.isYouthOnly)
-        })).sort((a, b) => b.bowlScore - a.bowlScore);
+        }).map(p => {
+            let bs = calculateBowlingScore(p, pitchEffect, weatherEffect, isT20, context.isYouthOnly, context.isHome);
+            // Apply opponent analysis adjustments — same logic as
+            // recommendLineup's post-hoc adjustments, so the allocation
+            // ranking is consistent with the XI selection.
+            if (opponentAnalysis) {
+                if (opponentAnalysis.pitchVulnerability === 'seam' && p.bowlerCategory === 'seam') bs *= 1.25;
+                if (opponentAnalysis.pitchVulnerability === 'spin' && p.bowlerCategory === 'spin') bs *= 1.25;
+                if (opponentAnalysis.isFatigued) bs *= 1.1;
+                // Opponent batting weakness: if they have more Seam
+                // Specialist batters, they're LESS vulnerable to seam →
+                // spin gets an edge (and vice versa)
+                if (opponentAnalysis.oppSeamSpecialistBatters > opponentAnalysis.oppSpinSpecialistBatters && p.bowlerCategory === 'spin') bs *= 1.1;
+                if (opponentAnalysis.oppSpinSpecialistBatters > opponentAnalysis.oppSeamSpecialistBatters && p.bowlerCategory === 'seam') bs *= 1.1;
+            }
+            return { ...p, bowlScore: bs };
+        }).sort((a, b) => b.bowlScore - a.bowlScore);
 
         // Talent-aware bowler ranking: New Ball Bowler gets priority for opening spells
         const hasTalent = (player, regex) => (player.talents || []).some(t => regex.test(t));
@@ -3693,26 +3836,36 @@
         // Generate recommendations
         const tossRec = recommendTossDecision(context, opponentAnalysis);
         const lineup = recommendLineup(enrichedPlayers, context, opponentAnalysis);
-        const battingOrder = recommendBattingOrder(lineup);
+        const battingOrder = recommendBattingOrder(lineup, context);
         const bowling = allocateBowlingSpells(lineup, context, opponentAnalysis);
 
         // Display toss
         const tossColor = tossRec.decision === 'bat' ? 'green' : 'blue';
         const tossIcon = tossRec.decision === 'bat' ? '\u{1F3CF}' : '\u{1F3C3}';
+        let dangerHtml = '';
+        if (opponentAnalysis && opponentAnalysis.dangerousBowlerCount > 0) {
+            const names = opponentAnalysis.dangerousBowlerNames.join(', ');
+            dangerHtml = `<div class="ftp-alert danger" style="margin:6px 0 0 0;"><span>\ud83d\udea8</span><div><strong>Opponent has ${opponentAnalysis.dangerousBowlerCount} dangerous bowler${opponentAnalysis.dangerousBowlerCount > 1 ? 's' : ''}:</strong> ${names} — these have triggered delivery talents (Yorker/Bouncer/Swing/etc). Prepare your lower order defensively.</div></div>`;
+        }
+        if (opponentAnalysis && opponentAnalysis.inForm) {
+            dangerHtml += `<div class="ftp-alert warning" style="margin:4px 0 0 0;"><span>\u26A0</span><div>Opponent is in strong form (avg form ${(opponentAnalysis.avgForm || 0).toFixed(1)}/10). Expect aggressive play.</div></div>`;
+        }
+
         document.getElementById('ftp-toss').innerHTML = `
             <div class="ftp-info-box success" style="text-align:center;">
                 <div style="font-size:22px;margin-bottom:4px;">${tossIcon}</div>
                 <div style="font-weight:700;font-size:16px;color:var(--vj-text);">${tossRec.decision === 'bat' ? 'Bat First' : 'Bowl First'}</div>
                 <div class="vj-text-xs vj-text-secondary vj-mt-4">${tossRec.reason}</div>
             </div>
+            ${dangerHtml}
             ${ageWarning}
         `;
 
         // Display batting order
-        displayBattingOrder(battingOrder);
+        displayBattingOrder(battingOrder, opponentAnalysis, context);
 
         // Display bowling
-        displayBowling(bowling);
+        displayBowling(bowling, opponentAnalysis);
         } catch (err) {
             console.error('[FTP Advisor] Error in updateOrdersAdvisor:', err);
             const ctx = document.getElementById('ftp-context');
@@ -3720,8 +3873,30 @@
         }
     }
 
-    function displayBattingOrder(battingOrder) {
-        let html = '<table class="ftp-table"><thead><tr><th>#</th><th>Player</th><th>Bat</th><th>Form</th><th>L/R</th><th>Tac</th></tr></thead><tbody>';
+    function displayBattingOrder(battingOrder, opponentAnalysis, context) {
+        const isT20 = context && (context.matchType === 'T20' || context.matchType === 'YT20');
+
+        // Opponent bowling composition — what our batters are facing
+        let oppBowlingHtml = '';
+        if (opponentAnalysis) {
+            const parts = [];
+            parts.push(`<strong>${opponentAnalysis.seamerCount} seam</strong>, <strong>${opponentAnalysis.spinnerCount} spin</strong>`);
+            if (opponentAnalysis.dangerousBowlerCount > 0) {
+                parts.push(`${opponentAnalysis.dangerousBowlerCount} dangerous (${opponentAnalysis.dangerousBowlerNames.join(', ')})`);
+            }
+            if (opponentAnalysis.keyBowler) {
+                parts.push(`Key: ${opponentAnalysis.keyBowler.name} (exp ${opponentAnalysis.keyBowler.experience})`);
+            }
+            const tacticTip = opponentAnalysis.seamerCount > opponentAnalysis.spinnerCount
+                ? 'More seam attack — LH batters get variety advantage; Seam Specialist talent triggers more.'
+                : opponentAnalysis.spinnerCount > opponentAnalysis.seamerCount
+                ? 'More spin attack — RH batters get variety advantage; Spin Specialist talent triggers more.'
+                : 'Balanced attack — no specific matchup edge.';
+            oppBowlingHtml = `<div class="ftp-alert info" style="margin-bottom:6px;"><span>\u{1F3CF}</span><div><strong>Opponent bowling:</strong> ${parts.join(' \u00B7 ')}<div class="vj-text-xs vj-mt-4">${tacticTip}</div></div></div>`;
+        }
+
+        let html = oppBowlingHtml;
+        html += '<table class="ftp-table"><thead><tr><th>#</th><th>Player</th><th>Bat</th><th>Form</th><th>L/R</th><th>Tac</th></tr></thead><tbody>';
         battingOrder.forEach(p => {
             const captainMark = p.isCaptain ? ' <span class="ftp-stat-badge amber" style="font-size:9px;padding:1px 5px;">C</span>' : '';
             const keeperMark = p.role === 'WK' ? ' <span class="ftp-stat-badge orange" style="font-size:9px;padding:1px 5px;background:var(--vj-orange-bg);color:var(--vj-orange);">WK</span>' : '';
@@ -3738,12 +3913,27 @@
             </tr>`;
         });
         html += '</tbody></table>';
-        html += '<div class="vj-text-xs vj-text-muted vj-mt-4" style="text-align:center;">C = Captain \u00B7 WK = Wicketkeeper \u00B7 N=Normal D=Defensive A=Aggressive</div>';
+        const tacticNote = isT20
+            ? 'N=Normal D=Defensive A=Aggressive \u00B7 T20: aggressive middle/death to maximise scoring rate'
+            : 'C = Captain \u00B7 WK = Wicketkeeper \u00B7 N=Normal D=Defensive A=Aggressive \u00B7 OD: anchor at #3, aggressive tail';
+        html += `<div class="vj-text-xs vj-text-muted vj-mt-4" style="text-align:center;">${tacticNote}</div>`;
         document.getElementById('ftp-batting').innerHTML = html;
     }
 
-    function displayBowling(bowlingSpells) {
-        let html = '<table class="ftp-table"><thead><tr><th>#</th><th>End</th><th>Over</th><th>Bowler</th><th>Bowl</th><th>Ovs</th><th>Tac</th><th>Phase</th></tr></thead><tbody>';
+    function displayBowling(bowlingSpells, opponentAnalysis) {
+        let html = '';
+
+        // Spell variety summary
+        const seamerSpells = bowlingSpells.filter(s => s && s.player && s.player.bowlerCategory === 'seam');
+        const spinnerSpells = bowlingSpells.filter(s => s && s.player && s.player.bowlerCategory === 'spin');
+        const varietyParts = [];
+        if (seamerSpells.length > 0) varietyParts.push(`${seamerSpells.length} seam spells`);
+        if (spinnerSpells.length > 0) varietyParts.push(`${spinnerSpells.length} spin spells`);
+        if (varietyParts.length > 0) {
+            html += `<div class="vj-text-xs vj-text-muted vj-mb-4" style="text-align:center;">Bowling variety: ${varietyParts.join(' + ')}</div>`;
+        }
+
+        html += '<table class="ftp-table"><thead><tr><th>#</th><th>End</th><th>Over</th><th>Bowler</th><th>Bowl</th><th>Ovs</th><th>Tac</th><th>Phase</th></tr></thead><tbody>';
         bowlingSpells.forEach((spell, index) => {
             if (!spell || !spell.player) return;
             const end = spell.end || (index % 2 === 0 ? 'Gibson' : 'Southern');
@@ -4054,6 +4244,48 @@
 
         // Default: Even
         return { pitch: 'Even', reason: `No clear strength advantage — Bat ${batRating.toFixed(1)}, Seam ${seamRating.toFixed(1)}, Spin ${spinRating.toFixed(1)}. Even: no advantage to anyone.` };
+    }
+
+    // ── Upcoming fixture fetcher (for training page integration) ──
+    // Fetches teamfixtures.htm in background, returns next 1-2 upcoming
+    // matches with format (T20/OD/YT20/YOD) so training can adapt.
+    function fetchUpcomingFixtures() {
+        return new Promise((resolve) => {
+            GM_xmlhttpRequest({
+                method: 'GET',
+                url: `https://www.fromthepavilion.org/teamfixtures.htm?teamId=${TEAM_ID}#curr`,
+                timeout: 10000,
+                onload: function(response) {
+                    if (response.status !== 200) { resolve([]); return; }
+                    const parser = new DOMParser();
+                    const doc = parser.parseFromString(response.responseText, 'text/html');
+                    const rows = doc.querySelectorAll('table.data tbody tr');
+                    const upcoming = [];
+                    const now = new Date();
+                    rows.forEach(row => {
+                        const cells = row.querySelectorAll('td');
+                        if (cells.length < 3) return;
+                        const dateText = cells[0].textContent.trim();
+                        const matchDate = new Date(dateText.replace(/(\d+) (\w+) (\d+) (\d+):(\d+)/, '$2 $1, $3 $4:$5'));
+                        if (isNaN(matchDate.getTime()) || matchDate < now) return;
+                        const matchClass = (cells[1]?.querySelector('a')?.textContent.trim() || cells[1]?.textContent.trim() || '').trim();
+                        const teams = cells[2]?.textContent.trim() || '';
+                        // Determine format from match class text
+                        let format = 'OD';
+                        const mc = matchClass.toLowerCase();
+                        if (mc.includes('twenty20') || mc.includes('t20')) format = mc.includes('youth') ? 'YT20' : 'T20';
+                        else if (mc.includes('youth') || mc.includes('yod')) format = 'YOD';
+                        else format = 'OD';
+                        const gameLink = row.querySelector('a[href*="game.htm?gameId="]');
+                        upcoming.push({ date: dateText, matchDate, matchClass, teams, format, gameLink: gameLink?.href || '' });
+                    });
+                    upcoming.sort((a, b) => a.matchDate - b.matchDate);
+                    resolve(upcoming.slice(0, 3));
+                },
+                onerror: function() { resolve([]); },
+                ontimeout: function() { resolve([]); }
+            });
+        });
     }
 
     // ============================================================
@@ -4771,7 +5003,7 @@ table.ftp-table {
      * academy speed, age curve, a matching training talent, and skill
      * slowdown above Outstanding. Returns null for unknown programs.
      */
-    function estimateWeeklyTrainingGain(programKey, player, academySpeed) {
+    function estimateWeeklyTrainingGain(programKey, player, academySpeed, opts) {
         const rates = TRAINING_BASE_RATES[programKey];
         if (!rates) return null;
         const ageMult = getAgeTrainingMultiplier(player.age);
@@ -4782,13 +5014,23 @@ table.ftp-table {
         // skills while in the youth squad." Gifted (X) talents have no
         // such restriction stated — they apply at any age.
         const isProdigy = (player.age || 0) < 21 && talents.some(t => t.toLowerCase().includes('prodigy'));
+        // Fatigue training penalty from official manual: moderate=15%,
+        // weary=30%, listless=45%, exhausted=60%, shattered=75%,
+        // clinically dead=90%. Satisfactory and below = 0%.
+        const FATIGUE_TRAINING_PENALTY = { 5: 0.15, 4: 0.30, 3: 0.45, 2: 0.60, 1: 0.75, 0: 0.90 };
+        const fatiguePenalty = (opts && opts.fatiguePenalty !== undefined) ? opts.fatiguePenalty :
+            (FATIGUE_TRAINING_PENALTY[player.fatigue] || 0);
+        // Squad overcrowding penalty: 7.5% per extra player beyond 25.
+        // Formula: efficiency% = 100 - ((players - 25) × 7.5), then
+        // convert to multiplier (e.g. 30 players → 62.5% → 0.625).
+        const squadMult = (opts && opts.squadSizePenalty !== undefined) ? opts.squadSizePenalty : 1;
         const result = {};
         for (const [skill, basePoints] of Object.entries(rates)) {
             const ageM = skill === 'power' ? ageMult.power : skill === 'endurance' ? ageMult.endurance : ageMult.primary;
             const hasGiftedMatch = isProdigy || talents.some(t => t.toLowerCase().includes('gifted') && t.toLowerCase().includes(skill));
             const talentM = hasGiftedMatch ? (1 + TRAINING_TALENT_BONUS) : 1;
             const slowdownM = getSkillSlowdownMultiplier(player[skill] || 0);
-            result[skill] = Math.round(basePoints * academyRatio * ageM * talentM * slowdownM);
+            result[skill] = Math.round(basePoints * academyRatio * ageM * talentM * slowdownM * (1 - fatiguePenalty) * squadMult);
         }
         return result;
     }
@@ -4818,6 +5060,36 @@ table.ftp-table {
      * Returns { finalSkills, finalProgress, levelUps, weeks }, or null
      * for an unknown/rest program.
      */
+    /**
+     * Project a youth player's skills forward to age 20 using the
+     * training simulation engine. Returns { projected, verdict } where
+     * projected has the skill levels at age 20 and verdict is an
+     * assessment of whether they'll reach useful levels.
+     */
+    function projectYouthToAge20(player, academySpeed) {
+        const currentAge = player.age || 16;
+        if (currentAge >= 20) return null; // already at final youth year
+        const weeksToAge20 = Math.ceil((20 - currentAge) * 14);
+        // Use the adaptive training plan to project — it re-runs the
+        // recommendation engine each week, which is the most accurate
+        // simulation we have.
+        const plan = simulateAdaptiveTrainingPlan(player, weeksToAge20, academySpeed, null);
+        if (!plan) return null;
+        const projected = plan.finalSkills;
+        const primaryInfo = getPrimarySkillInfo(projected);
+        const primaryAt20 = primaryInfo.value;
+        // Assessment thresholds based on community consensus:
+        // Expert(9)+ by 20 = excellent, Accomplished(8) = strong,
+        // Reliable(7) = adequate, below = likely won't contribute
+        let verdict;
+        if (primaryAt20 >= 10) verdict = 'outstanding';
+        else if (primaryAt20 >= 9) verdict = 'expert';
+        else if (primaryAt20 >= 8) verdict = 'accomplished';
+        else if (primaryAt20 >= 7) verdict = 'reliable';
+        else verdict = 'below-target';
+        return { projected, verdict, weeksToAge20, primaryAt20 };
+    }
+
     /**
      * "12wk outlook: Reasonable → Capable (wk8), 34% into Capable" —
      * turns a simulateTrainingPlan() result for one skill into one
@@ -4858,7 +5130,12 @@ table.ftp-table {
             // layout (Wk0-Wk14 per age column). Using 52 here understated
             // aging by ~3.7x in every previous version of this simulation.
             simPlayer.age = player.age + (week - 1) / 14;
-            const gains = estimateWeeklyTrainingGain(programKey, simPlayer, academySpeed);
+            // Week 1 uses real fatigue penalty; week 2+ assumes healthy
+            // baseline (fatigue=8, no penalty) since we don't have a
+            // match schedule to drive realistic fatigue dynamics.
+            const weekFatiguePenalty = week === 1 ? undefined : 0;
+            const gains = estimateWeeklyTrainingGain(programKey, simPlayer, academySpeed,
+                weekFatiguePenalty !== undefined ? { fatiguePenalty: weekFatiguePenalty } : undefined);
             for (const skill of Object.keys(state)) {
                 if (state[skill].level >= 15) continue; // Legendary — capped
                 state[skill].progress += (gains && gains[skill]) || 0;
@@ -4913,6 +5190,10 @@ table.ftp-table {
         ADAPTIVE_PLAN_SKILLS.forEach(skill => {
             state[skill] = { level: Math.min(15, Math.round(player[skill] || 0)), progress: 0 };
         });
+        // Squad size penalty — constant across all simulated weeks since
+        // we don't model squad composition changes during the plan.
+        const ss = squadContext?.size || 0;
+        const squadMult = ss > 25 ? Math.max(0, 1 - ((ss - 25) * 0.075)) : 1;
 
         const levelUps = [];
         const timeline = [];
@@ -4938,7 +5219,8 @@ table.ftp-table {
             }
 
             if (program === 'rest') continue; // no skill gain this week
-            const gains = estimateWeeklyTrainingGain(program, simPlayer, academySpeed);
+            const gainOpts = squadMult < 1 ? { squadSizePenalty: squadMult } : undefined;
+            const gains = estimateWeeklyTrainingGain(program, simPlayer, academySpeed, gainOpts);
             if (!gains) continue;
             Object.keys(gains).forEach(skill => {
                 if (!state[skill] || state[skill].level >= 15) return;
@@ -4975,21 +5257,22 @@ table.ftp-table {
         const hasGiftedBatting = player.talents.some(t => t.toLowerCase().includes('gifted') && t.toLowerCase().includes('batting'));
         const hasGiftedBowling = player.talents.some(t => t.toLowerCase().includes('gifted') && t.toLowerCase().includes('bowling'));
         const hasGiftedTechnique = player.talents.some(t => t.toLowerCase().includes('gifted') && t.toLowerCase().includes('technique'));
+        const hasGiftedFielding = player.talents.some(t => t.toLowerCase().includes('gifted') && t.toLowerCase().includes('fielding'));
         return { isBatsman, isBowler, isKeeper, isAllrounder, isWristSpinner, isProdigy,
-                 hasGiftedBatting, hasGiftedBowling, hasGiftedTechnique };
+                 hasGiftedBatting, hasGiftedBowling, hasGiftedTechnique, hasGiftedFielding };
     }
 
     // Youth training path (age < 21)
     function _recommendYouthTraining(rec, player, ctx) {
         const { academySpeed, setProgram } = ctx;
-        const { isBowler, isKeeper, isAllrounder, isWristSpinner, hasGiftedBatting, hasGiftedBowling, hasGiftedTechnique, isProdigy } = ctx;
+        const { isBowler, isKeeper, isAllrounder, isWristSpinner, hasGiftedBatting, hasGiftedBowling, hasGiftedTechnique, hasGiftedFielding, isProdigy } = ctx;
 
-        // Target Reliable (7), not Capable (6) — an experienced user's real
-        // training order for a 16yo bowler (fielding->Reliable, then bowling
-        // technique->Reliable, then bowling) confirmed Capable was stopping
-        // fielding development one tier too early.
-        if (player.fielding < 7) {
-            setProgram('fielding', `Youth: Fielding is ${skillLabel(player.fielding)}. Get fielding to Reliable first — early pops are cheap and fast, and this tier is worth pushing past Capable before moving on. Improves run-saving, catching, and runout opportunities. Academy speed: ${Math.round(academySpeed * 100)}%.`, 'high');
+        // Fielding target: Reliable (7) normally, but Capable (6) if Gifted
+        // (Fielding) — it pops faster as a secondary during other training.
+        const fieldingTarget = hasGiftedFielding ? 6 : 7;
+        if (player.fielding < fieldingTarget) {
+            const targetLabel = fieldingTarget === 6 ? 'Capable' : 'Reliable';
+            setProgram('fielding', `Youth: Fielding is ${skillLabel(player.fielding)}. Get fielding to ${targetLabel} first — early pops are cheap and fast.${hasGiftedFielding ? ' Gifted (Fielding) means it trains faster as a secondary, so Capable is enough.' : ''} Improves run-saving, catching, and runout opportunities. Academy speed: ${Math.round(academySpeed * 100)}%.`, 'high');
             return;
         }
 
@@ -5020,7 +5303,10 @@ table.ftp-table {
         // pouring development into bowling/batting, not only when it's
         // already fallen behind. Keeper-Batting already trains technique
         // alongside keeping so it's excluded here.
-        if (!isKeeper && player.technique < 7) {
+        // EXCEPTION: Gifted (Technique) players — technique pops faster as a
+        // secondary during fielding/bowling training, so skip the dedicated
+        // technique stage and go straight to primary.
+        if (!isKeeper && player.technique < 7 && !hasGiftedTechnique) {
             if (isBowler) {
                 setProgram('bowlingtech', `Fielding is at target — now build technique (${skillLabel(player.technique)}) to Reliable before bowling. High bowling + low technique = takes wickets but bowls poor deliveries; this order avoids that.`, 'high');
             } else {
@@ -5030,7 +5316,19 @@ table.ftp-table {
         }
 
         if (isAllrounder && player.batting >= 4 && player.bowling >= 4) {
-            setProgram('allrounder', `Youth all-rounder: Batting (${skillLabel(player.batting)}) and bowling (${skillLabel(player.bowling)}) are close. AR training develops both equally.`, 'high');
+            setProgram('allrounder', `Youth all-rounder: Batting (${skillLabel(player.batting)}) and bowling (${skillLabel(player.bowling)}) are close. AR training develops both equally.${isProdigy ? ' PRODIGY: all skills train faster — maximise breadth while in youth.' : ''}`, 'high');
+        } else if (isProdigy && player.age < 19 && !isKeeper) {
+            // Prodigy youth benefit from breadth — all skills train faster,
+            // so AR training in early youth builds a wider base before
+            // specialising. Only recommend if both bat/bowl are ≥3 (not
+            // completely lopsided).
+            if (player.batting >= 3 && player.bowling >= 3) {
+                setProgram('allrounder', `Youth PRODIGY: All skills train faster. AR training builds breadth — batting (${skillLabel(player.batting)}) and bowling (${skillLabel(player.bowling)}) both benefit. Specialise after 18.`, 'high');
+            } else {
+                // One discipline is too weak for AR — train the stronger one
+                const prog = player.batting >= player.bowling ? 'batting' : 'bowling';
+                setProgram(prog, `Youth PRODIGY: One discipline too weak for AR. Train ${prog} (${skillLabel(player[prog])}) while prodigy bonus is active.`, 'high');
+            }
         } else if (isKeeper) {
             setProgram('keeperbatting', `Youth keeper: Keeping (${skillLabel(player.keeping)}) is primary. Keeper-Batting trains keeping, batting, technique, and fielding together.`, 'high');
         } else if (isBowler) {
@@ -5170,9 +5468,16 @@ table.ftp-table {
 
         // Estimated weekly point gain + weeks-to-next-level, from the
         // FTP_Training model's base rates combined with the multipliers
-        // already computed above (academy/age/talent/slowdown).
+        // already computed above (academy/age/talent/slowdown/fatigue/squad).
         if (rec.program !== 'rest') {
-            rec.weeklyGain = estimateWeeklyTrainingGain(rec.program, player, academySpeed);
+            // Fatigue penalty: already handled by estimateWeeklyTrainingGain's
+            // default (reads player.fatigue). Squad size penalty: compute from
+            // squadContext.size and pass explicitly since the function has no
+            // access to squadContext.
+            const ss = squadContext?.size || 0;
+            const squadMult = ss > 25 ? Math.max(0, 1 - ((ss - 25) * 0.075)) : 1;
+            const gainOpts = squadMult < 1 ? { squadSizePenalty: squadMult } : undefined;
+            rec.weeklyGain = estimateWeeklyTrainingGain(rec.program, player, academySpeed, gainOpts);
             const programDef = TRAINING_PROGRAMS[rec.program];
             if (rec.weeklyGain && programDef && programDef.primary) {
                 rec.primarySkill = programDef.primary;
@@ -5316,17 +5621,44 @@ table.ftp-table {
         const academySpeed = academyInfo ? (academyInfo.trainingEfficiency != null ? academyInfo.trainingEfficiency / 100 : (ACADEMY_SPEED[academyInfo.levelNum] || 1.00)) : 1.00;
         const academyLevel = academyInfo ? academyInfo.level : 'unknown';
 
+        const squadCache = loadPlayerCache();
+        const cacheAgeHours = squadCache ? squadCache.ageHours : null;
+        const playersWithSkills = players.filter(p => (p.batting || 0) > 0 || (p.bowling || 0) > 0 || (p.fielding || 0) > 0).length;
+        const conf = computeConfidence({
+            cacheAgeHours,
+            playersWithSkills,
+            totalPlayers: players.length,
+            hasAcademyInfo: !!academyInfo,
+            hasFinanceInfo: !!financeInfo,
+            hasOpponentData: false,
+            matchTypeKnown: false,
+        });
+
         let statsHtml = `
             <div class="vj-flex vj-gap-6 vj-mb-8" style="flex-wrap:wrap;">
                 <span class="ftp-stat-badge blue">Squad: ${players.length}</span>
                 <span class="ftp-stat-badge ${efficiency < 100 ? 'red' : 'green'}">${efficiency.toFixed(0)}%</span>
                 <span class="ftp-stat-badge purple">${academyLevel} (${Math.round(academySpeed * 100)}%)</span>
+                ${renderConfidenceBadge(conf)}
             </div>
             <div class="ftp-stat-row"><span class="ftp-stat-label">Average age</span><span class="ftp-stat-value">${avgAge.toFixed(1)}</span></div>
             <div class="ftp-stat-row"><span class="ftp-stat-label">Youth (&lt;21)</span><span class="ftp-stat-value">${youth.length}</span></div>
             <div class="ftp-stat-row"><span class="ftp-stat-label">Aging (30+)</span><span class="ftp-stat-value">${aging.length}</span></div>
             <div class="ftp-stat-row"><span class="ftp-stat-label">Avg fatigue</span><span class="ftp-stat-value">${avgFatigue.toFixed(1)}/10</span></div>
             ${fatigued.length > 0 ? `<div class="ftp-alert danger" style="margin-top:4px;"><span>\u26A0</span><div>Fatigued: ${fatigued.map(p => p.name).join(', ')}</div></div>` : ''}
+            ${(() => {
+                // Injury risk: players at Shattered(1)/Exhausted(2) are at
+                // high risk — recommend Rest proactively. Listless(3) gets
+                // a milder warning.
+                const highRisk = players.filter(p => p.fatigue <= 2);
+                const moderateRisk = players.filter(p => p.fatigue === 3);
+                if (highRisk.length > 0) {
+                    return `<div class="ftp-alert danger" style="margin-top:4px;"><span>\ud83d\udea8</span><div>Injury risk: ${highRisk.map(p => `${p.name} (${SKILL_LABELS[p.fatigue]})`).join(', ')} — REST recommended, training gains severely penalised.</div></div>`;
+                } else if (moderateRisk.length > 0) {
+                    return `<div class="ftp-alert warning" style="margin-top:4px;"><span>\u26A0</span><div>Fatigue building: ${moderateRisk.map(p => `${p.name} (${SKILL_LABELS[p.fatigue]})`).join(', ')} — 45% training penalty. Consider Rest.</div></div>`;
+                }
+                return '';
+            })()}
             ${players.length > 25 ? `<div class="ftp-alert warning" style="margin-top:4px;"><span>\u26A0</span><div>Squad has ${players.length} players (&gt;25 limit). Training penalty: ${((players.length - 25) * 7.5).toFixed(1)}% per extra player.</div></div>` : ''}
         `;
         document.getElementById('ftp-training-stats').innerHTML = statsHtml;
@@ -5351,6 +5683,63 @@ table.ftp-table {
             </div>`;
         });
         document.getElementById('ftp-training-recs').innerHTML = recsHtml;
+
+        // ── Upcoming match context (background fetch) ───────────
+        fetchUpcomingFixtures().then(upcoming => {
+            if (upcoming.length === 0) return;
+            const next = upcoming[0];
+            const daysUntil = Math.ceil((next.matchDate - new Date()) / (1000 * 60 * 60 * 24));
+            const isT20 = next.format === 'T20' || next.format === 'YT20';
+            const isShort = isT20 || next.format === 'YOD';
+
+            // Training guidance based on upcoming match
+            let matchNote = '';
+            if (daysUntil <= 3) {
+                matchNote = `<div class="ftp-alert info" style="margin-top:8px;"><span>\u{1F4C5}</span><div><strong>Next match in ${daysUntil} day${daysUntil !== 1 ? 's' : ''}:</strong> ${next.teams} (${next.matchClass})<br>` +
+                    `<span class="vj-text-xs">Tip: ${isT20 ? 'T20 focus — bowling fitness & death-overs batting' : isShort ? 'Short format — bowling economy is key' : 'OD — full fitness matters, longer bowling spells'}.</span></div></div>`;
+            } else if (daysUntil <= 7) {
+                matchNote = `<div class="ftp-alert info" style="margin-top:8px;"><span>\u{1F4C5}</span><div><strong>Next match in ${daysUntil} days:</strong> ${next.teams} (${next.matchClass})<br>` +
+                    `<span class="vj-text-xs">Tip: ${isT20 ? 'T20 coming up — prioritise power batting & short bowling spells' : 'OD coming up — balance endurance with match fitness'}.</span></div></div>`;
+            } else {
+                matchNote = `<div class="ftp-alert info" style="margin-top:8px;"><span>\u{1F4C5}</span><div><strong>Next match in ${daysUntil} days:</strong> ${next.teams} (${next.matchClass})</div></div>`;
+            }
+
+            // Match-week rest recommendations: when a match is within 3
+            // days, recommend Rest for fatigued starters (Listless or
+            // worse) — the game penalises fatigued players with lower
+            // starting energy, which matters more than one extra training
+            // session before a match.
+            if (daysUntil <= 3) {
+                const severeFatigue = players.filter(p => p.fatigue <= 3);
+                const moderateFatigue = players.filter(p => p.fatigue === 4);
+                if (severeFatigue.length > 0) {
+                    matchNote += `<div class="ftp-alert danger" style="margin-top:4px;"><span>\u{1F6A8}</span><div><strong>REST recommended before the match:</strong><div class="vj-text-xs vj-mt-4">` +
+                        severeFatigue.map(p => `${p.name} (${SKILL_LABELS[p.fatigue]} — fatigue ${p.fatigue}/10)`).join(', ') +
+                        `<br>These players will start the match with reduced energy if they train this week. Consider giving them Rest.</div></div></div>`;
+                }
+                if (moderateFatigue.length > 0 && severeFatigue.length === 0) {
+                    matchNote += `<div class="ftp-alert warning" style="margin-top:4px;"><span>\u26A0</span><div>` +
+                        `Fatigued starters: ${moderateFatigue.map(p => `${p.name} (${SKILL_LABELS[p.fatigue]})`).join(', ')} — consider Rest if match fitness is priority.</div></div>`;
+                }
+            } else if (daysUntil <= 7) {
+                const severeFatigue = players.filter(p => p.fatigue <= 2);
+                if (severeFatigue.length > 0) {
+                    matchNote += `<div class="ftp-alert warning" style="margin-top:4px;"><span>\u26A0</span><div>` +
+                        `Match in ${daysUntil} days: ${severeFatigue.map(p => `${p.name} (${SKILL_LABELS[p.fatigue]})`).join(', ')} are very fatigued — schedule Rest this week to recover in time.</div></div>`;
+                }
+            }
+
+            // Show remaining upcoming fixtures too
+            if (upcoming.length > 1) {
+                matchNote += '<div class="vj-text-xs vj-text-muted" style="margin-top:4px;">Also upcoming: ' +
+                    upcoming.slice(1).map(m => `${m.teams} (${m.format})`).join(' \u00B7 ') + '</div>';
+            }
+
+            const recsContainer = document.getElementById('ftp-training-recs');
+            if (recsContainer) {
+                recsContainer.insertAdjacentHTML('afterbegin', matchNote);
+            }
+        });
     }
 
     function displayAcademyInfo(academyInfo, financeInfo) {
@@ -6091,6 +6480,7 @@ table.ftp-table {
                 { id: 'ftp-refresh', label: '\u21BB', title: 'Refresh' }
             ],
             sections: [
+                { id: 'ftp-transfer-gaps', label: 'Squad Gaps', icon: '\u26A0', iconColor: 'amber' },
                 { id: 'ftp-transfer-results', label: 'Search Results', icon: '\u{1F50D}', iconColor: 'green',
                   content: '<div class="vj-text-sm vj-text-muted">Search for players on the transfer form to evaluate them here.</div>' },
                 { id: 'ftp-transfer-targets', label: 'Target Thresholds', icon: '\u{1F3AF}', iconColor: 'blue', collapsible: true, collapsed: true },
@@ -6111,6 +6501,51 @@ table.ftp-table {
         const seniorPlayers = allPlayers.filter(p => p.age >= 21);
         const youthPlayers = allPlayers.filter(p => p.age < 21);
         const squadStats = computeSquadStats(allPlayers);
+
+        // ---- SQUAD GAPS ANALYSIS ----
+        const gapsEl = document.getElementById('ftp-transfer-gaps');
+        if (gapsEl && squadStats) {
+            const gaps = [];
+            const WARN = 'var(--vj-red)', OK = 'var(--vj-green)', NEUTRAL = 'var(--vj-blue)';
+
+            const transferConf = computeConfidence({
+                cacheAgeHours: cache ? cache.ageHours : null,
+                playersWithSkills: allPlayers.filter(p => (p.batting || 0) > 0).length,
+                totalPlayers: allPlayers.length,
+                hasAcademyInfo: false,
+                hasFinanceInfo: !!financeInfo,
+                hasOpponentData: false,
+                matchTypeKnown: false,
+            });
+
+            // Role balance: ideal squad has ~4 batters, ~4 bowlers, ~2 all-rounders, 1 keeper
+            if (squadStats.keeperCount < 1) gaps.push({ text: 'No specialist keeper — urgently need one', color: WARN });
+            else if (squadStats.keeperCount === 1) gaps.push({ text: 'Only 1 keeper — consider backup', color: NEUTRAL });
+
+            if (squadStats.bowlerCount < 3) gaps.push({ text: `Only ${squadStats.bowlerCount} bowler${squadStats.bowlerCount !== 1 ? 's' : ''} — need at least 4 for selection flexibility`, color: WARN });
+            else if (squadStats.bowlerCount < 4) gaps.push({ text: `${squadStats.bowlerCount} bowlers — one more would help`, color: NEUTRAL });
+
+            if (squadStats.batterCount < 4) gaps.push({ text: `Only ${squadStats.batterCount} batter${squadStats.batterCount !== 1 ? 's' : ''} — batting lineup is thin`, color: WARN });
+
+            if (squadStats.allrounderCount < 1) gaps.push({ text: 'No all-rounders — missing valuable squad flexibility', color: NEUTRAL });
+
+            // Skill gaps: compare min skills to reasonable thresholds
+            if (squadStats.minPrimary < 7) gaps.push({ text: `Lowest primary skill is ${skillLabel(squadStats.minPrimary)} — squad depth issue`, color: WARN });
+            if (squadStats.avgPrimary < 8) gaps.push({ text: `Average primary is ${skillLabel(squadStats.avgPrimary)} — below Expert`, color: NEUTRAL });
+
+            // Age profile
+            const oldPlayers = seniorPlayers.filter(p => p.age >= 30);
+            if (oldPlayers.length > 3) gaps.push({ text: `${oldPlayers.length} players aged 30+ — consider succession planning`, color: NEUTRAL });
+
+            if (gaps.length === 0) {
+                gapsEl.innerHTML = `<div style="margin-bottom:6px;">${renderConfidenceBadge(transferConf)}</div><div class="ftp-stat-row"><span class="ftp-stat-label" style="color:var(--vj-green);">Squad composition looks solid</span></div>`;
+            } else {
+                gapsEl.innerHTML = `<div style="margin-bottom:6px;">${renderConfidenceBadge(transferConf)}</div>` + gaps.map(g =>
+                    `<div class="ftp-stat-row"><span class="ftp-stat-label" style="color:${g.color};font-size:11px;">\u2022 ${g.text}</span></div>`
+                ).join('');
+            }
+        }
+
         if (resultsEl) {
             const results = scrapeTransferResults();
             if (results.length > 0) {
@@ -6207,6 +6642,15 @@ table.ftp-table {
                     if (players.length === 0) {
                         html += '<div class="vj-text-sm vj-text-muted">No targets found. Try adjusting search filters (age, bowling type, skill ranges).</div>';
                     } else {
+                        // Pre-compute academy speed for youth projections.
+                        // window._ftpAcademyInfo was never set anywhere in
+                        // the file — this silently always fell back to 100%
+                        // academy speed regardless of the real level. Use
+                        // the actual cache accessor used everywhere else.
+                        const academyInfoForProjection = loadAcademyCache();
+                        const academySpeed = academyInfoForProjection ?
+                            (academyInfoForProjection.trainingEfficiency != null ? academyInfoForProjection.trainingEfficiency / 100 : (ACADEMY_SPEED[academyInfoForProjection.levelNum] || 1.0)) : 1.0;
+
                         players.forEach((p, i) => {
                             const ev = p.eval;
                             const badgeClass = ev.verdict === 'elite' ? 'green' : ev.verdict === 'strong' ? 'green' : 'warn';
@@ -6229,7 +6673,14 @@ table.ftp-table {
                             if (p.rating) detailParts.push(`Rating ${p.rating.toLocaleString()}`);
                             if (detailsFetched && p.experience != null && p.experience > 0) detailParts.push(`Exp ${skillLabel(p.experience)}`);
                             if (detailsFetched && p.captaincy != null && p.captaincy > 0) detailParts.push(`Capt ${skillLabel(p.captaincy)}`);
-                            if (detailsFetched && p.wage != null && p.wage > 0) detailParts.push(`Wage $${p.wage.toLocaleString()}/wk`);
+                            if (detailsFetched && p.wage != null && p.wage > 0) {
+                                detailParts.push(`Wage $${p.wage.toLocaleString()}/wk`);
+                                // Wage-adjusted value: skill points per $1K wage
+                                const skillSum = (p.batting || 0) + (p.bowling || 0) + (p.technique || 0) + (p.fielding || 0) + (p.endurance || 0);
+                                const skillPerK = skillSum / (p.wage / 1000);
+                                const valueColor = skillPerK >= 10 ? 'var(--vj-green)' : skillPerK >= 5 ? 'var(--vj-gold)' : 'var(--vj-red)';
+                                detailParts.push(`<span style="color:${valueColor};">Value ${skillPerK.toFixed(1)} skill/$K</span>`);
+                            }
                             if (p.price) detailParts.push(`Price $${p.price.toLocaleString()}`);
                             if (detailsFetched && p.talents && p.talents.length > 0) detailParts.push(`<span style="color:var(--vj-gold);">${p.talents.join(', ')}</span>`);
 
@@ -6256,6 +6707,20 @@ table.ftp-table {
                                 </div>
                                 ${ev.warnings.length > 0 ? `<div class="vj-text-xs vj-text-muted" style="color:var(--vj-red);line-height:1.4;margin-top:2px;">\u26A0 ${ev.warnings.join(' \u00B7 ')}</div>` : ''}
                                 ${ev.strengths.length > 0 ? `<div class="vj-text-xs vj-text-muted" style="color:var(--vj-green);line-height:1.4;margin-top:2px;">\u2713 ${ev.strengths.join(' \u00B7 ')}</div>` : ''}
+                                ${(() => {
+                                    // Youth potential projection: show projected skills at age 20
+                                    if (Math.round(p.age) < 21 && Math.round(p.age) >= 16) {
+                                        const proj = projectYouthToAge20(p, academySpeed);
+                                        if (proj) {
+                                            const projPrimary = getPrimarySkillInfo(proj.projected);
+                                            const verdictColor = proj.verdict === 'outstanding' || proj.verdict === 'expert' ? 'var(--vj-green)' :
+                                                proj.verdict === 'accomplished' ? 'var(--vj-blue)' :
+                                                proj.verdict === 'reliable' ? 'var(--vj-gold)' : 'var(--vj-red)';
+                                            return `<div class="vj-text-xs" style="color:${verdictColor};line-height:1.4;margin-top:2px;">\ud83d\udd2e Projected at 20: ${projPrimary.name === 'keeping' ? 'Keep' : projPrimary.name === 'bowling' ? 'Bowl' : 'Bat'} ${skillLabel(projPrimary.value)} \u00B7 Tech ${skillLabel(proj.projected.technique)} \u00B7 Field ${skillLabel(proj.projected.fielding)} (${proj.verdict})</div>`;
+                                        }
+                                    }
+                                    return '';
+                                })()}
                                 ${compareHtml}
                             </div>`;
                         });
@@ -6502,6 +6967,7 @@ table.ftp-table {
         });
 
         html += `<div class="vj-text-xs vj-text-muted vj-mt-4">Replace with transfers: prioritize fast bowlers, wrist spinners, and high-technique players aged 16-27.</div>`;
+        html += `<div class="ftp-alert info" style="margin-top:6px;"><span>\u2139</span><div><strong>Transfer settlement:</strong> Listing fee $1,000 (non-refundable). Settlement: 50% + (days in squad/2)% if <100 days, 100% if 100+ days. Bidding on your own player resets days-in-squad to 0.</div></div>`;
         return html;
     }
 
@@ -6598,6 +7064,7 @@ table.ftp-table {
         });
 
         html += `<div class="vj-text-xs vj-text-muted vj-mt-4">Free roster spots for better youth recruits or transfer targets.</div>`;
+        html += `<div class="ftp-alert info" style="margin-top:6px;"><span>\u2139</span><div><strong>Transfer settlement:</strong> Listing fee $1,000. Youth recruits are exempt from the 7-day relist wait. Settlement same as seniors (50%+ for &lt;100 days in squad).</div></div>`;
         return html;
     }
 
@@ -6795,26 +7262,72 @@ table.ftp-table {
                     .filter(k => k.indexOf(OPPONENT_TIMESTAMP_PREFIX) === 0)
                     .map(k => k.slice(OPPONENT_TIMESTAMP_PREFIX.length));
                 if (opponentIds.length) {
-                    let oppHtml = '<table class="ftp-table"><thead><tr><th>Team</th><th>Players</th><th>Last Updated</th><th>Status</th></tr></thead><tbody>';
+                    const myCache = loadPlayerCache();
+                    const myPlayers = myCache ? myCache.players : [];
+                    let oppHtml = '';
                     opponentIds.forEach(id => {
                         const age = getDataAgeText(OPPONENT_TIMESTAMP_PREFIX + id);
                         const stale = isStale(OPPONENT_TIMESTAMP_PREFIX + id, STALE_OPPONENT_HOURS);
                         const cached = loadOpponentCache(id);
                         const count = cached ? cached.players.length : 0;
-                        const fullSkillCount = cached ? cached.players.filter(p => p.hasFullSkills).length : 0;
-                        const playersCell = count === 0
-                            ? '<span class="ftp-stat-badge red">0 found</span>'
-                            : fullSkillCount === 0
-                                ? `${count} <span class="vj-text-xs vj-text-muted">(skills hidden)</span>`
-                                : `${count}`;
-                        oppHtml += `<tr><td>Team ${id}</td><td>${playersCell}</td><td class="vj-text-xs vj-text-muted">${age}</td><td><span class="ftp-stat-badge ${stale ? 'amber' : 'green'}">${stale ? 'Stale' : 'Fresh'}</span></td></tr>`;
+                        if (count === 0) {
+                            oppHtml += `<div class="ftp-rec medium" style="padding:6px 8px;margin-bottom:4px;">
+                                <div class="vj-flex-between"><span class="vj-fw-700" style="font-size:12px;">Team ${id}</span><span class="ftp-stat-badge red">0 players</span></div>
+                            </div>`;
+                            return;
+                        }
+
+                        const analysis = analyzeOpposition(cached.players, myPlayers);
+                        const strengthColor = analysis && analysis.strength === 'elite' ? 'red' : analysis && analysis.strength === 'strong' ? 'amber' : 'green';
+                        const strengthLabel = analysis ? analysis.strength.charAt(0).toUpperCase() + analysis.strength.slice(1) : '?';
+
+                        oppHtml += `<div class="ftp-rec ${stale ? 'medium' : 'low'}" style="padding:6px 8px;margin-bottom:4px;">
+                            <div class="vj-flex-between">
+                                <span class="vj-fw-700" style="font-size:12px;">Team ${id}</span>
+                                <div>${analysis ? `<span class="ftp-stat-badge ${strengthColor}" style="font-size:9px;">${strengthLabel}</span>` : ''} <span class="ftp-stat-badge ${stale ? 'amber' : 'green'}" style="font-size:9px;">${age}</span></div>
+                            </div>`;
+
+                        if (analysis) {
+                            oppHtml += `<div class="vj-text-xs vj-text-muted" style="margin-top:2px;">${count} players \u00B7 Exp ${analysis.avgExp.toFixed(1)} \u00B7 Form ${analysis.avgForm.toFixed(1)} \u00B7 Fatigue ${analysis.avgFatigue.toFixed(1)}</div>`;
+
+                            // Bowling breakdown
+                            const bowlParts = [];
+                            if (analysis.seamerCount > 0) bowlParts.push(`${analysis.seamerCount} seam`);
+                            if (analysis.spinnerCount > 0) bowlParts.push(`${analysis.spinnerCount} spin`);
+                            if (analysis.dangerousBowlerCount > 0) bowlParts.push(`<span style="color:var(--vj-red);">\ud83d\udea8 ${analysis.dangerousBowlerCount} dangerous</span>`);
+                            if (bowlParts.length > 0) {
+                                oppHtml += `<div class="vj-text-xs" style="margin-top:2px;">Bowling: ${bowlParts.join(' + ')}</div>`;
+                            }
+
+                            // Tactical insight
+                            let tactic = '';
+                            if (analysis.pitchVulnerability === 'seam') {
+                                tactic = 'Weak seam attack \u2014 prefer spin bowlers';
+                            } else {
+                                tactic = 'Weak spin attack \u2014 prefer seam bowlers';
+                            }
+                            if (analysis.isFatigued) tactic += ' \u00B7 Tired squad \u2014 exploit with aggressive batting';
+                            if (analysis.inForm) tactic += ' \u00B7 In form \u00B7 expect strong performance';
+                            if (analysis.relativeStrength === 'stronger') tactic += ' \u00B7 Stronger than you \u00B7 play cautiously';
+                            else if (analysis.relativeStrength === 'weaker') tactic += ' \u00B7 Weaker than you \u00B7 play aggressively';
+                            oppHtml += `<div class="vj-text-xs" style="margin-top:2px;color:var(--vj-blue);">${tactic}</div>`;
+
+                            // Dangerous bowler names
+                            if (analysis.dangerousBowlerNames.length > 0) {
+                                oppHtml += `<div class="vj-text-xs" style="margin-top:2px;color:var(--vj-red);">Danger: ${analysis.dangerousBowlerNames.join(', ')}</div>`;
+                            }
+                        } else {
+                            oppHtml += `<div class="vj-text-xs vj-text-muted">${count} players cached (skills may be hidden)</div>`;
+                        }
+
+                        oppHtml += '</div>';
                     });
-                    oppHtml += '</tbody></table>';
                     oppEl.innerHTML = oppHtml;
                 } else {
-                    oppEl.innerHTML = '<div class="vj-text-xs vj-text-muted">No opponent scouting data cached.</div>';
+                    oppEl.innerHTML = '<div class="vj-text-xs vj-text-muted">No opponent scouting data cached. Use "Scout Next Opponent" above.</div>';
                 }
             } catch (e) {
+                console.error('[FTP] Opponent display error:', e);
                 oppEl.innerHTML = '<div class="vj-text-xs vj-text-muted">Opponent list not available on this userscript manager.</div>';
             }
         }
