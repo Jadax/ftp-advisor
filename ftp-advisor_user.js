@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         FTP Advisor
 // @namespace    http://tampermonkey.net/
-// @version      8.13
+// @version      8.14
 // @description  Comprehensive tactical advisor for From the Pavilion cricket game (v7.0: full UI redesign with modern navy+gold theme, reusable createPanel() helper, stat badges, rec cards, and component library; v6.6: added a Youth Development Curve check on the Training page; v6.5: fixed finance parsing, removed gold captain highlight, fatigue-aware bowling spell length; v6.4: unstyled panels fixed; v6.3: tactics advisor now loads on game.htm?gameId=...; v6.2: club.htm data-status dashboard; v6.1: training uses age-decay/skill-slowdown/talent-bonus data from the user's FTP_Training model)
 // @author       You
 // @license      MIT
@@ -6163,8 +6163,16 @@ table.ftp-table {
                 console.log(`[FTP Transfer] Scanned ${evaluated.length} (${youthEval.length} youth, ${seniorEval.length} senior). ` +
                     `Youth pass: ${youthEval.filter(e => e.eval.verdict !== 'poor' && e.eval.verdict !== 'weak').length}/${youthEval.length}. ` +
                     `Senior pass: ${seniorEval.filter(e => e.eval.verdict !== 'poor' && e.eval.verdict !== 'weak').length}/${seniorEval.length}.`);
-                if (youthEval.length > 0 && youthEval.every(e => e.eval.verdict === 'poor')) {
-                    console.log('[FTP Transfer] Every youth candidate failed. Sample failure reasons:', youthEval.slice(0, 3).map(e => ({ name: e.name, age: e.age, batting: e.batting, bowling: e.bowling, technique: e.technique, fielding: e.fielding, keeping: e.keeping, rating: e.rating, warnings: e.eval.warnings })));
+                if (youthEval.length > 0 && youthEval.every(e => e.eval.verdict === 'poor' || e.eval.verdict === 'weak')) {
+                    // Flattened to a plain string, not a logged object —
+                    // browser consoles collapse nested objects to "{...}"
+                    // when copy-pasted as text, which makes an object-based
+                    // log useless for a user pasting console output back.
+                    youthEval.slice(0, 5).forEach(e => {
+                        console.log(`[FTP Transfer] YOUTH FAIL: ${e.name} (age ${e.age.toFixed(2)}) — ` +
+                            `Bat ${e.batting} Bowl ${e.bowling} Keep ${e.keeping} Tech ${e.technique} Field ${e.fielding} Rating ${e.rating} — ` +
+                            `reasons: ${e.eval.warnings.join(' | ') || '(none — check verdict logic)'}`);
+                    });
                 }
                 const priorityBuys = filtered;
 
