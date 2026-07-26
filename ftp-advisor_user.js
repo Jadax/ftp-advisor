@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         FTP Advisor
 // @namespace    http://tampermonkey.net/
-// @version      8.18
+// @version      8.19
 // @description  Comprehensive tactical advisor for From the Pavilion cricket game (v8.18: enhanced opponent scouting report, match-week rest scheduling, bowling allocation opponent-aware; v8.17: phase-specific batting tactics; v8.16: confidence scores, fixture integration; v7.0: full UI redesign)
 // @author       You
 // @license      MIT
@@ -6889,6 +6889,29 @@ table.ftp-table {
     // urgency. Uses age, skill levels, technique, rating vs peers,
     // and replaceability to score each player.
     // ============================================================
+    // Shared by generateSeniorSellList() and generateYouthSellList() —
+    // the two were near-byte-identical rec cards (rank/name/statLine
+    // header, sellScore badge, reason bullets) that had drifted into two
+    // separate copies. Consolidated first since it's the one pair of the
+    // ~6 duplicated rec-card sites (see CLAUDE.md tech debt) provably
+    // identical enough to merge without needing live-browser verification
+    // — output is byte-for-byte the same as each site produced before.
+    // The other sites (training, youth recruit, transfer results,
+    // opponent scouting) have real structural differences and are left
+    // alone until they can be checked live.
+    function renderSellCandidateCard(rank, player, sellScore, reasons, statLine) {
+        const sev = sellScore >= 20 ? 'critical' : sellScore >= 10 ? 'high' : 'medium';
+        const badgeColor = sev === 'critical' ? 'red' : sev === 'high' ? 'amber' : 'neutral';
+        const reasonColor = sev === 'critical' ? 'red' : sev === 'high' ? 'amber' : 'muted';
+        return `<div class="ftp-rec ${sev}" style="padding:6px 8px;margin-bottom:4px;">
+                <div class="vj-flex-between">
+                    <span class="vj-fw-700" style="font-size:12px;">${rank}. ${player.name} <span class="vj-text-xs vj-text-muted">(${statLine})</span></span>
+                    <span class="ftp-stat-badge ${badgeColor}">${sellScore}pts</span>
+                </div>
+                ${reasons.length ? reasons.map(r2 => `<div class="vj-text-xs" style="color:var(--vj-${reasonColor});">• ${r2}</div>`).join('') : ''}
+            </div>`;
+    }
+
     function generateSeniorSellList(players) {
         if (!players || players.length === 0) return '<div class="vj-text-sm vj-text-muted">No players found.</div>';
         const seniors = players.filter(p => p.isSenior);
@@ -6956,14 +6979,8 @@ table.ftp-table {
 
         let html = `<div class="vj-text-xs vj-text-muted vj-mb-4">Ranked by urgency to sell. ${candidates.length} of ${seniors.length} seniors flagged.</div>`;
         candidates.forEach((r, i) => {
-            const sev = r.sellScore >= 20 ? 'critical' : r.sellScore >= 10 ? 'high' : 'medium';
-            html += `<div class="ftp-rec ${sev}" style="padding:6px 8px;margin-bottom:4px;">
-                <div class="vj-flex-between">
-                    <span class="vj-fw-700" style="font-size:12px;">${i+1}. ${r.player.name} <span class="vj-text-xs vj-text-muted">(${r.player.age}yo \u00B7 ${skillLabel(r.player.batting)}/${skillLabel(r.player.bowling)} \u00B7 R${r.player.rating || '?'})</span></span>
-                    <span class="ftp-stat-badge ${sev === 'critical' ? 'red' : sev === 'high' ? 'amber' : 'neutral'}">${r.sellScore}pts</span>
-                </div>
-                ${r.reasons.length ? r.reasons.map(r2 => `<div class="vj-text-xs" style="color:var(--vj-${sev === 'critical' ? 'red' : sev === 'high' ? 'amber' : 'muted'});">\u2022 ${r2}</div>`).join('') : ''}
-            </div>`;
+            const statLine = `${r.player.age}yo \u00B7 ${skillLabel(r.player.batting)}/${skillLabel(r.player.bowling)} \u00B7 R${r.player.rating || '?'}`;
+            html += renderSellCandidateCard(i + 1, r.player, r.sellScore, r.reasons, statLine);
         });
 
         html += `<div class="vj-text-xs vj-text-muted vj-mt-4">Replace with transfers: prioritize fast bowlers, wrist spinners, and high-technique players aged 16-27.</div>`;
@@ -7053,14 +7070,8 @@ table.ftp-table {
 
         let html = `<div class="vj-text-xs vj-text-muted vj-mb-4">Youth players behind the 16-20 development curve. ${scored.length} of ${youth.length} flagged.</div>`;
         scored.forEach((r, i) => {
-            const sev = r.sellScore >= 20 ? 'critical' : r.sellScore >= 10 ? 'high' : 'medium';
-            html += `<div class="ftp-rec ${sev}" style="padding:6px 8px;margin-bottom:4px;">
-                <div class="vj-flex-between">
-                    <span class="vj-fw-700" style="font-size:12px;">${i+1}. ${r.player.name} <span class="vj-text-xs vj-text-muted">(age ${Math.round(r.player.age)} \u00B7 ${skillLabel(r.player.batting)}/${skillLabel(r.player.bowling)})</span></span>
-                    <span class="ftp-stat-badge ${sev === 'critical' ? 'red' : sev === 'high' ? 'amber' : 'neutral'}">${r.sellScore}pts</span>
-                </div>
-                ${r.reasons.map(r2 => `<div class="vj-text-xs" style="color:var(--vj-${sev === 'critical' ? 'red' : sev === 'high' ? 'amber' : 'muted'});">\u2022 ${r2}</div>`).join('')}
-            </div>`;
+            const statLine = `age ${Math.round(r.player.age)} \u00B7 ${skillLabel(r.player.batting)}/${skillLabel(r.player.bowling)}`;
+            html += renderSellCandidateCard(i + 1, r.player, r.sellScore, r.reasons, statLine);
         });
 
         html += `<div class="vj-text-xs vj-text-muted vj-mt-4">Free roster spots for better youth recruits or transfer targets.</div>`;
