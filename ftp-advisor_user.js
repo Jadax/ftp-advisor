@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         FTP Advisor
 // @namespace    http://tampermonkey.net/
-// @version      8.22
+// @version      8.23
 // @description  Comprehensive tactical advisor for From the Pavilion cricket game (v8.18: enhanced opponent scouting report, match-week rest scheduling, bowling allocation opponent-aware; v8.17: phase-specific batting tactics; v8.16: confidence scores, fixture integration; v7.0: full UI redesign)
 // @author       You
 // @license      MIT
@@ -4077,7 +4077,7 @@
                 { id: 'ftp-cache-status', label: 'Data Status', icon: '\u{1F4BE}', iconColor: 'teal' },
                 { id: 'ftp-squad-strengths', label: 'Squad Strengths', icon: '\u{1F4AA}', iconColor: 'green' },
                 { id: 'ftp-pitch-recs', label: 'Recommended Pitches', icon: '\u2B50', iconColor: 'amber' },
-                { id: 'ftp-current-pitches', label: 'Current Pitches', icon: '\u{1F4CD}', iconColor: 'red', collapsible: true, collapsed: true },
+                { id: 'ftp-current-pitches', label: 'Current vs Recommended', icon: '\u{1F4CD}', iconColor: 'red' },
                 { id: 'ftp-capacity-recs', label: 'Ground Capacity', icon: '\u{1F3E0}', iconColor: 'teal' }
             ]
         });
@@ -4144,37 +4144,76 @@
         const seniorT20BatRating = seniorBatRating * 0.7 + seniorPowerRating * 0.3;
         const youthT20BatRating = youthBatRating * 0.7 + youthPowerRating * 0.3;
 
-        const pitchRecs = [
-            { type: 'One Day (Senior)', ...recommendPitchForSquad(seniorSeamRating, seniorSpinRating, seniorBatRating) },
-            { type: 'Twenty20 (Senior)', ...recommendPitchForSquad(seniorSeamRating, seniorSpinRating, seniorT20BatRating) },
-            { type: 'Youth OD', ...recommendPitchForSquad(youthSeamRating, youthSpinRating, youthBatRating) },
-            { type: 'Youth T20', ...recommendPitchForSquad(youthSeamRating, youthSpinRating, youthT20BatRating) }
-        ];
-
-        let recHtml = '';
-        pitchRecs.forEach(rec => {
-            const pitchEffect = PITCH_EFFECTS[rec.pitch] || PITCH_EFFECTS.Even;
-            recHtml += `<div class="ftp-rec low" style="margin:5px 0;">
-                <div class="vj-flex-between"><span class="vj-fw-700">${rec.type}</span><span class="ftp-stat-badge green">${rec.pitch}</span></div>
-                <div class="vj-text-xs vj-text-muted vj-mt-4">${pitchEffect.desc}</div>
-                <div class="vj-text-xs vj-text-secondary vj-mt-4">${rec.reason}</div>
-            </div>`;
-        });
-        document.getElementById('ftp-pitch-recs').innerHTML = recHtml;
+        // Official manual (rules.htm?rulespage=ground): "Your groundspeople
+        // have five pitches available, one for each league competition
+        // your club competes in and one specially set aside for Matt Krevs
+        // Memorial Cup matches" — and changing one takes real time ("flat
+        // to slow might take about 2 days, flat to green about 4 days").
+        // This is NOT a per-match lever: each competition's pitch should
+        // be set to match whichever squad (senior/youth) and format
+        // actually plays there most, then left alone. Below, recommendations
+        // are computed per REAL competition class scraped from the page
+        // (not invented categories) so they line up 1:1 with the pitches
+        // you can actually set.
+        let recHtml = `<div class="ftp-alert info" style="margin-bottom:6px;"><span>⏳</span><div><strong>Pitch changes take real time</strong> — official manual: changing pitch condition takes roughly 2 days for a small shift (e.g. Flat→Slow) up to 4+ days for a bigger one (e.g. Flat→Green). This isn't something to flip before each match — set each competition's pitch to fit your squad's actual strength (batting/seam/spin) and leave it, planning changes days ahead of a big fixture if you do need one.</div></div>`;
 
         const currentPitches = document.querySelectorAll('table.data tbody tr');
-        let currentHtml = '<table class="ftp-table"><thead><tr><th>Class</th><th>Current</th></tr></thead><tbody>';
+        let currentHtml = '<table class="ftp-table"><thead><tr><th>Class</th><th>Current</th><th>Recommended</th></tr></thead><tbody>';
+        let matchedAnyClass = false;
         currentPitches.forEach(row => {
             const cells = row.querySelectorAll('td');
             if (cells.length >= 2) {
                 const className = cells[0]?.textContent.trim() || '';
                 const pitchSpan = cells[1]?.querySelector('.popuphelp');
                 const currentPitch = pitchSpan ? pitchSpan.textContent.trim() : cells[1]?.textContent.trim() || '';
-                currentHtml += `<tr><td style="font-weight:600;">${className}</td><td><span class="ftp-stat-badge green">${currentPitch}</span></td></tr>`;
+
+                // Best-effort match of this real competition class to a
+                // squad/format so the recommendation uses the right player
+                // pool — falls back to senior OD if nothing matches, since
+                // that's the default/most common competition type.
+                const cn = className.toLowerCase();
+                const isYouthClass = /youth|junior|u-?20|u-?18/.test(cn);
+                const isT20Class = /t20|twenty ?20/.test(cn);
+                const seam = isYouthClass ? youthSeamRating : seniorSeamRating;
+                const spin = isYouthClass ? youthSpinRating : seniorSpinRating;
+                const bat = isT20Class
+                    ? (isYouthClass ? youthT20BatRating : seniorT20BatRating)
+                    : (isYouthClass ? youthBatRating : seniorBatRating);
+                const rec = recommendPitchForSquad(seam, spin, bat);
+                const isMatch = currentPitch && rec.pitch && currentPitch.toLowerCase() === rec.pitch.toLowerCase();
+                if (className) matchedAnyClass = true;
+
+                currentHtml += `<tr><td style="font-weight:600;">${className}</td><td><span class="ftp-stat-badge ${isMatch ? 'green' : 'neutral'}">${currentPitch}</span></td><td><span class="ftp-stat-badge ${isMatch ? 'green' : 'amber'}">${rec.pitch}</span></td></tr>`;
+                if (className) {
+                    recHtml += `<div class="ftp-rec ${isMatch ? 'low' : 'medium'}" style="margin:5px 0;">
+                        <div class="vj-flex-between"><span class="vj-fw-700">${className}</span>${isMatch ? '<span class="ftp-stat-badge green">Already set</span>' : `<span class="ftp-stat-badge amber">Consider: ${rec.pitch}</span>`}</div>
+                        <div class="vj-text-xs vj-text-secondary vj-mt-4">${rec.reason}</div>
+                    </div>`;
+                }
             }
         });
         currentHtml += '</tbody></table>';
         document.getElementById('ftp-current-pitches').innerHTML = currentHtml;
+
+        if (!matchedAnyClass) {
+            // No real class rows found on this page load (e.g. ground.htm
+            // hasn't rendered its pitch table yet) — fall back to the old
+            // senior/youth x OD/T20 breakdown so there's still useful
+            // output, just not tied to real settable pitch slots.
+            const fallback = [
+                { type: 'Senior (most matches)', ...recommendPitchForSquad(seniorSeamRating, seniorSpinRating, seniorBatRating) },
+                { type: 'Senior T20', ...recommendPitchForSquad(seniorSeamRating, seniorSpinRating, seniorT20BatRating) },
+                { type: 'Youth', ...recommendPitchForSquad(youthSeamRating, youthSpinRating, youthBatRating) },
+                { type: 'Youth T20', ...recommendPitchForSquad(youthSeamRating, youthSpinRating, youthT20BatRating) }
+            ];
+            fallback.forEach(rec => {
+                recHtml += `<div class="ftp-rec low" style="margin:5px 0;">
+                    <div class="vj-flex-between"><span class="vj-fw-700">${rec.type}</span><span class="ftp-stat-badge green">${rec.pitch}</span></div>
+                    <div class="vj-text-xs vj-text-secondary vj-mt-4">${rec.reason}</div>
+                </div>`;
+            });
+        }
+        document.getElementById('ftp-pitch-recs').innerHTML = recHtml;
 
         const groundCache = loadGroundCache();
         const financeCache = loadFinanceCache();
