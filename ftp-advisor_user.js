@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         FTP Advisor
 // @namespace    http://tampermonkey.net/
-// @version      8.21
+// @version      8.22
 // @description  Comprehensive tactical advisor for From the Pavilion cricket game (v8.18: enhanced opponent scouting report, match-week rest scheduling, bowling allocation opponent-aware; v8.17: phase-specific batting tactics; v8.16: confidence scores, fixture integration; v7.0: full UI redesign)
 // @author       You
 // @license      MIT
@@ -342,6 +342,19 @@
         return { value: batting, name: 'batting' };
     }
 
+    // Wicketkeepers need to be a competent batsman too — not a bowler,
+    // and not held to the same bar as keeping (their actual primary
+    // skill) or a specialist batsman's bar, but a real secondary
+    // requirement rather than ignored entirely. Roughly two skill tiers
+    // below the primary/keeping requirement, floored at 0. Shared so
+    // every hard filter that checks a keeper candidate (checkScoutBenchmark,
+    // evaluateTransferTarget's senior branch, evaluateYouthDevelopment's
+    // youth curve) applies the same secondary-batting bar instead of
+    // three independently-drifting definitions of "good enough".
+    function keeperBattingMin(primaryMin) {
+        return Math.max(0, (primaryMin || 0) - 2);
+    }
+
     // ============================================================
     // FORM / EXPERIENCE MULTIPLIERS
     // Real percentage curves from the user's FTP_Training model
@@ -517,13 +530,21 @@
         // Atrocious rating silently hard-fails every candidate exactly
         // like the Experience-always-0 bug fixed in v8.11 — same failure
         // shape, different field.
-        const primary = getPrimarySkillInfo(player).value;
+        const primaryInfo = getPrimarySkillInfo(player);
+        const primary = primaryInfo.value;
         const checks = [
             { name: 'Primary', value: primary, min: t.primary, known: primary > 0 },
             { name: 'Technique', value: player.technique || 0, min: t.technique, known: (player.technique || 0) > 0 },
             { name: 'Experience', value: player.experience || 0, min: t.experience, known: (player.experience || 0) > 0 },
             { name: 'Fielding', value: player.fielding || 0, min: t.fielding, known: (player.fielding || 0) > 0 },
         ];
+        // A keeper's primary check above is keeping, not batting — add
+        // batting as its own (lower-bar) requirement so a great keeper
+        // who genuinely can't bat still gets filtered out.
+        if (primaryInfo.name === 'keeping') {
+            const battingMin = keeperBattingMin(t.primary);
+            checks.push({ name: 'Batting (WK)', value: player.batting || 0, min: battingMin, known: (player.batting || 0) > 0 });
+        }
         if (t.power != null) checks.push({ name: 'Power', value: player.power || 0, min: t.power, known: (player.power || 0) > 0 });
         if (t.rating != null) checks.push({ name: 'Rating', value: player.rating || 0, min: t.rating, known: (player.rating || 0) > 0, isMoney: true });
 
@@ -644,8 +665,11 @@
             { label: 'Fielding', value: player.fielding || 0, min: target.fielding, good: target.fieldingGood }
         ];
         if (primaryStatName === 'keeping') {
-            // User's note: wicketkeepers are judged on keeping AND batting, not keeping alone.
-            rows.push({ label: 'Batting (WK)', value: player.batting || 0, min: target.primary, good: target.primaryGood });
+            // User's note: wicketkeepers are judged on keeping AND batting,
+            // not keeping alone — but batting is a secondary requirement,
+            // not held to the same bar as keeping itself (keeperBattingMin
+            // shared with the transfer-scouting hard filters below).
+            rows.push({ label: 'Batting (WK)', value: player.batting || 0, min: keeperBattingMin(target.primary) });
         }
         if (target.endurance !== undefined) rows.push({ label: 'Endurance', value: player.endurance || 0, min: target.endurance });
         if (target.experience !== undefined) rows.push({ label: 'Experience', value: player.experience || 0, min: target.experience });
@@ -1497,6 +1521,13 @@
             { name: 'Endurance', value: player.endurance || 0, min: SENIOR_MINS.endurance, known: (player.endurance || 0) > 0 },
             { name: 'Experience', value: player.experience || 0, min: SENIOR_MINS.experience, known: (player.experience || 0) > 0 }
         ];
+        // Same as checkScoutBenchmark: a keeper's Primary check above is
+        // keeping, not batting — a great keeper who genuinely can't bat
+        // should still be filtered, just against a lower bar than keeping.
+        if (primaryName === 'keeping') {
+            const battingMin = keeperBattingMin(SENIOR_MINS.primary);
+            seniorMinChecks.push({ name: 'Batting (WK)', value: player.batting || 0, min: battingMin, known: (player.batting || 0) > 0 });
+        }
 
         const belowMins = seniorMinChecks.filter(s => s.known && s.value < s.min);
         const meetsAllMins = belowMins.length === 0;
