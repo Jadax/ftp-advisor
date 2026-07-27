@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         FTP Advisor
 // @namespace    http://tampermonkey.net/
-// @version      8.20
+// @version      8.21
 // @description  Comprehensive tactical advisor for From the Pavilion cricket game (v8.18: enhanced opponent scouting report, match-week rest scheduling, bowling allocation opponent-aware; v8.17: phase-specific batting tactics; v8.16: confidence scores, fixture integration; v7.0: full UI redesign)
 // @author       You
 // @license      MIT
@@ -392,29 +392,14 @@
     const MIN_BOWLING_FOR_BOWLERS = 5;
 
     // ============================================================
-    // AGE-BASED SKILL EXPECTATIONS (community-backed)
-    // Based on forum posts, training guides, and player examples
-    // from the "How to Train?" thread and Youth Pull competitions.
-    //
-    // Skill scale: atrocious=0, dreadful=1, poor=2, ordinary=3,
-    //   average=4, reasonable=5, capable=6, reliable=7,
-    //   accomplished=8, expert=9, outstanding=10
-    //
-    // Community targets:
-    // - Fielding: capable min (age 16-17), reliable (age 18-19)
-    // - Technique: average (16), capable (17), reliable (18-19)
-    // - Endurance: ordinary (16), capable (18), reliable (20)
-    // - Primary skill: average (16), capable (17), reliable (18-19), accomplished (20)
-    // ============================================================
-    const AGE_SKILL_EXPECTATIONS = {
-        // age: { primary (max batting/bowling), technique, fielding }
-        // Only these 3 skills are required for youth — endurance/experience don't matter
-        16: { primary: 4, technique: 4, fielding: 4 },
-        17: { primary: 5, technique: 5, fielding: 5 },
-        18: { primary: 6, technique: 6, fielding: 6 },
-        19: { primary: 8, technique: 8, fielding: 6 },
-        20: { primary: 9, technique: 9, fielding: 8 }
-    };
+    // AGE-BASED SKILL EXPECTATIONS for the youth 16-20 curve used to live
+    // here as a separate table (AGE_SKILL_EXPECTATIONS), community-backed
+    // from forum posts/training guides. It had drifted into a near-
+    // duplicate of YOUTH_DEV_CURVE below (same "user-specified
+    // benchmarks", small unintentional differences like fielding target
+    // 8 vs 7 at age 20) — removed in favor of the one canonical curve,
+    // used via evaluateYouthDevelopment() everywhere a youth curve check
+    // is needed (transfer scouting, Player Advisor, training).
 
     // Wage expectations by age (community-backed, based on skill levels)
     // 16yo with average skills ≈ $1,000-1,300/wk
@@ -1393,30 +1378,31 @@
         // Only Primary, Technique, Fielding are checked — endurance/experience don't matter
         // ANY skill below target = filtered out
         if (isYouth) {
-            const targets = AGE_SKILL_EXPECTATIONS[age];
-            if (targets) {
-                const primary = getPrimarySkillInfo(player).value;
-
-                const skills = [
-                    { name: 'Primary', value: primary, target: targets.primary },
-                    { name: 'Technique', value: player.technique || 0, target: targets.technique },
-                    { name: 'Fielding', value: player.fielding || 0, target: targets.fielding }
-                ];
-
+            // Reuses the same YOUTH_DEV_CURVE / evaluateYouthDevelopment()
+            // the Player Advisor and training pages already use, instead
+            // of the separate (now-removed) AGE_SKILL_EXPECTATIONS table.
+            // The two had drifted into near-duplicates with small,
+            // unintentional differences (e.g. fielding target 8 vs 7 at
+            // age 20) — one canonical curve now, not two to keep in sync.
+            const ydEval = evaluateYouthDevelopment(player);
+            if (ydEval) {
                 // Same "known" reasoning as checkScoutBenchmark: a real 0
                 // across the board almost always means the column didn't
-                // scrape/map, not a genuine Atrocious youth prospect.
-                const belowSkills = skills.filter(s => s.value > 0 && s.value < s.target);
+                // scrape/map, not a genuine Atrocious youth prospect —
+                // evaluateYouthDevelopment() has no such gate since its
+                // other caller (Player Advisor) always has real scraped
+                // data, so it's applied here at the call site instead.
+                const belowSkills = ydEval.rows.filter(r => r.status === 'behind' && r.value > 0);
 
                 // ANY skill below target = filtered out
                 if (belowSkills.length > 0) {
                     score = -5;
-                    belowSkills.forEach(s => warnings.push(`${s.name} ${skillLabel(s.value)} — below age ${age} target ${skillLabel(s.target)}`));
+                    belowSkills.forEach(r => warnings.push(`${r.label} ${skillLabel(r.value)} — below age ${age} target ${skillLabel(r.min)}`));
                     warnings.push(`${belowSkills.length} skill${belowSkills.length > 1 ? 's' : ''} below age ${age} targets — filtered`);
                 } else {
                     score += 3;
                     strengths.push(`All skills meet age ${age} targets`);
-                    const aheadCount = skills.filter(s => s.value >= s.target + 1).length;
+                    const aheadCount = ydEval.rows.filter(r => r.value > 0 && r.status === 'ahead').length;
                     if (aheadCount >= 3) {
                         score += 3;
                         strengths.push(`${aheadCount} skills well above target — exceptional prospect`);
@@ -1680,7 +1666,7 @@
 
         // 2. Skill surplus above minimums (0-2 points)
         let surplusScore = 0;
-        const mins = isYouth ? AGE_SKILL_EXPECTATIONS[age] : (age <= 23 ? SENIOR_MINS_YOUNG : SENIOR_MINS_VETERAN);
+        const mins = isYouth ? YOUTH_DEV_CURVE[age] : (age <= 23 ? SENIOR_MINS_YOUNG : SENIOR_MINS_VETERAN);
         if (mins) {
             const skills = [
                 { value: primary, min: mins.primary },
