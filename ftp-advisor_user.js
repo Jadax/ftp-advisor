@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         FTP Advisor
 // @namespace    http://tampermonkey.net/
-// @version      8.23
+// @version      8.24
 // @description  Comprehensive tactical advisor for From the Pavilion cricket game (v8.18: enhanced opponent scouting report, match-week rest scheduling, bowling allocation opponent-aware; v8.17: phase-specific batting tactics; v8.16: confidence scores, fixture integration; v7.0: full UI redesign)
 // @author       You
 // @license      MIT
@@ -4488,10 +4488,16 @@
     function addCommonStyles() {
         GM_addStyle(`
 :root {
-  --vj-navy: #0f1729; --vj-navy-mid: #1a2744; --vj-navy-light: #243352;
-  --vj-gold: #c8a951; --vj-gold-dim: #a38b3e;
-  --vj-card: #ffffff; --vj-surface: #f4f6f9; --vj-border: #e2e6ec; --vj-border-light: #eef1f5;
-  --vj-text: #1e293b; --vj-text-secondary: #64748b; --vj-text-muted: #94a3b8;
+  /* Warmed the whole neutral scale off cool blue-grey toward a soft
+     stone/cream tone (surface, border, text) — the navy+gold accents
+     stay put, but a cool #f4f6f9 surface against them read clinical.
+     Semantic status colors (green/red/amber/blue/purple/teal/orange)
+     are untouched — their meaning is load-bearing across ~6 pages of
+     badges/alerts, not worth the regression risk of retuning hue. */
+  --vj-navy: #10172a; --vj-navy-mid: #1c2a48; --vj-navy-light: #263657;
+  --vj-gold: #cda355; --vj-gold-dim: #a3833f;
+  --vj-card: #ffffff; --vj-surface: #f7f5f1; --vj-border: #e7e2d8; --vj-border-light: #f1eee7;
+  --vj-text: #2a2621; --vj-text-secondary: #726b62; --vj-text-muted: #a39a8d;
   --vj-green: #059669; --vj-green-bg: #ecfdf5; --vj-green-border: #a7f3d0;
   --vj-red: #dc2626; --vj-red-bg: #fef2f2; --vj-red-border: #fecaca;
   --vj-amber: #d97706; --vj-amber-bg: #fffbeb; --vj-amber-border: #fde68a;
@@ -4499,12 +4505,14 @@
   --vj-purple: #7c3aed; --vj-purple-bg: #f5f3ff;
   --vj-teal: #0d9488; --vj-teal-bg: #f0fdfa;
   --vj-orange: #ea580c; --vj-orange-bg: #fff7ed;
-  --vj-shadow-sm: 0 1px 2px rgba(0,0,0,0.05);
-  --vj-shadow: 0 1px 3px rgba(0,0,0,0.08), 0 1px 2px rgba(0,0,0,0.04);
-  --vj-shadow-md: 0 4px 6px rgba(0,0,0,0.07), 0 2px 4px rgba(0,0,0,0.04);
-  --vj-shadow-lg: 0 10px 25px rgba(0,0,0,0.1), 0 4px 10px rgba(0,0,0,0.05);
-  --vj-radius: 10px; --vj-radius-sm: 6px; --vj-radius-xs: 4px;
-  --vj-transition: 0.2s cubic-bezier(0.4,0,0.2,1);
+  --vj-shadow-sm: 0 1px 2px rgba(42,38,33,0.05);
+  --vj-shadow: 0 1px 3px rgba(42,38,33,0.08), 0 1px 2px rgba(42,38,33,0.04);
+  --vj-shadow-md: 0 4px 6px rgba(42,38,33,0.07), 0 2px 4px rgba(42,38,33,0.04);
+  --vj-shadow-lg: 0 10px 25px rgba(42,38,33,0.1), 0 4px 10px rgba(42,38,33,0.05);
+  --vj-radius: 12px; --vj-radius-sm: 8px; --vj-radius-xs: 5px;
+  /* Snappier: 0.2s -> 0.15s. Interactions should feel immediate, not
+     leisurely, on a panel the user is clicking through quickly. */
+  --vj-transition: 0.15s cubic-bezier(0.4,0,0.2,1);
 }
 
 /* Panel */
@@ -4515,7 +4523,7 @@
   z-index: 999999; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
   font-size: 13px; color: var(--vj-text); display: flex; flex-direction: column;
   overflow: hidden;
-  animation: vjPanelIn 0.3s cubic-bezier(0.16,1,0.3,1);
+  animation: vjPanelIn 0.22s cubic-bezier(0.16,1,0.3,1);
 }
 @keyframes vjPanelIn { from { opacity:0; transform:translateY(-8px) scale(0.98); } to { opacity:1; transform:translateY(0) scale(1); } }
 
@@ -4547,10 +4555,12 @@
 /* Content */
 #ftp-advisor-content {
   padding: 14px 16px; overflow-y: auto; flex: 1; background: var(--vj-card);
+  line-height: 1.5;
 }
-#ftp-advisor-content::-webkit-scrollbar { width: 5px; }
+#ftp-advisor-content::-webkit-scrollbar { width: 6px; }
 #ftp-advisor-content::-webkit-scrollbar-track { background: transparent; }
-#ftp-advisor-content::-webkit-scrollbar-thumb { background: var(--vj-border); border-radius: 10px; }
+#ftp-advisor-content::-webkit-scrollbar-thumb { background: var(--vj-border); border-radius: 10px; transition: background var(--vj-transition); }
+#ftp-advisor-content::-webkit-scrollbar-thumb:hover { background: var(--vj-text-muted); }
 
 /* Section */
 .ftp-section { margin-bottom: 0; padding: 12px 16px; border-bottom: 1px solid var(--vj-border-light); }
@@ -4590,6 +4600,9 @@ details.ftp-collapsible summary h4 { margin: 0; cursor: pointer; font-size: 11.5
 }
 .ftp-button:active { transform: scale(0.97); }
 .ftp-button:hover { transform: translateY(-1px); }
+.ftp-button:focus-visible, #ftp-advisor-header button:focus-visible {
+  outline: 2px solid var(--vj-gold); outline-offset: 1px;
+}
 .ftp-button-primary {
   background: linear-gradient(135deg, var(--vj-navy), var(--vj-navy-mid));
   color: #fff; border-color: rgba(255,255,255,0.1);
@@ -4661,9 +4674,9 @@ table.ftp-table {
 .ftp-rec {
   background: var(--vj-card); border: 1px solid var(--vj-border);
   border-left: 3px solid var(--vj-blue); border-radius: var(--vj-radius-sm);
-  padding: 8px 10px; margin: 4px 0; transition: all var(--vj-transition);
+  padding: 9px 11px; margin: 5px 0; transition: all var(--vj-transition);
 }
-.ftp-rec:hover { box-shadow: var(--vj-shadow); transform: translateX(1px); border-left-width: 4px; }
+.ftp-rec:hover { box-shadow: var(--vj-shadow-md); transform: translateX(1px) translateY(-1px); border-left-width: 4px; }
 .ftp-rec.critical { border-left-color: var(--vj-red); background: var(--vj-red-bg); border-color: var(--vj-red-border); }
 .ftp-rec.high { border-left-color: var(--vj-amber); background: var(--vj-amber-bg); border-color: var(--vj-amber-border); }
 .ftp-rec.medium { border-left-color: var(--vj-blue); background: var(--vj-blue-bg); border-color: var(--vj-blue-border); }
