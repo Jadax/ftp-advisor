@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         FTP Advisor
 // @namespace    http://tampermonkey.net/
-// @version      8.24
+// @version      8.25
 // @description  Comprehensive tactical advisor for From the Pavilion cricket game (v8.18: enhanced opponent scouting report, match-week rest scheduling, bowling allocation opponent-aware; v8.17: phase-specific batting tactics; v8.16: confidence scores, fixture integration; v7.0: full UI redesign)
 // @author       You
 // @license      MIT
@@ -965,7 +965,14 @@
             bowlerCategory: BOWLER_CATEGORY[bowlerType] || 'none',
             bowlerPace: BOWLER_PACE[bowlerType] || 0,
             isLeftHanded: isLeftHanded, age: age,
-            hasFullSkills: true,
+            // Was hardcoded true regardless of whether skillCells actually
+            // matched anything — a page that isn't the grid view (e.g. the
+            // Overall Summary view, squadViewId=1, which the default squad
+            // nav link with no squadViewId param can land on) has no
+            // td.skills cells at all, so every stat below silently reads
+            // as 0 while this claimed "full skills" anyway. Now reflects
+            // reality: the grid has 9 skill columns.
+            hasFullSkills: skillCells.length >= 9,
             endurance: parseSkill(skillCells[0]?.textContent),
             batting: parseSkill(skillCells[1]?.textContent),
             bowling: parseSkill(skillCells[2]?.textContent),
@@ -2048,7 +2055,20 @@
         const labels = [];
 
         // 1. Squad (senior + youth)
-        if (force || isStale(CACHE_TIMESTAMP_KEY, STALE_SQUAD_HOURS)) {
+        // Also force a refetch if the existing cache looks corrupted (no
+        // player has real skill data) regardless of its age — this is how
+        // a squad page visited via the default nav link (no squadViewId
+        // param, defaults to the skill-less Overall Summary view) used to
+        // silently overwrite good cached skills with zeros, with nothing
+        // to self-correct it since a "fresh" bad cache isn't stale.
+        // Checks actual skill values, not the hasFullSkills flag — cache
+        // entries written by the buggy version of parsePlayerRow (before
+        // this fix) still have hasFullSkills:true baked in even though
+        // every stat is really 0.
+        const existingSquadCache = loadPlayerCache();
+        const squadCacheCorrupted = !!(existingSquadCache && existingSquadCache.players.length > 0 &&
+            !existingSquadCache.players.some(p => (p.batting || 0) > 0 || (p.bowling || 0) > 0 || (p.fielding || 0) > 0));
+        if (force || isStale(CACHE_TIMESTAMP_KEY, STALE_SQUAD_HOURS) || squadCacheCorrupted) {
             labels.push('squad');
             promises.push(
                 fetchSquadFromPage(`https://www.fromthepavilion.org/seniors.htm?squadViewId=2&teamId=${TEAM_ID}`)
@@ -7740,14 +7760,36 @@ table.ftp-table {
         if (TEAM_ID) cleanupOpponentCache(TEAM_ID);
 
         // --- SCRAPE CURRENT PAGE DATA (if on a data page) ---
+        // Whether this actually helps depends on which real-time re-fetch
+        // path runs below.
+        let squadScrapeNeedsBackgroundFix = false;
         if (pageType === 'squad') {
             // Scrape squad from current page DOM immediately
             const players = scrapeSquad();
             if (players.length > 0) {
                 const urlParams = new URLSearchParams(window.location.search);
                 const teamId = urlParams.get('teamId');
+                // The squad nav link (Club > Senior/Youth Squad) has no
+                // squadViewId param, which defaults to the Overall Summary
+                // view — no skill columns at all (see squadViewId=1 in the
+                // Map section). scrapeSquad() always uses the grid parser
+                // regardless of which view actually loaded; on a non-grid
+                // view every stat silently reads as 0. Saving that would
+                // overwrite good previously-cached skill data with zeros,
+                // and every downstream page (pitch advisor, tactics,
+                // training) would then compute off all-0.0 ratings with no
+                // visible error. Only save here if the grid was actually
+                // present; otherwise fall through to the background
+                // fetchAllData(force) below, which fetches the real
+                // squadViewId=2 grid regardless of what's on screen.
+                const hasRealSkills = players.some(p => p.hasFullSkills);
                 if (!teamId || teamId === String(TEAM_ID)) {
-                    savePlayerCache(players);
+                    if (hasRealSkills) {
+                        savePlayerCache(players);
+                    } else {
+                        console.warn('[FTP Advisor] Squad page has no skill columns (likely not squadViewId=2) — skipping cache save from this page, forcing a background grid re-fetch instead.');
+                        squadScrapeNeedsBackgroundFix = true;
+                    }
                 } else {
                     saveOpponentCache(teamId, players);
                 }
@@ -7768,9 +7810,18 @@ table.ftp-table {
         // isn't good enough: tactics advice is only as good as the
         // squad/opponent/pitch data behind it, so on this page we force
         // a real refresh every time rather than trusting a cache that
-        // could be hours old.
-        if (pageType !== 'squad') {
-            const forceRefresh = pageType === 'orders';
+        // could be hours old. Squad pages normally skip this too (the
+        // immediate DOM scrape above is enough) — EXCEPT when that scrape
+        // just found a non-grid view with no real skill data, in which
+        // case a real background fetch of the actual grid view is the
+        // only way to fix the cache.
+        if (pageType !== 'squad' || squadScrapeNeedsBackgroundFix) {
+            const forceForSquadFix = pageType === 'squad' && squadScrapeNeedsBackgroundFix;
+            // Force here too: the cache timestamp may have just been
+            // written moments ago (possibly with the bad zero-skill data
+            // this branch exists to fix), so a plain staleness check
+            // could skip the very re-fetch that's needed.
+            const forceRefresh = pageType === 'orders' || forceForSquadFix;
             fetchAllData({ force: forceRefresh }).then(() => {
                 // Re-run the advisor after data is refreshed
                 if (pageType === 'orders') updateOrdersAdvisor();
@@ -7779,6 +7830,7 @@ table.ftp-table {
                 else if (pageType === 'academy') updateAcademyAdvisor();
                 else if (pageType === 'youthrecruit') updateYouthRecruitAdvisor();
                 else if (pageType === 'club') updateClubStatusUI();
+                else if (pageType === 'squad') updateSquadAdvisor();
             }).catch(e => console.warn('[FTP Advisor] Background refresh failed:', e));
         }
 
