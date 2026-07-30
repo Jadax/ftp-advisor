@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         FTP Advisor
 // @namespace    http://tampermonkey.net/
-// @version      8.26
+// @version      8.27
 // @description  Comprehensive tactical advisor for From the Pavilion cricket game (v8.18: enhanced opponent scouting report, match-week rest scheduling, bowling allocation opponent-aware; v8.17: phase-specific batting tactics; v8.16: confidence scores, fixture integration; v7.0: full UI redesign)
 // @author       You
 // @license      MIT
@@ -20,6 +20,17 @@
 
 (function() {
     'use strict';
+
+    // Verbose per-item logging (one line per scraped row / per fetched
+    // player) is off by default — this is a public userscript and those
+    // fire inside loops, spamming the console of every user who opens
+    // devtools for any other reason. Real errors/warnings and the
+    // deliberate [FTP Transfer] funnel summary are NOT gated by this.
+    // Turn on from the console with:  localStorage.ftpDebug = '1'
+    const FTP_DEBUG = (() => {
+        try { return localStorage.getItem('ftpDebug') === '1'; } catch (e) { return false; }
+    })();
+    function debugLog(...args) { if (FTP_DEBUG) console.log(...args); }
 
     // ============================================================
     // TEAM CONFIGURATION
@@ -426,19 +437,13 @@
     // used via evaluateYouthDevelopment() everywhere a youth curve check
     // is needed (transfer scouting, Player Advisor, training).
 
-    // Wage expectations by age (community-backed, based on skill levels)
-    // 16yo with average skills ≈ $1,000-1,300/wk
-    // 17yo with capable skills ≈ $2,000-2,500/wk
-    // 18yo with reliable skills ≈ $3,000-4,000/wk
-    // 19yo with accomplished skills ≈ $4,000-6,000/wk
-    // 20yo with expert/outstanding skills ≈ $10,000+/wk
-    const AGE_WAGE_EXPECTATIONS = {
-        16: { min: 500, typical: 1000, max: 2000 },
-        17: { min: 600, typical: 2100, max: 3000 },
-        18: { min: 700, typical: 3500, max: 5000 },
-        19: { min: 800, typical: 4500, max: 7000 },
-        20: { min: 900, typical: 10000, max: 12000 }
-    };
+    // AGE_WAGE_EXPECTATIONS (per-age min/typical/max wage bands) was
+    // defined here and never read — "the base" gates quality on Primary
+    // skill and Rating directly rather than on wage (see its own note
+    // below), so the table had no consumer. Removed rather than left as
+    // a plausible-looking constant someone wires up later assuming it's
+    // load-bearing. Community wage figures are still documented in the
+    // youth wage-cap comments in updateTransferAdvisor(), which are live.
 
     // ============================================================
     // PITCH & WEATHER EFFECTS (from actual ground page descriptions)
@@ -468,6 +473,21 @@
 
     // Youth age limit (for Youth and Youth T20 matches)
     const YOUTH_MAX_AGE = 20;
+
+    // Squad-overcrowding training penalty: 7.5% per player beyond 25.
+    // The 25 / 7.5 pair was previously written out by hand in five
+    // separate places (two as a 0-1 multiplier, three as a percentage
+    // for display) — one canonical definition instead, so a rules
+    // change can't leave some call sites on the old numbers.
+    const MAX_EFFICIENT_SQUAD = 25;
+    const SQUAD_PENALTY_PCT_PER_PLAYER = 7.5;
+    function squadPenaltyPct(squadSize) {
+        return squadSize > MAX_EFFICIENT_SQUAD
+            ? (squadSize - MAX_EFFICIENT_SQUAD) * SQUAD_PENALTY_PCT_PER_PLAYER : 0;
+    }
+    function squadPenaltyMultiplier(squadSize) {
+        return Math.max(0, 1 - squadPenaltyPct(squadSize) / 100);
+    }
 
     // Senior minimum skill requirements for transfers (age-dependent)
     const SENIOR_MINS_YOUNG = { primary: 9, technique: 9, fielding: 8, endurance: 4, experience: 4 };
@@ -709,6 +729,38 @@
     // ============================================================
     // HELPER FUNCTIONS
     // ============================================================
+
+    /**
+     * Escape text that will be interpolated into innerHTML.
+     *
+     * SECURITY — this is not theoretical. Player names are chosen by
+     * other users (the game has a Rename Player page), and this script
+     * reads them off pages full of OTHER people's players: transfer
+     * search results, opponent squads, the youth recruit table. The
+     * game renders those names safely, so `.textContent` hands us the
+     * raw string — but every render site here then interpolates it into
+     * `innerHTML` (~80 assignments, none previously escaped). A player
+     * named `<img src=x onerror=...>` would therefore execute script in
+     * the page's own origin on an authenticated session — i.e. able to
+     * act as the user (list players, accept transfers, send mail).
+     * Classic safe-source/unsafe-sink.
+     *
+     * Applied at the PARSER level rather than at each of the ~80 render
+     * sites: the surface is small and auditable (a handful of scrape
+     * points below), it can't be forgotten when a new render site is
+     * added, and player names are display-only here — nothing compares
+     * or matches on them (verified), so escaping early is behaviour-safe.
+     */
+    function escapeHtml(text) {
+        if (text == null) return '';
+        return String(text)
+            .replace(/&/g, '&amp;')
+            .replace(/</g, '&lt;')
+            .replace(/>/g, '&gt;')
+            .replace(/"/g, '&quot;')
+            .replace(/'/g, '&#39;');
+    }
+
     function parseSkill(text) {
         if (!text) return 0;
         const clean = text.replace(/<[^>]+>/g, '').trim().toLowerCase();
@@ -961,7 +1013,7 @@
         const nameLink = row.querySelector('a.player');
         if (!nameLink) return null;
         const playerId = nameLink.href.match(/playerId=(\d+)/)?.[1];
-        const name = nameLink.textContent.trim();
+        const name = escapeHtml(nameLink.textContent.trim());
         const bowlerTypeSpan = row.querySelector('span.bowlerType');
         const bowlerType = bowlerTypeSpan ? bowlerTypeSpan.textContent.trim() : '';
         const skillCells = row.querySelectorAll('td.skills');
@@ -1027,7 +1079,7 @@
         const nameLink = row.querySelector('a.player');
         if (!nameLink) return null;
         const playerId = nameLink.href.match(/playerId=(\d+)/)?.[1];
-        const name = nameLink.textContent.trim();
+        const name = escapeHtml(nameLink.textContent.trim());
         const bowlerTypeSpan = row.querySelector('span.bowlerType');
         const bowlerType = bowlerTypeSpan ? bowlerTypeSpan.textContent.trim() : '';
         const experienceCell = row.querySelector('td.skills');
@@ -1140,7 +1192,7 @@
         if (!nameLink) return null;
         const playerId = (nameLink.href.match(/playerId=(\d+)/) || [])[1];
         // Opponent pages prefix the name with a squad number ("01. Name")
-        const name = nameLink.textContent.replace(/^\d+\.\s*/, '').trim();
+        const name = escapeHtml(nameLink.textContent.replace(/^\d+\.\s*/, '').trim());
 
         const ps = block.querySelectorAll(':scope > p');
         const infoText = ps[0] ? ps[0].textContent : '';
@@ -1163,7 +1215,12 @@
         const talents = [];
         block.querySelectorAll('span.popuphelp').forEach(span => {
             const title = span.getAttribute('title') || '';
-            const t = title.split('|')[0].trim();
+            // Escaped for the same reason as names — talent text is
+            // rendered into innerHTML downstream, and this reads other
+            // teams' players too. Talent MATCHING is all regex-based
+            // (/prodigy/i etc) on ASCII words, which entity-escaping
+            // leaves untouched, so scoring is unaffected.
+            const t = escapeHtml(title.split('|')[0].trim());
             if (t) talents.push(t);
         });
 
@@ -1341,26 +1398,14 @@
         return ACADEMY_SPEED[academyInfo ? academyInfo.levelNum : 0] || 1.00;
     }
 
-    // ============================================================
-    // AGE-BASED SKILL THRESHOLDS for transfer evaluation
-    // Derived from community training feedback & forum consensus.
-    // Validates that a player's skills match what's expected for
-    // their age. Below-threshold = underdeveloped = bad buy.
-    // ============================================================
-    // Keys: bat = batting min, bowl = bowling min, tech = technique min,
-    //       field = fielding min, end = endurance min, exp = experience min
-    const AGE_SKILL_THRESHOLDS = {
-        16: { bat: 4, bowl: 4, keep: 0, tech: 4, field: 4, end: 3, exp: 3, power: 0 },
-        17: { bat: 5, bowl: 5, keep: 0, tech: 5, field: 5, end: 4, exp: 3, power: 0 },
-        18: { bat: 6, bowl: 6, keep: 5, tech: 6, field: 6, end: 4, exp: 4, power: 0 },
-        19: { bat: 8, bowl: 8, keep: 6, tech: 8, field: 6, end: 5, exp: 4, power: 0 },
-        20: { bat: 9, bowl: 9, keep: 7, tech: 9, field: 7, end: 5, exp: 5, power: 0 },
-        21: { bat: 9, bowl: 9, keep: 7, tech: 9, field: 7, end: 5, exp: 5, power: 0 },
-        22: { bat: 10, bowl: 10, keep: 8, tech: 10, field: 7, end: 6, exp: 5, power: 0 },
-        23: { bat: 10, bowl: 10, keep: 8, tech: 10, field: 7, end: 6, exp: 6, power: 3 },
-        24: { bat: 10, bowl: 10, keep: 8, tech: 10, field: 7, end: 6, exp: 6, power: 4 },
-        25: { bat: 10, bowl: 10, keep: 8, tech: 10, field: 7, end: 6, exp: 6, power: 5 },
-    };
+    // A third age-threshold table (AGE_SKILL_THRESHOLDS) lived here and
+    // was never referenced by anything — dead since before v8.x. It
+    // overlapped YOUTH_DEV_CURVE (16-20) and AGE_SCOUT_THRESHOLDS ("the
+    // base", 16-27) with its own subtly different numbers, i.e. a third
+    // competing definition of "good enough for this age" sitting in the
+    // file waiting to be wired up by mistake. Removed; the two live
+    // tables above are the only ones. Same cleanup as v8.21, which
+    // removed the AGE_SKILL_EXPECTATIONS near-duplicate.
 
     /**
      * Compute squad statistics from cached players to use as dynamic
@@ -2241,16 +2286,16 @@
         rows.forEach((row, idx) => {
             const cells = row.querySelectorAll('td');
             if (cells.length < 5) {
-                console.log('[FTP Advisor] Row', idx, 'skipped - cells.length:', cells.length);
+                debugLog('[FTP Advisor] Row', idx, 'skipped - cells.length:', cells.length);
                 return;
             }
             const nameLink = row.querySelector('a.player');
             if (!nameLink) {
-                console.log('[FTP Advisor] Row', idx, 'skipped - no name link');
+                debugLog('[FTP Advisor] Row', idx, 'skipped - no name link');
                 return;
             }
             const playerId = nameLink.href.match(/playerId=(\d+)/)?.[1];
-            const name = nameLink.textContent.trim();
+            const name = escapeHtml(nameLink.textContent.trim());
 
             const bowlerTypeSpan = row.querySelector('span.bowlerType');
             const bowlerType = bowlerTypeSpan ? bowlerTypeSpan.textContent.trim() : '';
@@ -2334,7 +2379,7 @@
         const nameLink = row.querySelector('a[href*="player.htm"]');
         if (!nameLink) return null;
         const playerId = nameLink.href.match(/playerId=(\d+)/)?.[1];
-        const name = nameLink.textContent.trim();
+        const name = escapeHtml(nameLink.textContent.trim());
         if (!name || name.length < 2) return null;
 
         const cellTexts = Array.from(cells).map(c => c.textContent.trim());
@@ -2405,7 +2450,7 @@
                 onload: (resp) => {
                     try {
                         if (resp.status !== 200) {
-                            console.log(`[FTP] Player ${playerId}: HTTP ${resp.status}`);
+                            debugLog(`[FTP] Player ${playerId}: HTTP ${resp.status}`);
                             return resolve({ experience: null, wage: null, talents: [], captaincy: null });
                         }
                         const parser = new DOMParser();
@@ -2414,7 +2459,7 @@
 
                         // Quick sanity check: if we got the login page, bail
                         if (doc.querySelector('input[name="username"]') || resp.responseText.length < 500) {
-                            console.log(`[FTP] Player ${playerId}: likely login page or empty (len=${resp.responseText.length})`);
+                            debugLog(`[FTP] Player ${playerId}: likely login page or empty (len=${resp.responseText.length})`);
                             return resolve(result);
                         }
 
@@ -2443,27 +2488,27 @@
                                 const spans = td.querySelectorAll('span.popuphelp');
                                 spans.forEach(span => {
                                     const title = span.getAttribute('title') || '';
-                                    const name = title.split('|')[0].trim();
+                                    const name = escapeHtml(title.split('|')[0].trim());
                                     if (name) result.talents.push(name);
                                 });
                                 if (result.talents.length === 0) {
                                     const text = td.textContent.trim();
                                     if (text && text !== 'None') {
-                                        result.talents = text.split(',').map(t => t.trim()).filter(t => t.length > 0);
+                                        result.talents = text.split(',').map(t => escapeHtml(t.trim())).filter(t => t.length > 0);
                                     }
                                 }
                             }
                         }
 
-                        console.log(`[FTP] Player ${playerId}: exp=${result.experience}, wage=${result.wage}, capt=${result.captaincy}, talents=${result.talents.length}`);
+                        debugLog(`[FTP] Player ${playerId}: exp=${result.experience}, wage=${result.wage}, capt=${result.captaincy}, talents=${result.talents.length}`);
                         resolve(result);
                     } catch (e) {
-                        console.log(`[FTP] Player ${playerId}: parse error`, e);
+                        debugLog(`[FTP] Player ${playerId}: parse error`, e);
                         resolve({ experience: null, wage: null, talents: [], captaincy: null });
                     }
                 },
-                onerror: (e) => { console.log(`[FTP] Player ${playerId}: network error`, e); resolve({ experience: null, wage: null, talents: [], captaincy: null }); },
-                ontimeout: () => { console.log(`[FTP] Player ${playerId}: timeout`); resolve({ experience: null, wage: null, talents: [], captaincy: null }); }
+                onerror: (e) => { debugLog(`[FTP] Player ${playerId}: network error`, e); resolve({ experience: null, wage: null, talents: [], captaincy: null }); },
+                ontimeout: () => { debugLog(`[FTP] Player ${playerId}: timeout`); resolve({ experience: null, wage: null, talents: [], captaincy: null }); }
             });
         });
     }
@@ -3888,13 +3933,32 @@
             };
         });
 
-        // Age filtering for youth matches
+        // Age filtering for youth matches.
+        // Official manual: "Only players aged 20 and under are eligible to
+        // play in these matches" (rulespage=competitions) and "At the end
+        // of each week, all players turning 21 are moved from your youth
+        // squad and are promoted to your senior squad" (rulespage=
+        // youthacademy). The second rule is the important one here: a
+        // player still sitting in the youth squad has by definition NOT
+        // turned 21, so the game's own squad classification is proof of
+        // eligibility — and it's more trustworthy than our derived
+        // decimal age at the exact year boundary. A player displayed as
+        // "20.14" parses to 20 + 14/14 = exactly 21.0, so the old
+        // `age < maxAge + 1` test dropped them as 21 even though the game
+        // still lists them as a 20-year-old youth player. That silently
+        // removed a legal player from the recommended XI.
+        // Squad membership is only used to INCLUDE, never to exclude:
+        // a 20yo already promoted/held in the senior squad is still
+        // eligible on age, so those fall through to the age test.
+        // (Safe against a stale flag: the orders page force-refreshes
+        // squad data on every visit — see forceRefresh in init().)
         let ageWarning = '';
         if (context.isYouthOnly) {
             const beforeCount = enrichedPlayers.length;
             enrichedPlayers = enrichedPlayers.filter(p => {
-                if (p.age !== undefined && p.age !== null) return p.age < context.maxAge + 1;
-                return p.isYouth || (!p.isSenior && !p.isYouth);
+                if (p.isYouth === true) return true;
+                if (p.age !== undefined && p.age !== null) return Math.floor(p.age) <= context.maxAge;
+                return !p.isSenior;
             });
             if (enrichedPlayers.length < 11) {
                 ageWarning = `<div class="ftp-alert danger" style="margin:4px 0 0 0;">Only ${enrichedPlayers.length} eligible youth players (U${context.maxAge}). ${11 - enrichedPlayers.length} short of full squad — fill with youth recruits.</div>`;
@@ -4206,9 +4270,9 @@
         currentPitches.forEach(row => {
             const cells = row.querySelectorAll('td');
             if (cells.length >= 2) {
-                const className = cells[0]?.textContent.trim() || '';
+                const className = escapeHtml(cells[0]?.textContent.trim() || '');
                 const pitchSpan = cells[1]?.querySelector('.popuphelp');
-                const currentPitch = pitchSpan ? pitchSpan.textContent.trim() : cells[1]?.textContent.trim() || '';
+                const currentPitch = escapeHtml(pitchSpan ? pitchSpan.textContent.trim() : cells[1]?.textContent.trim() || '');
 
                 // Best-effort match of this real competition class to a
                 // squad/format so the recommendation uses the right player
@@ -4996,7 +5060,7 @@ table.ftp-table {
             if (!nameLink) return;
 
             const playerId = nameLink.href.match(/playerId=(\d+)/)?.[1] || '';
-            const name = nameLink.textContent.trim();
+            const name = escapeHtml(nameLink.textContent.trim());
 
             // Training page columns: Player | Age | Fatigue | Form | Rating | Training Program | Previous Week
             // No skill columns — skills MUST come from squad cache
@@ -5319,7 +5383,7 @@ table.ftp-table {
         // Squad size penalty — constant across all simulated weeks since
         // we don't model squad composition changes during the plan.
         const ss = squadContext?.size || 0;
-        const squadMult = ss > 25 ? Math.max(0, 1 - ((ss - 25) * 0.075)) : 1;
+        const squadMult = squadPenaltyMultiplier(ss);
 
         const levelUps = [];
         const timeline = [];
@@ -5334,7 +5398,10 @@ table.ftp-table {
             simPlayer.age = player.age + (week - 1) / 14;
             simPlayer.fatigue = week === 1 ? player.fatigue : 8;
 
-            const rec = recommendTraining(simPlayer, squadContext);
+            // Only rec.program is used here — the 12-week projection
+            // recommendTraining() would otherwise compute is discarded
+            // immediately, so skip it (see opts.skipProjection).
+            const rec = recommendTraining(simPlayer, squadContext, { skipProjection: true });
             const program = rec.program;
             weeklyPrograms.push(program);
 
@@ -5534,7 +5601,17 @@ table.ftp-table {
         }
     }
 
-    function recommendTraining(player, squadContext) {
+    // opts.skipProjection — omit the 12-week outlook simulation at the
+    // end. That projection exists purely to render the "📅 12wk outlook"
+    // line on the Training page; when this function is called from
+    // INSIDE a simulation loop (simulateAdaptiveTrainingPlan re-runs it
+    // once per simulated week) the projection is computed and thrown
+    // away immediately. Measured: a 16yo transfer candidate ran 784
+    // weekly-gain calculations, of which ~92% came from these discarded
+    // inner projections (56 simulated weeks x a 12-week throwaway sim
+    // each). Across 20 youth rows that was ~15,700 calculations,
+    // synchronously, while building an innerHTML string.
+    function recommendTraining(player, squadContext, opts) {
         const rec = { program: 'batting', reason: '', priority: 'medium', warnings: [], skillGains: [] };
 
         const FATIGUE_TRAINING_PENALTY = { 5: 15, 4: 30, 3: 45, 2: 60, 1: 75, 0: 90 };
@@ -5561,7 +5638,7 @@ table.ftp-table {
         }
         const squadSize = squadContext?.size || 0;
         if (squadSize > 25) {
-            rec.warnings.push(`Squad has ${squadSize} players (>25 limit). Training penalty: ${((squadSize - 25) * 7.5).toFixed(1)}% per extra player.`);
+            rec.warnings.push(`Squad has ${squadSize} players (>${MAX_EFFICIENT_SQUAD} limit). Training penalty: ${squadPenaltyPct(squadSize).toFixed(1)}%.`);
         }
         const ageMult = getAgeTrainingMultiplier(player.age);
         if (ageMult.primary <= 0.5) {
@@ -5601,7 +5678,7 @@ table.ftp-table {
             // squadContext.size and pass explicitly since the function has no
             // access to squadContext.
             const ss = squadContext?.size || 0;
-            const squadMult = ss > 25 ? Math.max(0, 1 - ((ss - 25) * 0.075)) : 1;
+            const squadMult = squadPenaltyMultiplier(ss);
             const gainOpts = squadMult < 1 ? { squadSizePenalty: squadMult } : undefined;
             rec.weeklyGain = estimateWeeklyTrainingGain(rec.program, player, academySpeed, gainOpts);
             const programDef = TRAINING_PROGRAMS[rec.program];
@@ -5610,8 +5687,11 @@ table.ftp-table {
                 rec.weeksToNextLevel = weeksToNextLevel(rec.weeklyGain[programDef.primary]);
                 // 12-week outlook: keeps training this program and shows
                 // where the primary skill actually lands, not just the
-                // next single level-up.
-                rec.projection = simulateTrainingPlan(player, rec.program, 12, academySpeed);
+                // next single level-up. UI-only — skipped when called
+                // from inside a simulation loop (see opts.skipProjection).
+                if (!opts || !opts.skipProjection) {
+                    rec.projection = simulateTrainingPlan(player, rec.program, 12, academySpeed);
+                }
             }
         }
 
@@ -5738,7 +5818,7 @@ table.ftp-table {
         const fatigued = players.filter(p => p.fatigue <= 4);
         const youth = players.filter(p => p.age < 21);
         const aging = players.filter(p => p.age >= 30);
-        const efficiency = players.length <= 25 ? 100 : Math.max(0, 100 - ((players.length - 25) * 7.5));
+        const efficiency = Math.max(0, 100 - squadPenaltyPct(players.length));
         // Squad-wide summary badge — uses the game's own live overall
         // efficiency (avg of Senior/Youth Training Efficiency %, already
         // scraped in parseAcademyDoc) rather than the derived ACADEMY_SPEED
@@ -5785,7 +5865,7 @@ table.ftp-table {
                 }
                 return '';
             })()}
-            ${players.length > 25 ? `<div class="ftp-alert warning" style="margin-top:4px;"><span>\u26A0</span><div>Squad has ${players.length} players (&gt;25 limit). Training penalty: ${((players.length - 25) * 7.5).toFixed(1)}% per extra player.</div></div>` : ''}
+            ${players.length > MAX_EFFICIENT_SQUAD ? `<div class="ftp-alert warning" style="margin-top:4px;"><span>\u26A0</span><div>Squad has ${players.length} players (&gt;${MAX_EFFICIENT_SQUAD} limit). Training penalty: ${squadPenaltyPct(players.length).toFixed(1)}%.</div></div>` : ''}
         `;
         document.getElementById('ftp-training-stats').innerHTML = statsHtml;
 
@@ -6768,14 +6848,17 @@ table.ftp-table {
                     if (players.length === 0) {
                         html += '<div class="vj-text-sm vj-text-muted">No targets found. Try adjusting search filters (age, bowling type, skill ranges).</div>';
                     } else {
-                        // Pre-compute academy speed for youth projections.
-                        // window._ftpAcademyInfo was never set anywhere in
-                        // the file — this silently always fell back to 100%
-                        // academy speed regardless of the real level. Use
-                        // the actual cache accessor used everywhere else.
+                        // Academy info for the per-candidate youth
+                        // projections below. Deliberately NOT collapsed to
+                        // one shared academySpeed number: these rows are
+                        // all 16-20yos, and trainingEfficiency is the mean
+                        // of senior+youth efficiency, which understates (or
+                        // overstates) youth training whenever the two
+                        // differ. getAcademySpeedForPlayer() picks the
+                        // age-appropriate figure per player instead — it's
+                        // the canonical helper used by the training page
+                        // and Player Advisor, so all three now agree.
                         const academyInfoForProjection = loadAcademyCache();
-                        const academySpeed = academyInfoForProjection ?
-                            (academyInfoForProjection.trainingEfficiency != null ? academyInfoForProjection.trainingEfficiency / 100 : (ACADEMY_SPEED[academyInfoForProjection.levelNum] || 1.0)) : 1.0;
 
                         players.forEach((p, i) => {
                             const ev = p.eval;
@@ -6836,7 +6919,7 @@ table.ftp-table {
                                 ${(() => {
                                     // Youth potential projection: show projected skills at age 20
                                     if (Math.round(p.age) < 21 && Math.round(p.age) >= 16) {
-                                        const proj = projectYouthToAge20(p, academySpeed);
+                                        const proj = projectYouthToAge20(p, getAcademySpeedForPlayer(p, academyInfoForProjection));
                                         if (proj) {
                                             const projPrimary = getPrimarySkillInfo(proj.projected);
                                             const verdictColor = proj.verdict === 'outstanding' || proj.verdict === 'expert' ? 'var(--vj-green)' :
@@ -7513,7 +7596,7 @@ table.ftp-table {
     function scrapePlayerDetailPage() {
         const doc = document;
         const nameEl = doc.querySelector('h1, .panel h2, .panel .padded h2');
-        const name = nameEl ? nameEl.textContent.trim() : 'This player';
+        const name = nameEl ? escapeHtml(nameEl.textContent.trim()) : 'This player';
 
         const bowlerTypeSpan = doc.querySelector('span.bowlerType');
         let bowlerType = bowlerTypeSpan ? bowlerTypeSpan.textContent.trim().toLowerCase() : '';
@@ -7571,12 +7654,12 @@ table.ftp-table {
                 const spans = td.querySelectorAll('span.popuphelp');
                 spans.forEach(span => {
                     const title = span.getAttribute('title') || '';
-                    const t = title.split('|')[0].trim();
+                    const t = escapeHtml(title.split('|')[0].trim());
                     if (t) player.talents.push(t);
                 });
                 if (player.talents.length === 0) {
                     const text = td.textContent.trim();
-                    if (text && text !== 'None') player.talents = text.split(',').map(t => t.trim()).filter(Boolean);
+                    if (text && text !== 'None') player.talents = text.split(',').map(t => escapeHtml(t.trim())).filter(Boolean);
                 }
             }
         });
