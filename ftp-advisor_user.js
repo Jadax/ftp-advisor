@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         FTP Advisor
 // @namespace    http://tampermonkey.net/
-// @version      8.25
+// @version      8.26
 // @description  Comprehensive tactical advisor for From the Pavilion cricket game (v8.18: enhanced opponent scouting report, match-week rest scheduling, bowling allocation opponent-aware; v8.17: phase-specific batting tactics; v8.16: confidence scores, fixture integration; v7.0: full UI redesign)
 // @author       You
 // @license      MIT
@@ -323,6 +323,18 @@
         return m ? parseInt(m[1], 10) : 0;
     }
 
+    // Inverse of parseGameAge's decimal, for display — raw decimal ages
+    // (e.g. 16.428571428571427) were leaking straight into the UI as
+    // "16.428571428571427yo" wherever a template literal interpolated
+    // player.age directly. Reconstructs the game's own "Yy Ww" format
+    // instead of an ugly float.
+    function formatAgeDisplay(age) {
+        if (age == null || isNaN(age)) return '';
+        const years = Math.floor(age);
+        const weeks = Math.round((age - years) * 14);
+        return weeks > 0 ? `${years}y${weeks}w` : `${years}`;
+    }
+
     // Which discipline (batting/bowling/keeping) is this player's actual
     // primary skill. Transfer scouting (checkScoutBenchmark,
     // evaluateTransferTarget, calculateRank) used to hardcode
@@ -642,11 +654,22 @@
               endurance: 3, experience: 3 }                                               // Ordinary+
     };
 
+    // Delegates to getPrimarySkillInfo() — this used to be a separate
+    // implementation that additionally required bowlerCategory !== 'none'
+    // before ever considering bowling as primary. That's a real bug: on
+    // any scrape where bowlerType/bowlerCategory detection fails (e.g.
+    // player.htm — see scrapePlayerDetailPage's own lower-confidence
+    // note, its bowlerType span/regex fallback doesn't always match) a
+    // genuine bowler with bowling clearly ahead of batting still fell
+    // through to 'batting', while getPrimarySkillInfo() (used by transfer
+    // search) only ever compares the raw skill numbers and has no such
+    // dependency. Same player, two different "primary skill" answers
+    // depending only on which page scraped bowlerCategory successfully —
+    // e.g. Player Advisor verdict (RELEASE, judged on weak batting) vs.
+    // transfer search verdict (STRONG, judged on solid bowling) for the
+    // literal same person. One shared implementation now; can't diverge.
     function getYouthPrimarySkillName(player) {
-        const isKeeper = player.role === 'WK' || (player.keeping >= 4 && player.keeping > player.bowling);
-        if (isKeeper) return 'keeping';
-        const isBowler = player.bowlerCategory && player.bowlerCategory !== 'none' && player.bowling >= player.batting;
-        return isBowler ? 'bowling' : 'batting';
+        return getPrimarySkillInfo(player).name;
     }
 
     // Returns null if the player is outside the tracked age window (16-20)
@@ -5776,7 +5799,7 @@ table.ftp-table {
             const priorityIcon = rec.priority === 'critical' ? '\u{1F534}' : rec.priority === 'high' ? '\u{1F7E0}' : rec.priority === 'medium' ? '\u{1F535}' : '\u26AA';
 
             recsHtml += `<div class="ftp-rec ${rec.priority}">
-                <div class="vj-flex-between"><span class="ftp-rec-name">${priorityIcon} ${p.name} <span class="vj-text-xs vj-text-muted">(${p.age})</span></span><span class="vj-text-xs ${isAlreadyCorrect ? 'vj-text-muted' : ''}">${isAlreadyCorrect ? '\u2705' : '\u27A1'}</span></div>
+                <div class="vj-flex-between"><span class="ftp-rec-name">${priorityIcon} ${p.name} <span class="vj-text-xs vj-text-muted">(${formatAgeDisplay(p.age)})</span></span><span class="vj-text-xs ${isAlreadyCorrect ? 'vj-text-muted' : ''}">${isAlreadyCorrect ? '\u2705' : '\u27A1'}</span></div>
                 <div class="ftp-rec-current">Now: ${currentProg} \u00B7 Bat ${skillLabel(p.batting).slice(0,3)} \u00B7 Bowl ${skillLabel(p.bowling).slice(0,3)} \u00B7 Tech ${skillLabel(p.technique).slice(0,3)} \u00B7 Field ${skillLabel(p.fielding).slice(0,3)} \u00B7 End ${skillLabel(p.endurance).slice(0,3)}${p.keeping > 0 ? ` \u00B7 Keep ${skillLabel(p.keeping).slice(0,3)}` : ''}</div>
                 <div class="ftp-rec-program">\u2192 ${TRAINING_PROGRAM_LABELS[rec.program] || rec.program}${rec.weeksToNextLevel ? ` <span class="vj-text-xs vj-text-muted">(~${rec.weeksToNextLevel}wk to next level)</span>` : ''}</div>
                 ${gains ? `<div class="ftp-rec-gains">${gains.gains.join(' | ')}</div>` : ''}
@@ -6243,7 +6266,7 @@ table.ftp-table {
                 const ev = getEval(p);
                 const badge = ev.verdict === 'elite' ? 'green' : ev.verdict === 'strong' ? 'green' : ev.verdict === 'promising' ? 'blue' : ev.verdict === 'average' ? 'amber' : 'red';
                 html += `<div class="ftp-stat-row" style="padding:4px 0;">
-                    <span class="vj-text-xs" style="font-weight:600;">${p.name} (${p.age})</span>
+                    <span class="vj-text-xs" style="font-weight:600;">${p.name} (${formatAgeDisplay(p.age)})</span>
                     <span class="vj-text-xs vj-text-muted">Bat ${skillLabel(p.batting)} \u00B7 Bowl ${skillLabel(p.bowling)}</span>
                     <span class="ftp-stat-badge ${badge}" style="font-size:9px;">${ev.verdict.toUpperCase()} (${ev.score})</span>
                 </div>`;
@@ -6800,7 +6823,7 @@ table.ftp-table {
 
                             html += `<div class="ftp-rec low" style="padding:6px 8px;margin:3px 0;">
                                 <div class="vj-flex-between">
-                                    <span class="vj-fw-700" style="font-size:12px;">#${i+1} ${p.name} <span class="vj-text-xs vj-text-muted">(${p.age}yo)</span></span>
+                                    <span class="vj-fw-700" style="font-size:12px;">#${i+1} ${p.name} <span class="vj-text-xs vj-text-muted">(${formatAgeDisplay(p.age)})</span></span>
                                     <div style="display:flex;gap:4px;align-items:center;">
                                         <span class="ftp-stat-badge ${badgeClass}">${ev.verdict.toUpperCase()}</span>
                                     </div>
@@ -7082,7 +7105,7 @@ table.ftp-table {
 
         let html = `<div class="vj-text-xs vj-text-muted vj-mb-4">Ranked by urgency to sell. ${candidates.length} of ${seniors.length} seniors flagged.</div>`;
         candidates.forEach((r, i) => {
-            const statLine = `${r.player.age}yo \u00B7 ${skillLabel(r.player.batting)}/${skillLabel(r.player.bowling)} \u00B7 R${r.player.rating || '?'}`;
+            const statLine = `${formatAgeDisplay(r.player.age)} \u00B7 ${skillLabel(r.player.batting)}/${skillLabel(r.player.bowling)} \u00B7 R${r.player.rating || '?'}`;
             html += renderSellCandidateCard(i + 1, r.player, r.sellScore, r.reasons, statLine);
         });
 
