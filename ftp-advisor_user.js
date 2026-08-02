@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         FTP Advisor
 // @namespace    http://tampermonkey.net/
-// @version      8.28
+// @version      8.29
 // @description  Comprehensive tactical advisor for From the Pavilion cricket game (v8.18: enhanced opponent scouting report, match-week rest scheduling, bowling allocation opponent-aware; v8.17: phase-specific batting tactics; v8.16: confidence scores, fixture integration; v7.0: full UI redesign)
 // @author       You
 // @license      MIT
@@ -3472,8 +3472,21 @@
     function allocateBowlingSpells(lineup, context, opponentAnalysis) {
         const totalOvers = context.overs;
         const isT20 = context.matchType === 'T20' || context.matchType === 'YT20';
-        const maxPerSpell = isT20 ? 4 : 8;
-        const maxPerBowler = isT20 ? 4 : 10;
+        // Confirmed verbatim (rules.htm?rulespage=competitions): "There are
+        // 5-10 bowlers who can each bowl a maximum of 10 overs each" (Senior
+        // OD), "...4 overs each" (Senior T20), "...8 overs each" (Youth OD —
+        // NOT 10, a real format difference from Senior OD), "...4 overs
+        // each" (Youth T20). This used to be a flat isT20 ? 4 : 10, which
+        // silently let Youth OD bowling plans allocate up to 10 overs to a
+        // single bowler — 2 more than the format actually allows.
+        // Min spell (2 OD / 1 T20) is also manual-confirmed; there is no
+        // stated MAX-per-spell rule for any format, so the per-spell cap
+        // below is a heuristic margin (never hand a bowler their entire
+        // match quota in one continuous burst), kept proportionate to each
+        // format's real per-bowler max rather than a flat 8.
+        const MAX_OVERS_PER_BOWLER = { OD: 10, YOD: 8, T20: 4, YT20: 4 };
+        const maxPerBowler = MAX_OVERS_PER_BOWLER[context.matchType] || (isT20 ? 4 : 10);
+        const maxPerSpell = isT20 ? maxPerBowler : Math.max(2, maxPerBowler - 2);
         const minPerSpell = isT20 ? 1 : 2;
         const perEnd = totalOvers / 2;
 
@@ -3755,8 +3768,10 @@
 
         // Fix adjacency violations: no bowler may bowl consecutive overs.
         // Run multiple passes since a swap can introduce new violations.
-        // Admin rules enforced: max 8 per spell (OD), 4 per spell (T20),
-        // max 10 per bowler (OD), 4 per bowler (T20), no consecutive overs.
+        // Manual-confirmed per-bowler max overs (rules.htm?rulespage=
+        // competitions): Senior OD 10, Senior T20 4, Youth OD 8, Youth T20
+        // 4 — see MAX_OVERS_PER_BOWLER above. No consecutive overs is also
+        // manual-confirmed (rulespage=matchorders).
         for (let pass = 0; pass < 3; pass++) {
             let fixed = false;
             for (let i = 1; i < plan.length; i++) {
