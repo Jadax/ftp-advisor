@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         FTP Advisor
 // @namespace    http://tampermonkey.net/
-// @version      8.27
+// @version      8.28
 // @description  Comprehensive tactical advisor for From the Pavilion cricket game (v8.18: enhanced opponent scouting report, match-week rest scheduling, bowling allocation opponent-aware; v8.17: phase-specific batting tactics; v8.16: confidence scores, fixture integration; v7.0: full UI redesign)
 // @author       You
 // @license      MIT
@@ -6759,7 +6759,11 @@ table.ftp-table {
                 const evaluated = results.map(p => {
                     const ev = evaluateTransferTarget(p, squadStats);
                     ev.rank = calculateRank(p, squadStats);
-                    return { ...p, eval: ev };
+                    // Squad-peer comparison computed up front (not just at
+                    // render time) so it can gate the senior filter below,
+                    // not just annotate the card afterwards.
+                    const peerCompare = (Math.round(p.age) >= 21) ? comparePlayerToSquadPeers(p, seniorPlayers) : null;
+                    return { ...p, eval: ev, peerCompare };
                 });
 
                 // ---- FILTERS ----
@@ -6775,21 +6779,41 @@ table.ftp-table {
                     return age >= 21 && age > SENIOR_MAX_AGE;
                 }).length;
 
-                const filtered = evaluated.filter(e => {
+                // Requested behaviour: an ELITE senior sitting on the
+                // market is still a wasted signing if they're not
+                // actually better than what you already have — showing
+                // "elite" or "strong" verdicts on their own is pointless
+                // for a like-for-like swap. So for 21+, "worth showing"
+                // means BOTH the absolute verdict is elite AND the
+                // squad-peer comparison says they're a real upgrade
+                // (outrank at least one current player in the SAME role
+                // — batter vs batters, bowler vs bowlers, keeper vs
+                // keepers, see comparePlayerToSquadPeers) or fill a
+                // genuine role gap (isGap). Youth keep the original
+                // elite/strong/adequate gate — they're development bets
+                // against an age curve, not like-for-like swaps, so
+                // "better than your current squad" doesn't apply yet.
+                function isWorthShowing(e) {
                     const age = Math.round(e.age);
                     const isYouth = age < 21;
-
-                    // Age filter (seniors only — peak is 25-27, decline starts 28+)
                     if (!isYouth && age > SENIOR_MAX_AGE) {
                         e.eval.warnings.push(`Age ${age} — past prime years for senior transfer`);
                         return false;
                     }
-                    // Filter out poor/weak verdicts (failed minimums)
-                    if (e.eval.verdict === 'poor' || e.eval.verdict === 'weak') {
+                    if (isYouth) {
+                        return e.eval.verdict !== 'poor' && e.eval.verdict !== 'weak';
+                    }
+                    if (e.eval.verdict !== 'elite') {
+                        e.eval.warnings.push(`Verdict ${e.eval.verdict.toUpperCase()} — only ELITE seniors that also upgrade your squad are shown here`);
                         return false;
                     }
-                    return true;
-                });
+                    const cmp = e.peerCompare;
+                    if (!cmp || cmp.isGap || cmp.wouldReplace.length > 0) return true;
+                    e.eval.warnings.push(`Elite, but doesn't outrank any current ${cmp.groupLabel} in your squad — not a real upgrade`);
+                    return false;
+                }
+
+                const filtered = evaluated.filter(isWorthShowing);
 
                 const verdictFiltered = evaluated.length - ageFiltered - filtered.length;
                 const skipped = evaluated.length - filtered.length;
@@ -6801,9 +6825,14 @@ table.ftp-table {
                 // the scoring code each time.
                 const youthEval = evaluated.filter(e => Math.round(e.age) < 21);
                 const seniorEval = evaluated.filter(e => Math.round(e.age) >= 21);
+                // Reuses `filtered` (computed above) rather than calling
+                // isWorthShowing again — it pushes into e.eval.warnings as
+                // a side effect, and re-running it here would duplicate
+                // every warning message shown on the actual cards.
+                const filteredSet = new Set(filtered);
                 console.log(`[FTP Transfer] Scanned ${evaluated.length} (${youthEval.length} youth, ${seniorEval.length} senior). ` +
-                    `Youth pass: ${youthEval.filter(e => e.eval.verdict !== 'poor' && e.eval.verdict !== 'weak').length}/${youthEval.length}. ` +
-                    `Senior pass: ${seniorEval.filter(e => e.eval.verdict !== 'poor' && e.eval.verdict !== 'weak').length}/${seniorEval.length}.`);
+                    `Youth pass: ${youthEval.filter(e => filteredSet.has(e)).length}/${youthEval.length}. ` +
+                    `Senior pass (elite + squad upgrade): ${seniorEval.filter(e => filteredSet.has(e)).length}/${seniorEval.length}.`);
                 if (youthEval.length > 0 && youthEval.every(e => e.eval.verdict === 'poor' || e.eval.verdict === 'weak')) {
                     // Flattened to a plain string, not a logged object —
                     // browser consoles collapse nested objects to "{...}"
@@ -6822,26 +6851,15 @@ table.ftp-table {
                 priorityBuys.sort((a, b) => (verdictOrder[a.eval.verdict] ?? 9) - (verdictOrder[b.eval.verdict] ?? 9) || b.eval.rank - a.eval.rank || (a.price || 0) - (b.price || 0));
 
                 function renderTransferResults(players, totalScanned, ageFilteredCount, verdictFilteredCount, detailsFetched) {
-                    // Requested: 21+ candidates should always show who on the
-                    // current squad they outrank — same peer-comparison logic
-                    // already used on the Player Advisor (player.htm), just
-                    // run here against every search result instead of one
-                    // player at a time. Youth (16-20) stays curve/filter-based
-                    // since there's no same-age squad peer to compare against
-                    // (you can only recruit 16yos — the "peers" for a search
-                    // hit are whoever's now aged into that bracket).
-                    players.forEach(p => {
-                        if (Math.round(p.age) >= 21 && seniorPlayers.length > 0) {
-                            p._peerCompare = comparePlayerToSquadPeers(p, seniorPlayers);
-                        } else {
-                            p._peerCompare = null;
-                        }
-                    });
+                    // peerCompare was already computed per-candidate up in
+                    // the `evaluated` map (it now gates which seniors even
+                    // make it into `players` — see isWorthShowing above),
+                    // so just read it back rather than recomputing.
                     let html = `<div class="vj-flex vj-gap-6 vj-mb-8" style="flex-wrap:wrap;">
                         <span class="ftp-stat-badge green">${players.length} Target${players.length !== 1 ? 's' : ''}</span>
                         <span class="ftp-stat-badge neutral">${totalScanned} Total Scanned</span>
                         ${ageFilteredCount > 0 ? `<span class="vj-text-xs vj-text-muted" style="align-self:center;">${ageFilteredCount} over age limit</span>` : ''}
-                        ${verdictFilteredCount > 0 ? `<span class="vj-text-xs vj-text-muted" style="align-self:center;">${verdictFilteredCount} below threshold</span>` : ''}
+                        ${verdictFilteredCount > 0 ? `<span class="vj-text-xs vj-text-muted" style="align-self:center;">${verdictFilteredCount} below threshold or not a squad upgrade</span>` : ''}
                         ${!detailsFetched ? `<button id="ftp-fetch-details-btn" class="vj-btn vj-btn-sm" style="font-size:11px;padding:2px 8px;cursor:pointer;">\u21BB Fetch Experience & Wages</button>` : `<span class="ftp-stat-badge neutral">\u2713 Details fetched</span>`}
                     </div>`;
 
@@ -6894,13 +6912,15 @@ table.ftp-table {
                             if (detailsFetched && p.talents && p.talents.length > 0) detailParts.push(`<span style="color:var(--vj-gold);">${p.talents.join(', ')}</span>`);
 
                             let compareHtml = '';
-                            const cmp = p._peerCompare;
+                            const cmp = p.peerCompare;
                             if (cmp) {
-                                if (cmp.wouldReplace.length > 0) {
+                                if (cmp.isGap) {
+                                    compareHtml = `<div class="vj-text-xs" style="color:var(--vj-green);line-height:1.4;margin-top:2px;">\u2191 Fills a real gap \u2014 you have no current ${cmp.role === 'keeping' ? 'wicketkeeper' : cmp.role === 'bowling' ? 'bowler' : 'batter'}</div>`;
+                                } else if (cmp.wouldReplace.length > 0) {
                                     const names = cmp.wouldReplace.map(r => r.player.name).join(', ');
-                                    compareHtml = `<div class="vj-text-xs" style="color:var(--vj-green);line-height:1.4;margin-top:2px;">\u2191 Outranks ${cmp.wouldReplace.length} of your ${cmp.groupLabel} squad \u2014 would replace: ${names}</div>`;
+                                    compareHtml = `<div class="vj-text-xs" style="color:var(--vj-green);line-height:1.4;margin-top:2px;">\u2191 Outranks ${cmp.wouldReplace.length} of your ${cmp.groupLabel} \u2014 would replace: ${names}</div>`;
                                 } else {
-                                    compareHtml = `<div class="vj-text-xs vj-text-muted" style="line-height:1.4;margin-top:2px;">Doesn't outrank any current ${cmp.groupLabel} player \u2014 depth signing only.</div>`;
+                                    compareHtml = `<div class="vj-text-xs vj-text-muted" style="line-height:1.4;margin-top:2px;">Doesn't outrank any current ${cmp.groupLabel} \u2014 depth signing only, not an upgrade.</div>`;
                                 }
                             }
 
@@ -6953,19 +6973,15 @@ table.ftp-table {
                             const ev = evaluateTransferTarget(p, squadStats);
                             ev.rank = calculateRank(p, squadStats);
                             p.eval = ev;
+                            // Role doesn't change from the detail fetch, but
+                            // candidateRank can shift slightly with real
+                            // experience now known — recompute for consistency
+                            // with the same isWorthShowing gate used above.
+                            p.peerCompare = (Math.round(p.age) >= 21) ? comparePlayerToSquadPeers(p, seniorPlayers) : null;
                         });
-                        // Re-filter: remove players who now fail updated evaluation.
-                        // The base (checkScoutBenchmark, including its experience
-                        // minimum per age) is already enforced inside
-                        // evaluateTransferTarget above via verdict === 'poor' —
-                        // no separate experience check needed here.
-                        const reFiltered = priorityBuys.filter(p => {
-                            const age = Math.round(p.age);
-                            const isYouth = age < 21;
-                            if (!isYouth && age > SENIOR_MAX_AGE) return false;
-                            if (p.eval.verdict === 'poor' || p.eval.verdict === 'weak') return false;
-                            return true;
-                        });
+                        // Re-filter with the exact same rule as the initial
+                        // pass (elite + genuine squad upgrade for seniors).
+                        const reFiltered = priorityBuys.filter(isWorthShowing);
                         const reAgeFiltered = priorityBuys.filter(p => { const age = Math.round(p.age); return age >= 21 && age > SENIOR_MAX_AGE; }).length;
                         const reVerdictFiltered = priorityBuys.length - reAgeFiltered - reFiltered.length;
                         resultsEl.innerHTML = renderTransferResults(reFiltered, evaluated.length, reAgeFiltered, reVerdictFiltered, true);
@@ -7669,28 +7685,35 @@ table.ftp-table {
     }
 
     /**
-     * Ranks this candidate against squad players in the same age
-     * bracket (exact age first, falls back to all seniors if nobody
-     * matches — a small squad may have no exact-age peer). Returns the
-     * peers sorted worst-rank-first, i.e. best-sell-candidate-first, so
-     * a caller can show "if you sign this player, here's who to move
+     * Ranks this candidate against the squad players who actually compete
+     * for the same spot — same PRIMARY ROLE (batting/bowling/keeping via
+     * getPrimarySkillInfo), not same age. Age was the original grouping
+     * here, but "does this new signing outrank your other 24-year-olds"
+     * is a meaningless question if those 24-year-olds are your bowlers
+     * and the candidate is a keeper — a keeper only ever replaces a
+     * keeper. Requested explicitly: batsmen, bowlers, and wicketkeepers
+     * need to be judged against their own kind.
+     * No peers in that role at all (e.g. squad currently has zero
+     * specialist keepers) is flagged via `isGap` — that's not "nobody to
+     * compare against so ignore this candidate", it's a genuine squad
+     * hole, arguably the strongest possible case FOR signing.
+     * Returns peers sorted worst-rank-first (best-sell-candidate-first),
+     * so a caller can show "if you sign this player, here's who to move
      * on, starting with the clearest cut."
      */
     function comparePlayerToSquadPeers(candidate, squadPlayers) {
         const squadStats = computeSquadStats(squadPlayers);
-        const candidateAge = Math.round(candidate.age);
-        let peers = squadPlayers.filter(p => Math.round(p.age) === candidateAge && p.age >= 21);
-        let groupLabel = `age ${candidateAge}`;
-        if (peers.length === 0) {
-            peers = squadPlayers.filter(p => p.age >= 21);
-            groupLabel = 'all seniors (no exact age match in squad)';
-        }
+        const candidateRole = getPrimarySkillInfo(candidate).name; // 'batting' | 'bowling' | 'keeping'
+        const peers = squadPlayers.filter(p => p.age >= 21 && getPrimarySkillInfo(p).name === candidateRole);
+        const isGap = peers.length === 0;
+        const roleLabel = candidateRole === 'keeping' ? 'wicketkeeper' : candidateRole === 'bowling' ? 'bowler' : 'batter';
+        const groupLabel = isGap ? `no current ${roleLabel}s — fills a squad gap` : `${roleLabel}`;
         const candidateRank = calculateRank(candidate, squadStats);
         const ranked = peers
             .map(p => ({ player: p, rank: calculateRank(p, squadStats) }))
             .sort((a, b) => a.rank - b.rank);
         const wouldReplace = ranked.filter(r => candidateRank > r.rank);
-        return { candidateRank, groupLabel, wouldReplace, allPeers: ranked, squadStats };
+        return { candidateRank, groupLabel, wouldReplace, allPeers: ranked, squadStats, isGap, role: candidateRole };
     }
 
     // Short training-program codes matching the workbook's own
@@ -7826,13 +7849,15 @@ table.ftp-table {
         // that doesn't mean much yet.
         if (!isYouth && squadPlayers.length > 0) {
             const cmp = comparePlayerToSquadPeers(player, squadPlayers);
-            let cHtml = `<div class="vj-text-xs vj-text-muted vj-mb-4">Compared against ${cmp.groupLabel} in your squad (${cmp.allPeers.length} player${cmp.allPeers.length === 1 ? '' : 's'}). This player ranks ${cmp.candidateRank}/10.</div>`;
+            let cHtml = cmp.isGap
+                ? `<div class="vj-text-xs vj-text-muted vj-mb-4">You have no current ${cmp.role === 'keeping' ? 'wicketkeepers' : cmp.role === 'bowling' ? 'bowlers' : 'batters'} to compare against — this player would fill a genuine squad gap. This player ranks ${cmp.candidateRank}/10.</div>`
+                : `<div class="vj-text-xs vj-text-muted vj-mb-4">Compared against your squad's ${cmp.groupLabel}s (${cmp.allPeers.length} player${cmp.allPeers.length === 1 ? '' : 's'}). This player ranks ${cmp.candidateRank}/10.</div>`;
             if (cmp.wouldReplace.length > 0) {
                 cHtml += `<div class="vj-fw-700 vj-mb-4">Would replace (best sell first):</div>`;
                 cmp.wouldReplace.forEach(r => {
                     cHtml += `<div class="ftp-stat-row"><span class="ftp-stat-label">${r.player.name}</span><span class="ftp-stat-value">Rank ${r.rank}/10</span></div>`;
                 });
-            } else {
+            } else if (!cmp.isGap) {
                 cHtml += `<div class="vj-text-sm vj-text-muted">Doesn't clearly outrank anyone in this group — not an obvious replacement for your current squad.</div>`;
             }
             compareEl.innerHTML = cHtml;
