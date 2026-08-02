@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         FTP Advisor
 // @namespace    http://tampermonkey.net/
-// @version      8.30
+// @version      8.31
 // @description  Comprehensive tactical advisor for From the Pavilion cricket game (v8.18: enhanced opponent scouting report, match-week rest scheduling, bowling allocation opponent-aware; v8.17: phase-specific batting tactics; v8.16: confidence scores, fixture integration; v7.0: full UI redesign)
 // @author       You
 // @license      MIT
@@ -3572,7 +3572,9 @@
                 if (capLeft < minPerSpell) continue;
                 if (b.id === lastOtherBowler) continue;
                 const c = Math.min(need, fatigueSpellCap(b), capLeft);
-                if (c >= minPerSpell) { spells.push({ player: b, overs: c, phase: 'Death overs', end: endName }); cap[b.id] -= c; need -= c; }
+                if (c >= minPerSpell) {
+                    spells.push({ player: b, overs: c, phase: 'Death overs', end: endName }); cap[b.id] -= c; need -= c;
+                }
             }
         }
 
@@ -3717,14 +3719,27 @@
                 const lastThisEnd = spells.length > 0 ? spells[spells.length - 1].player.id : null;
                 for (const b of bowlers) {
                     if (deficit <= 0) break;
-                    let capLeft = cap[b.id] || 0;
+                    const capLeft = cap[b.id] || 0;
                     if (b.id === lastOtherBowler) continue;
                     if (b.id === lastThisEnd) continue;
-                    if (capLeft < minPerSpell) {
-                        // Lift maxPerBowler if needed — better to exceed cap than leave overs unassigned
-                        cap[b.id] = minPerSpell;
-                        capLeft = minPerSpell;
-                    }
+                    // REAL BUG (found via automated verification, fixed): this
+                    // used to "lift" a bowler's remaining cap up to minPerSpell
+                    // whenever it was below that — cap[b.id] = minPerSpell —
+                    // as a side effect of merely being scanned here, even for
+                    // a bowler this loop never ends up selecting. Since a
+                    // bowler who's already bowled their full match allocation
+                    // legitimately has capLeft=0, this silently manufactured
+                    // 2 overs of capacity back for them, corrupting the
+                    // shared cap tracker for the REST of the allocation — a
+                    // later Strategy 1 call (on a different end) would then
+                    // read that fabricated capacity as real and extend an
+                    // already-at-cap bowler past their manual-confirmed
+                    // per-match over limit. Confirmed with a synthetic 11-
+                    // player Youth OD lineup: a bowler ended up with 9 overs
+                    // against an 8-over cap. Correct behaviour: a bowler
+                    // below minPerSpell genuinely can't take a normal-length
+                    // new spell here — skip them, don't fabricate room.
+                    if (capLeft < minPerSpell) continue;
                     const c = Math.min(deficit, capLeft, maxPerSpell);
                     if (c >= minPerSpell) {
                         spells.push({ player: b, overs: c, phase: 'Death overs', end: endName });
@@ -3734,9 +3749,40 @@
                 }
             }
 
-            // Strategy 3: absolute last resort — if STILL deficit (extremely rare),
-            // extend any spell regardless of cap (exceed maxPerBowler)
+            // Strategy 2.5: still deficit — retry EVERY bowler with cap
+            // room, ignoring the end-adjacency exclusion this time. A
+            // same-XI bowler with unused overs left is always a legal fix
+            // (worst case, a short top-up spell below the normal
+            // minPerSpell — real matches do sometimes give someone a
+            // single closing over), and the manual-confirmed per-bowler
+            // over limit should never be violated while one exists. This
+            // catches exactly the case Strategy 2 misses: a weaker bowler
+            // who was skipped there only because they happened to be the
+            // last bowler on the other end at that moment, not because
+            // they were actually unavailable. Any adjacency issue this
+            // introduces is caught by the "no consecutive overs" fixup
+            // pass that already runs after this function.
             if (deficit > 0) {
+                for (const b of bowlers) {
+                    if (deficit <= 0) break;
+                    const capLeft = cap[b.id] || 0;
+                    if (capLeft <= 0) continue;
+                    const c = Math.min(deficit, capLeft, maxPerSpell);
+                    if (c > 0) {
+                        spells.push({ player: b, overs: c, phase: 'Death overs', end: endName });
+                        cap[b.id] -= c;
+                        deficit -= c;
+                    }
+                }
+            }
+
+            // Strategy 3: absolute last resort — if STILL deficit (every
+            // eligible bowler is genuinely capped out, e.g. a squad with
+            // too few bowling options for this format), extend any spell
+            // regardless of cap (exceed maxPerBowler). This should now
+            // only trigger when there really is no legal allocation left.
+            if (deficit > 0) {
+                const before = deficit;
                 for (const spell of spells) {
                     if (deficit <= 0) break;
                     const canAdd = Math.min(deficit, maxPerSpell - spell.overs);
@@ -3744,6 +3790,9 @@
                         spell.overs += canAdd;
                         deficit -= canAdd;
                     }
+                }
+                if (before > deficit) {
+                    console.warn(`[FTP Advisor] ${endName} end: squad has too few bowling options for this format — exceeded a bowler's per-match over limit by ${before - deficit} to fill the innings. Consider recruiting/training another bowler.`);
                 }
             }
 
@@ -6884,8 +6933,19 @@ table.ftp-table {
                         <span class="ftp-stat-badge neutral">${totalScanned} Total Scanned</span>
                         ${ageFilteredCount > 0 ? `<span class="vj-text-xs vj-text-muted" style="align-self:center;">${ageFilteredCount} over age limit</span>` : ''}
                         ${verdictFilteredCount > 0 ? `<span class="vj-text-xs vj-text-muted" style="align-self:center;">${verdictFilteredCount} below threshold or not a squad upgrade</span>` : ''}
-                        ${!detailsFetched ? `<button id="ftp-fetch-details-btn" class="vj-btn vj-btn-sm" style="font-size:11px;padding:2px 8px;cursor:pointer;">\u21BB Fetch Experience & Wages</button>` : `<span class="ftp-stat-badge neutral">\u2713 Details fetched</span>`}
+                        ${!detailsFetched ? `<button id="ftp-fetch-details-btn" class="vj-btn vj-btn-sm" style="font-size:11px;padding:2px 8px;cursor:pointer;">\u21BB Fetch Experience, Wages & Talents</button>` : `<span class="ftp-stat-badge neutral">\u2713 Details fetched</span>`}
                     </div>`;
+                    if (!detailsFetched) {
+                        // Talents aren't shown on the transfer search table
+                        // at all (game limitation \u2014 only on the player's
+                        // own page), so every talent-driven bonus (Prodigy,
+                        // Skilled, Seam/Spin Specialist, etc.) and the
+                        // elite-verdict gate that depends on them are
+                        // computed WITHOUT talents on this first pass.
+                        // Verdicts, and which players even show up here,
+                        // can genuinely change once fetched.
+                        html += `<div class="vj-text-xs vj-text-muted vj-mb-8">\u2139\uFE0F Talents aren't visible on the search table itself \u2014 click above to fetch them per player. Verdicts (and who qualifies as ELITE) may change once talents are known.</div>`;
+                    }
 
                     if (players.length === 0) {
                         html += '<div class="vj-text-sm vj-text-muted">No targets found. Try adjusting search filters (age, bowling type, skill ranges).</div>';
