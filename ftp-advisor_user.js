@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         FTP Advisor
 // @namespace    http://tampermonkey.net/
-// @version      8.31
+// @version      8.32
 // @description  Comprehensive tactical advisor for From the Pavilion cricket game (v8.18: enhanced opponent scouting report, match-week rest scheduling, bowling allocation opponent-aware; v8.17: phase-specific batting tactics; v8.16: confidence scores, fixture integration; v7.0: full UI redesign)
 // @author       You
 // @license      MIT
@@ -4076,7 +4076,7 @@
         displayBattingOrder(battingOrder, opponentAnalysis, context);
 
         // Display bowling
-        displayBowling(bowling, opponentAnalysis);
+        displayBowling(bowling, opponentAnalysis, context.overs);
         } catch (err) {
             console.error('[FTP Advisor] Error in updateOrdersAdvisor:', err);
             const ctx = document.getElementById('ftp-context');
@@ -4131,8 +4131,40 @@
         document.getElementById('ftp-batting').innerHTML = html;
     }
 
-    function displayBowling(bowlingSpells, opponentAnalysis) {
+    function displayBowling(bowlingSpells, opponentAnalysis, totalOvers) {
         let html = '';
+
+        // Rest-across-the-break check. Real user feedback, and manual-
+        // confirmed mechanic: "Energy is partially replenished during
+        // drinks breaks and during the change of innings" (rulespage=
+        // matchengine). Splitting a bowler's overs into a spell before
+        // the halfway-point break and another after gives them an actual
+        // rest window, instead of one continuous block. NOT enforced
+        // inside allocateBowlingSpells() itself — that allocator is
+        // already an intricate multi-strategy algorithm (see the v8.31
+        // over-limit bug found in it), and restructuring it to force a
+        // split per bowler isn't safe to do without live-game
+        // verification. Surfaced here as a direct, visible check instead,
+        // computed from the real spell.startOver values already on each
+        // spell, so it's honest about what's actually been scheduled.
+        if (totalOvers) {
+            const breakOver = totalOvers / 2;
+            const perBowler = {};
+            bowlingSpells.forEach(s => {
+                if (!s || !s.player) return;
+                if (!perBowler[s.player.id]) perBowler[s.player.id] = { name: s.player.name, before: 0, after: 0, total: 0 };
+                const b = perBowler[s.player.id];
+                const spellEndOver = s.startOver + (s.overs - 1) * 2;
+                if (spellEndOver <= breakOver) b.before += s.overs;
+                else if (s.startOver > breakOver) b.after += s.overs;
+                else b.before += s.overs; // straddles the break — already gets a natural gap either way
+                b.total += s.overs;
+            });
+            const noRest = Object.values(perBowler).filter(b => b.total >= 4 && (b.before === 0 || b.after === 0));
+            if (noRest.length > 0) {
+                html += `<div class="ftp-alert warning" style="margin-bottom:6px;"><span>⚠</span><div><strong>No rest across the drinks break:</strong> ${noRest.map(b => `${b.name} (${b.total} overs, all ${b.before === 0 ? 'after' : 'before'})`).join(', ')} — consider a shorter spell either side of the break instead of one long block, so they get a real rest window.</div></div>`;
+            }
+        }
 
         // Spell variety summary
         const seamerSpells = bowlingSpells.filter(s => s && s.player && s.player.bowlerCategory === 'seam');
