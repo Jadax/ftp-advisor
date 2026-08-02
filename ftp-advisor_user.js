@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         FTP Advisor
 // @namespace    http://tampermonkey.net/
-// @version      8.29
+// @version      8.30
 // @description  Comprehensive tactical advisor for From the Pavilion cricket game (v8.18: enhanced opponent scouting report, match-week rest scheduling, bowling allocation opponent-aware; v8.17: phase-specific batting tactics; v8.16: confidence scores, fixture integration; v7.0: full UI redesign)
 // @author       You
 // @license      MIT
@@ -1420,11 +1420,20 @@
         const avg = (key) => seniors.reduce((s, p) => s + (p[key] || 0), 0) / seniors.length;
         const min = (key) => Math.min(...seniors.map(p => p[key] || 0));
 
-        // Role-specific: bowlers vs batters
-        const bowlers = seniors.filter(p => (p.bowling || 0) > (p.batting || 0));
-        const batters = seniors.filter(p => (p.batting || 0) >= (p.bowling || 0));
+        // Role-specific: bowlers vs batters vs keepers. Now mutually
+        // exclusive via getPrimarySkillInfo() — previously bowlers/batters
+        // used a raw bowling>batting comparison while wicketkeepers used a
+        // separate keeping>=6 threshold, so a genuine keeper with
+        // bowling>batting was silently double-counted as both a bowler
+        // AND a keeper. That corrupted any "do we have enough of X" logic
+        // built on these counts (role-surplus sell scoring, squad gap
+        // warnings). allrounders stays a separate cross-cutting quality
+        // tag (batting AND bowling both strong), not a primary-role bucket
+        // — a real allrounder still has exactly one primary role above.
+        const bowlers = seniors.filter(p => getPrimarySkillInfo(p).name === 'bowling');
+        const batters = seniors.filter(p => getPrimarySkillInfo(p).name === 'batting');
+        const wicketkeepers = seniors.filter(p => getPrimarySkillInfo(p).name === 'keeping');
         const allrounders = seniors.filter(p => (p.batting || 0) >= 7 && (p.bowling || 0) >= 7);
-        const wicketkeepers = seniors.filter(p => (p.keeping || 0) >= 6 || p.role === 'WK');
 
         return {
             count: seniors.length,
@@ -7152,6 +7161,60 @@ table.ftp-table {
             </div>`;
     }
 
+    // Recommended senior squad shape for a competitive matchday XI plus
+    // realistic rotation/injury cover — NOT a game-enforced rule (the
+    // only real squad-size rule is the 25-player training-efficiency
+    // penalty, far above this). It's an operating target so "who's
+    // actually excess" has a real answer even when every player
+    // individually looks fine, which was the reported gap: a squad of
+    // 16 good players had nobody to flag. 1 starting keeper + 1 backup,
+    // ~6 bowlers for seam/spin variety and rotation (matches the
+    // manual's own advice — "a balanced bowling attack including a mix
+    // of left and right handed spinners and seam bowlers will in
+    // general perform slightly better"), ~6 batters for the order plus
+    // a spare. Sums to ~14, matching the 13-14 target asked for.
+    const SENIOR_ROLE_TARGETS = { keeping: 2, bowling: 6, batting: 6 };
+
+    // Ranks each senior within their own primary-role group (best to
+    // worst, via calculateRank — the same quality metric transfer
+    // scouting uses) and flags anyone past the role's healthy-depth
+    // target as squad surplus. This is what makes "16 good players, who
+    // do I cut" answerable: a decent 4th-string bowler behind three
+    // better ones is surplus even though nothing about him individually
+    // is bad — the same logic a real selector uses.
+    function computeRoleSurplus(seniors, squadStats) {
+        const roles = { batting: [], bowling: [], keeping: [] };
+        seniors.forEach(p => { roles[getPrimarySkillInfo(p).name].push(p); });
+        const surplusMap = new Map();
+        Object.entries(roles).forEach(([role, group]) => {
+            const ranked = [...group].sort((a, b) => calculateRank(b, squadStats) - calculateRank(a, squadStats));
+            ranked.forEach((p, idx) => {
+                surplusMap.set(p.id, {
+                    role, roleCount: group.length, roleTarget: SENIOR_ROLE_TARGETS[role],
+                    positionInRole: idx + 1, isSurplus: idx >= SENIOR_ROLE_TARGETS[role]
+                });
+            });
+        });
+        return surplusMap;
+    }
+
+    // Real talents make a player harder to replace even when their raw
+    // numbers put them near the bottom of a role group — a squad trim
+    // shouldn't casually sell your only Skilled bowler just because he's
+    // 4th-ranked. Applied as a silent score reduction (like the existing
+    // captain/allrounder/bowler-type bonuses below), not surfaced as a
+    // "reason to sell" since it's the opposite of one.
+    function seniorTalentProtection(player) {
+        const talents = player.talents || [];
+        let protect = 0;
+        if (talents.some(t => /skilled/i.test(t))) protect += 5;
+        if (talents.some(t => /natural leader/i.test(t))) protect += 4;
+        if (talents.some(t => /safe hands/i.test(t))) protect += 3;
+        if (talents.some(t => /new ball bowler|old ball bowler|^opener$|finisher/i.test(t))) protect += 4;
+        if (talents.some(t => /sturdy/i.test(t))) protect += 2;
+        return protect;
+    }
+
     function generateSeniorSellList(players) {
         if (!players || players.length === 0) return '<div class="vj-text-sm vj-text-muted">No players found.</div>';
         const seniors = players.filter(p => p.isSenior);
@@ -7163,6 +7226,8 @@ table.ftp-table {
         // genuine keeper gets judged (and flagged for sale below) on
         // mediocre batting/bowling instead of their actual keeping skill.
         const avgPrimary = avg(seniors.map(p => ({...p, primary: getPrimarySkillInfo(p).value})), 'primary');
+        const squadStats = computeSquadStats(players);
+        const surplusMap = squadStats ? computeRoleSurplus(seniors, squadStats) : new Map();
 
         const scored = seniors.map(p => {
             let sellScore = 0;
@@ -7194,6 +7259,19 @@ table.ftp-table {
                 sellScore += 5;
             }
 
+            // Squad depth surplus — see computeRoleSurplus(). This is what
+            // makes a "16 good players" squad still produce real
+            // candidates: being the 5th bowler when 6 is the target isn't
+            // a flaw, but being the 8th is depth you don't need.
+            const surplus = surplusMap.get(p.id);
+            if (surplus && surplus.isSurplus) {
+                const overBy = surplus.positionInRole - surplus.roleTarget;
+                const bonus = overBy === 1 ? 12 : overBy === 2 ? 9 : 6;
+                sellScore += bonus;
+                const roleLabel = surplus.role === 'keeping' ? 'keeper' : surplus.role === 'bowling' ? 'bowler' : 'batter';
+                reasons.push(`Squad depth: #${surplus.positionInRole} of ${surplus.roleCount} ${roleLabel}s (target ~${surplus.roleTarget}) — lowest-priority for a trimmed squad`);
+            }
+
             // All-rounder bonus — harder to replace
             if (isAllrounder) { sellScore -= 10; }
 
@@ -7205,19 +7283,26 @@ table.ftp-table {
             if (['rf', 'lf'].includes(p.bowlerType)) { sellScore -= 8; }
             else if (['rfm', 'lfm', 'rws', 'lws'].includes(p.bowlerType)) { sellScore -= 5; }
 
+            // Talents make a player harder to replace even when he's
+            // ranked low within his role — see seniorTalentProtection().
+            sellScore -= seniorTalentProtection(p);
+
             return { player: p, sellScore, reasons };
         }).sort((a, b) => b.sellScore - a.sellScore);
 
         // Show top sell candidates (those with sellScore > 0 = some reason to sell)
         const candidates = scored.filter(r => r.sellScore > 0);
+
+        const shapeHtml = squadStats ? `<div class="vj-text-xs vj-text-muted vj-mb-4">Squad shape: ${squadStats.keeperCount} keeper${squadStats.keeperCount === 1 ? '' : 's'} (target ${SENIOR_ROLE_TARGETS.keeping}) · ${squadStats.bowlerCount} bowler${squadStats.bowlerCount === 1 ? '' : 's'} (target ${SENIOR_ROLE_TARGETS.bowling}) · ${squadStats.batterCount} batter${squadStats.batterCount === 1 ? '' : 's'} (target ${SENIOR_ROLE_TARGETS.batting}) — aiming for a ~${SENIOR_ROLE_TARGETS.keeping + SENIOR_ROLE_TARGETS.bowling + SENIOR_ROLE_TARGETS.batting}-player senior squad.</div>` : '';
+
         if (candidates.length === 0) {
-            return `<div class="ftp-info-box success">
+            return shapeHtml + `<div class="ftp-info-box success">
                 <div class="vj-fw-700">No strong sell candidates</div>
-                <div class="vj-text-xs vj-text-secondary vj-mt-4">All senior players are performing adequately. Focus on upgrading the weakest through transfers.</div>
+                <div class="vj-text-xs vj-text-secondary vj-mt-4">Every senior is either performing well or filling a real role need — nobody is depth you don't need. Focus on upgrading the weakest through transfers.</div>
             </div>`;
         }
 
-        let html = `<div class="vj-text-xs vj-text-muted vj-mb-4">Ranked by urgency to sell. ${candidates.length} of ${seniors.length} seniors flagged.</div>`;
+        let html = shapeHtml + `<div class="vj-text-xs vj-text-muted vj-mb-4">Ranked by urgency to sell. ${candidates.length} of ${seniors.length} seniors flagged.</div>`;
         candidates.forEach((r, i) => {
             const statLine = `${formatAgeDisplay(r.player.age)} \u00B7 ${skillLabel(r.player.batting)}/${skillLabel(r.player.bowling)} \u00B7 R${r.player.rating || '?'}`;
             html += renderSellCandidateCard(i + 1, r.player, r.sellScore, r.reasons, statLine);
@@ -7228,10 +7313,27 @@ table.ftp-table {
         return html;
     }
 
+    // Training talents make a youth prospect worth persevering with even
+    // when they're currently behind the curve — Prodigy especially
+    // (trains ALL skills faster while in the youth squad, official
+    // manual) means "behind now" is much less predictive of "behind at
+    // 20" than for a talent-less player on the same curve. Silent score
+    // reduction, same pattern as seniorTalentProtection() — not surfaced
+    // as a sell reason since it's the opposite of one.
+    function youthTalentProtection(player) {
+        const talents = player.talents || [];
+        let protect = 0;
+        if (talents.some(t => /prodigy/i.test(t))) protect += 15;
+        if (talents.some(t => /gifted/i.test(t))) protect += 6;
+        if (talents.some(t => /skilled/i.test(t))) protect += 3;
+        return protect;
+    }
+
     function generateYouthSellList(players) {
         if (!players || players.length === 0) return '<div class="vj-text-sm vj-text-muted">No players found.</div>';
         const youth = players.filter(p => p.isYouth);
         if (youth.length === 0) return '<div class="vj-text-sm vj-text-muted">No youth players found.</div>';
+        const squadStats = computeSquadStats(players);
 
         const scored = youth.map(p => {
             let sellScore = 0;
@@ -7297,19 +7399,49 @@ table.ftp-table {
                 sellScore -= 10;
             }
 
-            return { player: p, sellScore, reasons };
-        }).filter(r => r.sellScore > 0)
-          .sort((a, b) => b.sellScore - a.sellScore);
+            // Training talents (Prodigy especially) make "behind now" a
+            // weaker signal \u2014 see youthTalentProtection().
+            sellScore -= youthTalentProtection(p);
 
-        if (scored.length === 0) {
+            return { player: p, sellScore, reasons };
+        }).sort((a, b) => b.sellScore - a.sellScore);
+
+        const flagged = scored.filter(r => r.sellScore > 0);
+
+        if (flagged.length === 0) {
+            // Everyone's on track or ahead \u2014 but a squad that's grown
+            // large still needs a real answer to "who first if I have
+            // to trim". Below the manual-confirmed floor (promotions
+            // that drop the youth squad under 12 trigger the game's own
+            // auto-draft of REPLACEMENT recruits with poor skills,
+            // rulespage=youthacademy) trimming would be actively
+            // counterproductive, so this only appears once there's
+            // genuine room: show the 2 lowest-ranked (calculateRank,
+            // same metric transfer scouting uses) as soft, non-urgent
+            // candidates rather than pretending nobody exists.
+            let html = '';
+            if (youth.length > 14) {
+                const ranked = [...scored].sort((a, b) => calculateRank(a.player, squadStats) - calculateRank(b.player, squadStats));
+                const soft = ranked.slice(0, 2);
+                html += `<div class="ftp-info-box success">
+                    <div class="vj-fw-700">No urgent sell candidates</div>
+                    <div class="vj-text-xs vj-text-secondary vj-mt-4">All ${youth.length} youth players are developing on track or ahead of the curve.</div>
+                </div>`;
+                html += `<div class="vj-text-xs vj-text-muted vj-mt-8 vj-mb-4">Squad is on the larger side (${youth.length}). If you want to trim, these rank lowest relatively \u2014 not a development problem, just the weakest of a strong group. Below 12 the game auto-drafts replacement recruits with poor skills (official manual), so don't cut past that.</div>`;
+                soft.forEach((r, i) => {
+                    const statLine = `age ${formatAgeDisplay(r.player.age)} \u00B7 ${skillLabel(r.player.batting)}/${skillLabel(r.player.bowling)} \u00B7 rank ${calculateRank(r.player, squadStats)}/10`;
+                    html += renderSellCandidateCard(i + 1, r.player, 0, ['Relative depth only \u2014 no actual development concern'], statLine);
+                });
+                return html;
+            }
             return `<div class="ftp-info-box success">
                 <div class="vj-fw-700">No youth sell candidates</div>
                 <div class="vj-text-xs vj-text-secondary vj-mt-4">All youth players are developing on track or ahead of the curve.</div>
             </div>`;
         }
 
-        let html = `<div class="vj-text-xs vj-text-muted vj-mb-4">Youth players behind the 16-20 development curve. ${scored.length} of ${youth.length} flagged.</div>`;
-        scored.forEach((r, i) => {
+        let html = `<div class="vj-text-xs vj-text-muted vj-mb-4">Youth players behind the 16-20 development curve. ${flagged.length} of ${youth.length} flagged.</div>`;
+        flagged.forEach((r, i) => {
             const statLine = `age ${Math.round(r.player.age)} \u00B7 ${skillLabel(r.player.batting)}/${skillLabel(r.player.bowling)}`;
             html += renderSellCandidateCard(i + 1, r.player, r.sellScore, r.reasons, statLine);
         });
