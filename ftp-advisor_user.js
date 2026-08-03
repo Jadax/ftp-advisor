@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         FTP Advisor
 // @namespace    http://tampermonkey.net/
-// @version      8.33
+// @version      8.34
 // @description  Comprehensive tactical advisor for From the Pavilion cricket game (v8.18: enhanced opponent scouting report, match-week rest scheduling, bowling allocation opponent-aware; v8.17: phase-specific batting tactics; v8.16: confidence scores, fixture integration; v7.0: full UI redesign)
 // @author       You
 // @license      MIT
@@ -379,6 +379,44 @@
     }
 
     /**
+     * Whether a talent actually pays off for THIS player, given their
+     * real role. User's own framing, and it's correct: a batsman with a
+     * bowling talent is not the same as that batsman with a batting
+     * talent — it rarely triggers, since he's picked and used for his
+     * batting. A mismatched role-specific talent should count for
+     * nothing, same as not having a talent at all — not a penalty, just
+     * no bonus. Generic talents (captaincy, fatigue recovery, fielding,
+     * broad training speed, Prodigy) always count regardless of role.
+     *
+     * Batting-relevant talents also apply to keepers — they have a real
+     * secondary batting duty (see keeperBattingMin's reasoning), so
+     * Opener/Skilled(Batting)/etc. genuinely help a keeper when he bats,
+     * unlike a specialist bowler who rarely does.
+     *
+     * Talents already gated individually elsewhere for a manual-
+     * confirmed reason (Seam/Spin Specialist — a BATTING matchup talent
+     * per the manual, gated to batting-primary in evaluateTransferTarget
+     * and calculateBattingScore) are left out of these two regexes on
+     * purpose so their existing, separately-reasoned gate isn't doubled
+     * up or overridden here.
+     */
+    const BATTING_RELEVANT_TALENTS = /skilled \(batting\)|skilled \(power\)|gifted \(batting\)|gifted \(power\)|^opener$|finisher|accumulator|boundary hitter/i;
+    const BOWLING_RELEVANT_TALENTS = /skilled \(bowling\)|gifted \(bowling\)|new ball bowler|old ball bowler|wrongun|flipper|swing|bouncer|yorker|slower ball|arm ball|doosra/i;
+    function isTalentRoleAligned(talentText, primaryName) {
+        if (BATTING_RELEVANT_TALENTS.test(talentText)) return primaryName === 'batting' || primaryName === 'keeping';
+        if (BOWLING_RELEVANT_TALENTS.test(talentText)) return primaryName === 'bowling';
+        return true; // generic, or handled by its own dedicated gate elsewhere
+    }
+    // Talent count for scoring contexts that just need "how many talents
+    // actually matter here" (calculateRank, computePlayerValueSkillSum) —
+    // a mismatched role-specific talent doesn't count, matching the
+    // reasoning above.
+    function countAlignedTalents(player) {
+        const primaryName = getPrimarySkillInfo(player).name;
+        return (player.talents || []).filter(t => isTalentRoleAligned(t, primaryName)).length;
+    }
+
+    /**
      * Role-aware, talent-aware "value" skill total for a wage-adjusted
      * skill/$K metric. Replaces a previous version that summed
      * batting+bowling+technique+fielding+endurance for EVERY player
@@ -416,12 +454,18 @@
         sum += player.endurance || 0;
         if (primaryInfo.name === 'keeping') sum += (player.batting || 0) * 0.5;
 
+        // Role-aligned only — a mismatched role-specific talent (e.g.
+        // "Skilled (Bowling)" on a specialist batsman) is worth the same
+        // as no talent at all here, same reasoning as calculateRank's
+        // talent score. See isTalentRoleAligned().
         const talents = player.talents || [];
         const isYouth = (player.age || 0) < 21;
-        if (talents.some(t => /prodigy/i.test(t)) && isYouth) sum += 3;
-        if (talents.some(t => /skilled/i.test(t))) sum += 2;
-        if (talents.some(t => /gifted/i.test(t)) && isYouth) sum += 1;
-        if (talents.some(t => /new ball bowler|old ball bowler|^opener$|finisher|safe hands|natural leader/i.test(t))) sum += 1;
+        const aligned = (re) => talents.some(t => re.test(t) && isTalentRoleAligned(t, primaryInfo.name));
+        if (talents.some(t => /prodigy/i.test(t)) && isYouth) sum += 3; // generic — all skills
+        if (aligned(/skilled/i)) sum += 2;
+        if (aligned(/gifted/i) && isYouth) sum += 1;
+        if (aligned(/new ball bowler|old ball bowler|^opener$|finisher/i)) sum += 1;
+        if (talents.some(t => /safe hands|natural leader/i.test(t))) sum += 1; // generic — captaincy/fielding
 
         return sum;
     }
@@ -1594,24 +1638,38 @@
             else if (age === 19) { /* neutral — 1 year left */ }
             else if (age === 20) { score -= 1; warnings.push(`Age ${age} — final youth year, limited development time`); }
 
-            // Talent bonuses — training talents matter MORE for youth
+            // Talent bonuses — training talents matter MORE for youth.
+            // Role-gated the same way as the senior branch below (added
+            // here to match — this branch previously gave Gifted(Batting/
+            // Bowling) and New/Old Ball Bowler/Opener/Finisher full credit
+            // regardless of the player's actual role, which the senior
+            // branch already got right). A mismatched role-specific
+            // talent counts for nothing, same as not having it.
             const talents = player.talents || [];
             const hasTalent = (regex) => talents.some(t => regex.test(t));
+            const primaryName = getPrimarySkillInfo(player).name;
+            const battingRelevant = primaryName === 'batting' || primaryName === 'keeping';
             if (hasTalent(/prodigy/i)) { score += 4; strengths.push('Prodigy — trains ALL skills faster (HIGH VALUE at this age)'); }
-            if (hasTalent(/gifted.*batting/i)) { score += 2; strengths.push('Gifted (Batting) — trains batting faster'); }
-            if (hasTalent(/gifted.*bowling/i)) { score += 2; strengths.push('Gifted (Bowling) — trains bowling faster'); }
+            if (hasTalent(/gifted.*batting/i)) {
+                if (battingRelevant) { score += 2; strengths.push('Gifted (Batting) — trains batting faster'); }
+                else warnings.push('Gifted (Batting) present but primary role is ' + primaryName + ' — limited practical value');
+            }
+            if (hasTalent(/gifted.*bowling/i)) {
+                if (primaryName === 'bowling') { score += 2; strengths.push('Gifted (Bowling) — trains bowling faster'); }
+                else warnings.push('Gifted (Bowling) present but primary role is ' + primaryName + ' — limited practical value');
+            }
             if (hasTalent(/gifted.*technique/i)) { score += 2; strengths.push('Gifted (Technique) — trains technique faster'); }
             if (hasTalent(/gifted.*fielding/i)) { score += 1; strengths.push('Gifted (Fielding) — trains fielding faster'); }
             if (hasTalent(/gifted.*endurance/i)) { score += 1; strengths.push('Gifted (Endurance) — trains endurance faster'); }
-            if (hasTalent(/gifted.*power/i)) { score += 1; strengths.push('Gifted (Power) — trains power faster'); }
+            if (hasTalent(/gifted.*power/i) && battingRelevant) { score += 1; strengths.push('Gifted (Power) — trains power faster'); }
             if (hasTalent(/natural leader/i)) { score += 1; strengths.push('Natural Leader — captaincy bonus'); }
             if (hasTalent(/sturdy/i)) { score += 1; strengths.push('Sturdy — recovers from fatigue faster'); }
 
             // Role-specific talents (immediate value even for youth)
-            if (hasTalent(/new ball bowler/i)) { score += 1; strengths.push('New Ball Bowler — opens bowling'); }
-            if (hasTalent(/old ball bowler/i)) { score += 1; strengths.push('Old Ball Bowler — death overs specialist'); }
-            if (hasTalent(/^opener$/i)) { score += 1; strengths.push('Opener — bats at top of order'); }
-            if (hasTalent(/finisher/i)) { score += 1; strengths.push('Finisher — end-of-innings specialist'); }
+            if (hasTalent(/new ball bowler/i) && primaryName === 'bowling') { score += 1; strengths.push('New Ball Bowler — opens bowling'); }
+            if (hasTalent(/old ball bowler/i) && primaryName === 'bowling') { score += 1; strengths.push('Old Ball Bowler — death overs specialist'); }
+            if (hasTalent(/^opener$/i) && battingRelevant) { score += 1; strengths.push('Opener — bats at top of order'); }
+            if (hasTalent(/finisher/i) && battingRelevant) { score += 1; strengths.push('Finisher — end-of-innings specialist'); }
             // Batting matchup talents (official manual: "performs better
             // when batting against seam/spin bowlers") — only meaningful
             // for a player whose primary skill is batting.
@@ -1724,18 +1782,39 @@
         // benefit once senior, not just "less" — so no score bonus here
         // (a senior scoring well elsewhere isn't helped by a stale Prodigy tag).
         if (hasTalent(/prodigy/i)) { strengths.push('Prodigy (no training benefit now senior, but confirms elite youth potential)'); }
-        if (hasTalent(/gifted.*batting/i)) { score += 1; strengths.push('Gifted (Batting) — trains batting faster'); }
-        if (hasTalent(/gifted.*bowling/i)) { score += 1; strengths.push('Gifted (Bowling) — trains bowling faster'); }
+        // Gifted (Batting/Power) only pays off if this player will
+        // actually train/use batting — i.e. batting or keeping primary
+        // (keepers have a real secondary batting duty, see
+        // keeperBattingMin). A specialist bowler with "Gifted (Batting)"
+        // is very unlikely to ever prioritise batting training, so the
+        // talent is largely wasted on him — same reasoning throughout
+        // this block, and the user's own framing: a mismatched role-
+        // specific talent is worth the same as no talent at all.
+        const battingRelevant = primaryName === 'batting' || primaryName === 'keeping';
+        if (hasTalent(/gifted.*batting/i)) {
+            if (battingRelevant) { score += 1; strengths.push('Gifted (Batting) — trains batting faster'); }
+            else warnings.push('Gifted (Batting) present but primary role is ' + primaryName + ' — limited practical value');
+        }
+        if (hasTalent(/gifted.*bowling/i)) {
+            if (primaryName === 'bowling') { score += 1; strengths.push('Gifted (Bowling) — trains bowling faster'); }
+            else warnings.push('Gifted (Bowling) present but primary role is ' + primaryName + ' — limited practical value');
+        }
         if (hasTalent(/gifted.*technique/i)) { score += 1; strengths.push('Gifted (Technique) — trains technique faster'); }
         if (hasTalent(/gifted.*fielding/i)) { strengths.push('Gifted (Fielding) — trains fielding faster'); }
         if (hasTalent(/gifted.*endurance/i)) { strengths.push('Gifted (Endurance) — trains endurance faster'); }
-        if (hasTalent(/gifted.*power/i)) { strengths.push('Gifted (Power) — trains power faster'); }
+        if (hasTalent(/gifted.*power/i) && battingRelevant) { strengths.push('Gifted (Power) — trains power faster'); }
 
         // Match performance talents (immediate value)
-        if (hasTalent(/skilled.*batting/i)) { score += 1; strengths.push('Skilled (Batting) — bonus during matches'); }
-        if (hasTalent(/skilled.*bowling/i)) { score += 1; strengths.push('Skilled (Bowling) — bonus during matches'); }
+        if (hasTalent(/skilled.*batting/i)) {
+            if (battingRelevant) { score += 1; strengths.push('Skilled (Batting) — bonus during matches'); }
+            else warnings.push('Skilled (Batting) present but primary role is ' + primaryName + ' — rarely triggers');
+        }
+        if (hasTalent(/skilled.*bowling/i)) {
+            if (primaryName === 'bowling') { score += 1; strengths.push('Skilled (Bowling) — bonus during matches'); }
+            else warnings.push('Skilled (Bowling) present but primary role is ' + primaryName + ' — rarely triggers');
+        }
         if (hasTalent(/skilled.*technique/i)) { score += 1; strengths.push('Skilled (Technique) — bonus during matches'); }
-        if (hasTalent(/skilled.*power/i)) { score += 1; strengths.push('Skilled (Power) — bonus during matches'); }
+        if (hasTalent(/skilled.*power/i) && battingRelevant) { score += 1; strengths.push('Skilled (Power) — bonus during matches'); }
         if (hasTalent(/natural leader/i)) { score += 1; strengths.push('Natural Leader — captaincy bonus during matches'); }
         if (hasTalent(/sturdy/i)) { score += 1; strengths.push('Sturdy — recovers from fatigue faster'); }
 
@@ -1870,10 +1949,12 @@
             ageScore = (age >= 24 && age <= 26) ? 1.5 : (age >= 22 && age <= 23) ? 1.0 : (age <= 21) ? 0.8 : 0.3;
         }
 
-        // 4. Talents (0-1 point)
-        const talents = player.talents || [];
-        const talentCount = talents.length;
-        const talentScore = Math.min(1, talentCount * 0.25);
+        // 4. Talents (0-1 point) — role-aligned count, not raw count.
+        // A "Skilled (Bowling)" talent on a specialist batsman rarely
+        // triggers and shouldn't rank him the same as a batsman whose
+        // talents actually match what he's picked for — see
+        // isTalentRoleAligned()/countAlignedTalents().
+        const talentScore = Math.min(1, countAlignedTalents(player) * 0.25);
 
         // 5. Squad fit (0-0.5 points)
         let fitScore = 0;
