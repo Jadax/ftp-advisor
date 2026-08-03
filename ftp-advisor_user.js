@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         FTP Advisor
 // @namespace    http://tampermonkey.net/
-// @version      8.35
+// @version      8.36
 // @description  Comprehensive tactical advisor for From the Pavilion cricket game (v8.18: enhanced opponent scouting report, match-week rest scheduling, bowling allocation opponent-aware; v8.17: phase-specific batting tactics; v8.16: confidence scores, fixture integration; v7.0: full UI redesign)
 // @author       You
 // @license      MIT
@@ -8396,6 +8396,26 @@ table.ftp-table {
                 else if (pageType === 'youthrecruit') updateYouthRecruitAdvisor();
                 else if (pageType === 'club') updateClubStatusUI();
                 else if (pageType === 'squad') updateSquadAdvisor();
+                // REAL BUG (found via user report): transfer.htm and
+                // player.htm both DO trigger this same background
+                // fetchAllData() call (any pageType !== 'squad' does),
+                // but neither was in this re-render list — so
+                // updateTransferAdvisor()/updatePlayerAdvisor() only ever
+                // ran ONCE, synchronously, against whatever was already
+                // in the cache at page-load, before the fresh fetch below
+                // had a chance to complete. If your squad cache was even
+                // a little stale (e.g. a player's bat/bowl balance shifted
+                // from training since the last fetch), the transfer
+                // advisor's squad-peer comparison (comparePlayerToSquadPeers)
+                // and the Player Advisor's verdict would silently keep
+                // using the OLD numbers even after fresh data landed in
+                // the cache seconds later — this is what caused "you have
+                // no current batter" to persist even with real batters in
+                // the squad, independent of the getPrimarySkillInfo tie-
+                // break fix (v8.35), which only fixed a different, narrower
+                // case (skill data reading exactly 0/0).
+                else if (pageType === 'transfer') updateTransferAdvisor();
+                else if (pageType === 'player') updatePlayerAdvisor();
             }).catch(e => console.warn('[FTP Advisor] Background refresh failed:', e));
         }
 
