@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         FTP Advisor
 // @namespace    http://tampermonkey.net/
-// @version      8.44
+// @version      8.45
 // @description  Comprehensive tactical advisor for From the Pavilion cricket game (v8.18: enhanced opponent scouting report, match-week rest scheduling, bowling allocation opponent-aware; v8.17: phase-specific batting tactics; v8.16: confidence scores, fixture integration; v7.0: full UI redesign)
 // @author       You
 // @license      MIT
@@ -2434,7 +2434,24 @@
              || !existingSquadCache.players.some(p => (p.batting || 0) > 0 || (p.bowling || 0) > 0 || (p.fielding || 0) > 0)
              || existingSquadCache.players.some(p => (p.isSenior || p.isYouth) &&
                 (p.batting || 0) === 0 && (p.bowling || 0) === 0 && (p.fielding || 0) === 0)));
-        if (force || isStale(CACHE_TIMESTAMP_KEY, STALE_SQUAD_HOURS) || squadCacheCorrupted) {
+        // v8.45 — user reported the empty-cache symptom persisting even
+        // after confirming v8.44 was installed (ruling out a stale-script
+        // explanation). The v8.42 fix above only forces a refetch when
+        // `existingSquadCache` is a real object with an empty/corrupted
+        // `players` array — but `existingSquadCache &&` short-circuits to
+        // "not corrupted" whenever `loadPlayerCache()` returns null
+        // outright (data key missing/unparseable). If the DATA write in
+        // `_saveCache()` ever fails/throws (quota, serialization issue)
+        // while a PREVIOUS successful save already wrote a recent
+        // timestamp, `isStale()` would read that old-but-recent timestamp
+        // and report "not stale" even though the actual cached data is
+        // now unreadable — the exact desync that would reproduce this
+        // symptom while looking identical to "all data is fresh" in the
+        // console. Also forcing a refetch whenever the cache fails to
+        // load at all closes that gap; this is purely additive (only ever
+        // adds a refetch trigger, never removes one) so it can't regress
+        // the cases already fixed.
+        if (force || isStale(CACHE_TIMESTAMP_KEY, STALE_SQUAD_HOURS) || squadCacheCorrupted || !existingSquadCache) {
             labels.push('squad');
             promises.push(
                 fetchSquadFromPage(`https://www.fromthepavilion.org/seniors.htm?squadViewId=2&teamId=${TEAM_ID}`)
@@ -7345,6 +7362,19 @@ table.ftp-table {
                 // Logging this unconditionally on every pass removes that
                 // race entirely — whichever render the user is looking at,
                 // its own console output is right above it.
+                // v8.45 — this now also logs the RAW cache state
+                // (cache === null vs cache.players.length) so a future
+                // report can immediately tell apart three previously-
+                // indistinguishable scenarios that all produce the same
+                // "seniorPlayers is EMPTY" symptom: (1) loadPlayerCache()
+                // returned null (data never saved, or unreadable), (2)
+                // cache exists but players array is genuinely empty, (3)
+                // cache has real players but all of them fail the
+                // age>=21 filter (which would point at an age-parsing bug
+                // instead of a cache problem, and hasn't been ruled out
+                // yet since the old log only ever showed the already-
+                // filtered seniorPlayers.length).
+                console.log(`[FTP Transfer] Raw squad cache: ${cache === null ? 'NULL (loadPlayerCache() returned nothing)' : `present, ${allPlayers.length} total players (all ages)`}`);
                 console.log(`[FTP Transfer] Senior squad (age>=21, ${seniorPlayers.length} players) role counts — ` +
                     `batters: ${seniorPlayers.filter(p => getPrimarySkillInfo(p).name === 'batting').length}, ` +
                     `bowlers: ${seniorPlayers.filter(p => getPrimarySkillInfo(p).name === 'bowling').length}, ` +
