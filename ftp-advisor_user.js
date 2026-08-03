@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         FTP Advisor
 // @namespace    http://tampermonkey.net/
-// @version      8.42
+// @version      8.43
 // @description  Comprehensive tactical advisor for From the Pavilion cricket game (v8.18: enhanced opponent scouting report, match-week rest scheduling, bowling allocation opponent-aware; v8.17: phase-specific batting tactics; v8.16: confidence scores, fixture integration; v7.0: full UI redesign)
 // @author       You
 // @license      MIT
@@ -1750,8 +1750,31 @@
             // Batting matchup talents (official manual: "performs better
             // when batting against seam/spin bowlers") — only meaningful
             // for a player whose primary skill is batting.
-            if (hasTalent(/seam specialist/i) && (player.batting || 0) >= (player.bowling || 0)) { score += 1; strengths.push('Seam Specialist — better batting vs seam'); }
-            if (hasTalent(/spin specialist/i) && (player.batting || 0) >= (player.bowling || 0)) { score += 1; strengths.push('Spin Specialist — better batting vs spin'); }
+            if (hasTalent(/seam specialist/i)) {
+                if ((player.batting || 0) >= (player.bowling || 0)) { score += 1; strengths.push('Seam Specialist — better batting vs seam'); }
+                else warnings.push('Seam Specialist present but primary role is ' + primaryName + ' — a batting matchup talent, rarely triggers');
+            }
+            if (hasTalent(/spin specialist/i)) {
+                if ((player.batting || 0) >= (player.bowling || 0)) { score += 1; strengths.push('Spin Specialist — better batting vs spin'); }
+                else warnings.push('Spin Specialist present but primary role is ' + primaryName + ' — a batting matchup talent, rarely triggers');
+            }
+            // Generic fallback for role-specific talents without their own
+            // hand-written strength/warning pair above (Opener, Finisher,
+            // Accumulator, Boundary Hitter, New/Old Ball Bowler, the
+            // triggered delivery talents) — reuses isTalentRoleAligned(),
+            // the same source of truth already driving their scoring in
+            // calculateRank()/computePlayerValueSkillSum(), so a mismatch
+            // here can't silently drift out of sync with those. Without
+            // this, a mismatched Accumulator/Finisher/etc. was previously
+            // dropped with zero explanation, unlike Gifted/Skilled
+            // (Batting/Bowling) which already explain themselves below.
+            const ALREADY_EXPLAINED_TALENTS = /gifted \(batting\)|gifted \(bowling\)|skilled \(batting\)|skilled \(bowling\)/i;
+            talents.forEach(t => {
+                if (ALREADY_EXPLAINED_TALENTS.test(t)) return;
+                if (!isTalentRoleAligned(t, primaryName)) {
+                    warnings.push(`${t} present but primary role is ${primaryName} — mismatched, contributes nothing`);
+                }
+            });
 
             // "The base" — age-specific primary/technique/experience/
             // fielding minimums (rating for youth). HARD FILTER: must
@@ -1912,15 +1935,29 @@
         // manual: "performs better than normal when batting against
         // seam/spin bowlers") — only meaningful for a player who
         // actually bats, same gating as Opener/Finisher above.
-        if (hasTalent(/seam specialist/i) && primaryName === 'batting') {
-            score += 1; strengths.push('Seam Specialist — performs better batting against seam bowling');
+        if (hasTalent(/seam specialist/i)) {
+            if (primaryName === 'batting') { score += 1; strengths.push('Seam Specialist — performs better batting against seam bowling'); }
+            else warnings.push('Seam Specialist present but primary role is ' + primaryName + ' — a batting matchup talent, rarely triggers');
         }
-        if (hasTalent(/spin specialist/i) && primaryName === 'batting') {
-            score += 1; strengths.push('Spin Specialist — performs better batting against spin bowling');
+        if (hasTalent(/spin specialist/i)) {
+            if (primaryName === 'batting') { score += 1; strengths.push('Spin Specialist — performs better batting against spin bowling'); }
+            else warnings.push('Spin Specialist present but primary role is ' + primaryName + ' — a batting matchup talent, rarely triggers');
         }
         if (hasTalent(/safe hands/i)) {
             score += 1; strengths.push('Safe Hands — fielding/keeping bonus');
         }
+        // Generic fallback for role-specific talents without their own
+        // hand-written strength/warning pair above (Opener, Finisher,
+        // New/Old Ball Bowler, the triggered delivery talents) — see the
+        // matching comment in the youth branch above for why this reuses
+        // isTalentRoleAligned() instead of hand-checking each talent name.
+        const ALREADY_EXPLAINED_TALENTS = /gifted \(batting\)|gifted \(bowling\)|skilled \(batting\)|skilled \(bowling\)/i;
+        talents.forEach(t => {
+            if (ALREADY_EXPLAINED_TALENTS.test(t)) return;
+            if (!isTalentRoleAligned(t, primaryName)) {
+                warnings.push(`${t} present but primary role is ${primaryName} — mismatched, contributes nothing`);
+            }
+        });
 
         // Age penalty — peak at 25-27, decline starts 28+
         if (age >= 30) { score -= 3; warnings.push(`Age ${age} — past prime, skills declining`); }
