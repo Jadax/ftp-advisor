@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         FTP Advisor
 // @namespace    http://tampermonkey.net/
-// @version      8.41
+// @version      8.42
 // @description  Comprehensive tactical advisor for From the Pavilion cricket game (v8.18: enhanced opponent scouting report, match-week rest scheduling, bowling allocation opponent-aware; v8.17: phase-specific batting tactics; v8.16: confidence scores, fixture integration; v7.0: full UI redesign)
 // @author       You
 // @license      MIT
@@ -2374,8 +2374,27 @@
         // youth player missing ALL three core stats simultaneously is
         // treated the same as a fully-corrupted cache.
         const existingSquadCache = loadPlayerCache();
-        const squadCacheCorrupted = !!(existingSquadCache && existingSquadCache.players.length > 0 &&
-            (!existingSquadCache.players.some(p => (p.batting || 0) > 0 || (p.bowling || 0) > 0 || (p.fielding || 0) > 0)
+        // REAL BUG (found via a user report of a recurring false "no
+        // current senior bowler/batter" squad-gap): this whole check used
+        // to require `existingSquadCache.players.length > 0` as a
+        // precondition — so a cache that had become a genuinely EMPTY
+        // array (0 players, confirmed live via the [FTP Transfer] Senior
+        // squad role-count diagnostic showing "0 players" / "seniorPlayers
+        // is EMPTY") was NEVER treated as corrupted, since the `.length >
+        // 0` guard short-circuited the whole expression to false before
+        // even reaching the corruption checks below. Combined with a
+        // freshly-written timestamp (isStale() also false — "All data is
+        // fresh"), this let a fully-empty squad cache persist indefinitely
+        // with nothing to self-heal it, even though the user's actual live
+        // squad clearly has players. Exactly how the cache first became an
+        // empty array (a transient fetch hiccup that wrote `[]` before an
+        // earlier version of this code existed, or similar) is now moot —
+        // the real fix is making sure it can never get PERMANENTLY stuck
+        // that way again. Now an empty-but-present cache object is treated
+        // the same as a fully-zeroed one.
+        const squadCacheCorrupted = !!(existingSquadCache &&
+            (existingSquadCache.players.length === 0
+             || !existingSquadCache.players.some(p => (p.batting || 0) > 0 || (p.bowling || 0) > 0 || (p.fielding || 0) > 0)
              || existingSquadCache.players.some(p => (p.isSenior || p.isYouth) &&
                 (p.batting || 0) === 0 && (p.bowling || 0) === 0 && (p.fielding || 0) === 0)));
         if (force || isStale(CACHE_TIMESTAMP_KEY, STALE_SQUAD_HOURS) || squadCacheCorrupted) {
