@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         FTP Advisor
 // @namespace    http://tampermonkey.net/
-// @version      8.39
+// @version      8.40
 // @description  Comprehensive tactical advisor for From the Pavilion cricket game (v8.18: enhanced opponent scouting report, match-week rest scheduling, bowling allocation opponent-aware; v8.17: phase-specific batting tactics; v8.16: confidence scores, fixture integration; v7.0: full UI redesign)
 // @author       You
 // @license      MIT
@@ -484,6 +484,74 @@
     function computePlayerValuePerK(player) {
         if (!player || !player.wage || player.wage <= 0) return null;
         return computePlayerValueSkillSum(player) / (player.wage / 1000);
+    }
+
+    // Shared by projectYouthToAge20() and computePlayerCeiling() so "weeks
+    // until this youth turns 20" lives in exactly one formula instead of
+    // two copies quietly drifting apart (the exact class of bug the
+    // AGE_SKILL_EXPECTATIONS/YOUTH_DEV_CURVE duplication was, removed
+    // v8.21 — see the Map section).
+    function weeksToAge20(age) {
+        return Math.ceil((20 - (age || 16)) * 14);
+    }
+
+    // Community-consensus assessment thresholds for a projected primary
+    // skill at age 20 — Expert(9)+ = excellent, Accomplished(8) = strong,
+    // Reliable(7) = adequate, below = likely won't contribute. Shared by
+    // projectYouthToAge20() and the Transfer Advisor's candidate cards so
+    // both label a given projected value identically.
+    function classifyProjectedPrimary(value) {
+        if (value >= 10) return 'outstanding';
+        if (value >= 9) return 'expert';
+        if (value >= 8) return 'accomplished';
+        if (value >= 7) return 'reliable';
+        return 'below-target';
+    }
+
+    /**
+     * "Dynasty Score" — a single current-vs-ceiling figure combining
+     * everything computePlayerValueSkillSum() already accounts for (role,
+     * talents) with how far THIS specific player could still realistically
+     * grow given their real age, real academy speed, and the same staged
+     * training logic the Training Potential panel already simulates
+     * (simulateAdaptiveTrainingPlan — not a new model, reused as-is).
+     *
+     * Explicitly requested: one number usable to compare a squad player
+     * against a market candidate, accounting for age/academy/training
+     * rather than just current stats — because a cheaper, currently-weaker
+     * 17yo can still be the better long-term signing than an already-
+     * peaked 26yo. current/ceiling are both computePlayerValueSkillSum()
+     * outputs (same units, safely comparable) — current is "what you get
+     * today", ceiling is "what they could realistically become".
+     *
+     * Horizon depends on age, since there's no fixed development window
+     * once senior: youth (<20) project to the real age-20 promotion
+     * boundary via projectYouthToAge20()'s own math (weeksToAge20());
+     * 20-29 get a real 2 age-year outlook; 30+ get 1 age-year — training
+     * still works past 30 (the age multiplier curve already accounts for
+     * slower gains), it's ACTIVE SKILL DECLINE from 30+ that isn't
+     * modeled (no confirmed rate — see the age-30 gotcha), so a short
+     * forward projection there is still meaningful, just not a substitute
+     * for judging an aging player mainly on current output.
+     *
+     * Unlike projectYouthToAge20() (which discards the plan and only
+     * returns final skills + a verdict label), this returns the full
+     * `plan` object too — callers that also need the week-by-week
+     * timeline (the Player Advisor's training grid) can reuse it instead
+     * of re-simulating.
+     */
+    function computePlayerCeiling(player, academySpeed, squadContext) {
+        const age = player.age || 0;
+        const isYouth = age < 20;
+        const weeks = isYouth ? weeksToAge20(age) : (age >= 30 ? 14 : 28);
+        const label = isYouth ? 'to age 20' : (age >= 30 ? '1 age-year outlook' : '2 age-year outlook');
+        const plan = simulateAdaptiveTrainingPlan(player, weeks, academySpeed, squadContext);
+        const projectedSkills = Object.assign({}, player, plan.finalSkills);
+        return {
+            current: computePlayerValueSkillSum(player),
+            ceiling: computePlayerValueSkillSum(projectedSkills),
+            weeks, label, projectedSkills, plan
+        };
     }
 
     // ============================================================
@@ -5529,25 +5597,16 @@ table.ftp-table {
     function projectYouthToAge20(player, academySpeed) {
         const currentAge = player.age || 16;
         if (currentAge >= 20) return null; // already at final youth year
-        const weeksToAge20 = Math.ceil((20 - currentAge) * 14);
+        const weeks = weeksToAge20(currentAge);
         // Use the adaptive training plan to project — it re-runs the
         // recommendation engine each week, which is the most accurate
         // simulation we have.
-        const plan = simulateAdaptiveTrainingPlan(player, weeksToAge20, academySpeed, null);
+        const plan = simulateAdaptiveTrainingPlan(player, weeks, academySpeed, null);
         if (!plan) return null;
         const projected = plan.finalSkills;
         const primaryInfo = getPrimarySkillInfo(projected);
         const primaryAt20 = primaryInfo.value;
-        // Assessment thresholds based on community consensus:
-        // Expert(9)+ by 20 = excellent, Accomplished(8) = strong,
-        // Reliable(7) = adequate, below = likely won't contribute
-        let verdict;
-        if (primaryAt20 >= 10) verdict = 'outstanding';
-        else if (primaryAt20 >= 9) verdict = 'expert';
-        else if (primaryAt20 >= 8) verdict = 'accomplished';
-        else if (primaryAt20 >= 7) verdict = 'reliable';
-        else verdict = 'below-target';
-        return { projected, verdict, weeksToAge20, primaryAt20 };
+        return { projected, verdict: classifyProjectedPrimary(primaryAt20), weeksToAge20: weeks, primaryAt20 };
     }
 
     /**
@@ -7206,6 +7265,10 @@ table.ftp-table {
                         // the canonical helper used by the training page
                         // and Player Advisor, so all three now agree.
                         const academyInfoForProjection = loadAcademyCache();
+                        // Squad size for the training-speed squad-penalty
+                        // multiplier — same shape squadContext takes
+                        // everywhere else (Player Advisor, Training page).
+                        const squadContextForProjection = { size: seniorPlayers.length + youthPlayers.length, academyInfo: academyInfoForProjection, financeInfo: loadFinanceCache() };
 
                         players.forEach((p, i) => {
                             const ev = p.eval;
@@ -7213,13 +7276,23 @@ table.ftp-table {
                             const primaryInfo = getPrimarySkillInfo(p);
                             const primarySkill = primaryInfo.value;
                             const primaryName = primaryInfo.name === 'keeping' ? 'Keep' : primaryInfo.name === 'bowling' ? 'Bowl' : 'Bat';
+                            // Dynasty Score — current vs age/academy/training
+                            // -aware ceiling, same computePlayerCeiling() used
+                            // on the Player Advisor and sell lists, so a
+                            // market candidate and a squad player are always
+                            // comparable in the same units. Computed once per
+                            // candidate here and reused below for the youth
+                            // "Projected at 20" detail line instead of a
+                            // second simulateAdaptiveTrainingPlan() call.
+                            const ceilingResult = computePlayerCeiling(p, getAcademySpeedForPlayer(p, academyInfoForProjection), squadContextForProjection);
 
                             // Build detail line — show experience/wage only if fetched
                             const detailParts = [
                                 `${primaryName} ${skillLabel(primarySkill)}`,
                                 `Tech ${skillLabel(p.technique)}`,
                                 `Field ${skillLabel(p.fielding)}`,
-                                `End ${skillLabel(p.endurance)}`
+                                `End ${skillLabel(p.endurance)}`,
+                                `<span style="color:var(--vj-gold);">Dynasty ${ceilingResult.current.toFixed(1)}→${ceilingResult.ceiling.toFixed(1)}</span>`
                             ];
                             // Keeping isn't always primary but is always worth
                             // showing for any plausible keeper (Capable+) so
@@ -7269,16 +7342,16 @@ table.ftp-table {
                                 ${ev.warnings.length > 0 ? `<div class="vj-text-xs vj-text-muted" style="color:var(--vj-red);line-height:1.4;margin-top:2px;">\u26A0 ${ev.warnings.join(' \u00B7 ')}</div>` : ''}
                                 ${ev.strengths.length > 0 ? `<div class="vj-text-xs vj-text-muted" style="color:var(--vj-green);line-height:1.4;margin-top:2px;">\u2713 ${ev.strengths.join(' \u00B7 ')}</div>` : ''}
                                 ${(() => {
-                                    // Youth potential projection: show projected skills at age 20
-                                    if (Math.round(p.age) < 21 && Math.round(p.age) >= 16) {
-                                        const proj = projectYouthToAge20(p, getAcademySpeedForPlayer(p, academyInfoForProjection));
-                                        if (proj) {
-                                            const projPrimary = getPrimarySkillInfo(proj.projected);
-                                            const verdictColor = proj.verdict === 'outstanding' || proj.verdict === 'expert' ? 'var(--vj-green)' :
-                                                proj.verdict === 'accomplished' ? 'var(--vj-blue)' :
-                                                proj.verdict === 'reliable' ? 'var(--vj-gold)' : 'var(--vj-red)';
-                                            return `<div class="vj-text-xs" style="color:${verdictColor};line-height:1.4;margin-top:2px;">\ud83d\udd2e Projected at 20: ${projPrimary.name === 'keeping' ? 'Keep' : projPrimary.name === 'bowling' ? 'Bowl' : 'Bat'} ${skillLabel(projPrimary.value)} \u00B7 Tech ${skillLabel(proj.projected.technique)} \u00B7 Field ${skillLabel(proj.projected.fielding)} (${proj.verdict})</div>`;
-                                        }
+                                    // Youth potential projection: show projected skills at
+                                    // age 20, sourced from the SAME ceilingResult computed
+                                    // above (not a second simulation call).
+                                    if (p.age < 20) {
+                                        const projPrimary = getPrimarySkillInfo(ceilingResult.projectedSkills);
+                                        const verdict = classifyProjectedPrimary(projPrimary.value);
+                                        const verdictColor = verdict === 'outstanding' || verdict === 'expert' ? 'var(--vj-green)' :
+                                            verdict === 'accomplished' ? 'var(--vj-blue)' :
+                                            verdict === 'reliable' ? 'var(--vj-gold)' : 'var(--vj-red)';
+                                        return `<div class="vj-text-xs" style="color:${verdictColor};line-height:1.4;margin-top:2px;">\ud83d\udd2e Projected at 20: ${projPrimary.name === 'keeping' ? 'Keep' : projPrimary.name === 'bowling' ? 'Bowl' : 'Bat'} ${skillLabel(projPrimary.value)} \u00B7 Tech ${skillLabel(ceilingResult.projectedSkills.technique)} \u00B7 Field ${skillLabel(ceilingResult.projectedSkills.fielding)} (${verdict})</div>`;
                                     }
                                     return '';
                                 })()}
@@ -7537,6 +7610,12 @@ table.ftp-table {
         const avgPrimary = avg(seniors.map(p => ({...p, primary: getPrimarySkillInfo(p).value})), 'primary');
         const squadStats = computeSquadStats(players);
         const surplusMap = squadStats ? computeRoleSurplus(seniors, squadStats) : new Map();
+        // Dynasty Score inputs — same computePlayerCeiling() shared with
+        // the Player Advisor and Transfer Advisor, so "who's better" reads
+        // the same across squad and market. Computed once here, not per
+        // player, since academy/squad context doesn't vary per player.
+        const dynastyAcademyInfo = loadAcademyCache();
+        const dynastySquadContext = { size: players.length, academyInfo: dynastyAcademyInfo, financeInfo: loadFinanceCache() };
 
         const scored = seniors.map(p => {
             let sellScore = 0;
@@ -7610,7 +7689,17 @@ table.ftp-table {
                 else if (skillPerK >= 10) { sellScore -= 5; }
             }
 
-            return { player: p, sellScore, reasons, skillPerK };
+            // Dynasty Score (display only, like skillPerK above) — this
+            // player's realistic ceiling given their real age/academy
+            // speed, not just today's stats. Not folded into sellScore:
+            // a senior already close to their ceiling isn't a sell signal
+            // by itself, it's expected — the number is here so it reads
+            // consistently against the Player Advisor and transfer market
+            // when deciding whether a specific transfer target is really
+            // an upgrade over this player long-term, not just today.
+            const ceilingResult = computePlayerCeiling(p, getAcademySpeedForPlayer(p, dynastyAcademyInfo), dynastySquadContext);
+
+            return { player: p, sellScore, reasons, skillPerK, ceilingResult };
         }).sort((a, b) => b.sellScore - a.sellScore);
 
         // Show top sell candidates (those with sellScore > 0 = some reason to sell)
@@ -7629,10 +7718,11 @@ table.ftp-table {
         candidates.forEach((r, i) => {
             let statLine = `${formatAgeDisplay(r.player.age)} \u00B7 ${skillLabel(r.player.batting)}/${skillLabel(r.player.bowling)} \u00B7 R${r.player.rating || '?'}`;
             if (r.skillPerK != null) statLine += ` \u00B7 ${r.skillPerK.toFixed(1)} skill/$K`;
+            statLine += ` \u00B7 Dynasty ${r.ceilingResult.current.toFixed(1)}\u2192${r.ceilingResult.ceiling.toFixed(1)}`;
             html += renderSellCandidateCard(i + 1, r.player, r.sellScore, r.reasons, statLine);
         });
 
-        html += `<div class="vj-text-xs vj-text-muted vj-mt-4">Replace with transfers: prioritize fast bowlers, wrist spinners, and high-technique players aged 16-27.</div>`;
+        html += `<div class="vj-text-xs vj-text-muted vj-mt-4">Replace with transfers: prioritize fast bowlers, wrist spinners, and high-technique players aged 16-27. Compare a transfer target's Dynasty ceiling (shown on its market card) against this player's ceiling above, not just current stats \u2014 a younger replacement's ceiling matters more than their day-one numbers.</div>`;
         html += `<div class="ftp-alert info" style="margin-top:6px;"><span>\u2139</span><div><strong>Transfer settlement:</strong> Listing fee $1,000 (non-refundable). Settlement: 50% + (days in squad/2)% if <100 days, 100% if 100+ days. Bidding on your own player resets days-in-squad to 0.</div></div>`;
         return html;
     }
@@ -7658,6 +7748,12 @@ table.ftp-table {
         const youth = players.filter(p => p.isYouth);
         if (youth.length === 0) return '<div class="vj-text-sm vj-text-muted">No youth players found.</div>';
         const squadStats = computeSquadStats(players);
+        // Same computePlayerCeiling() inputs as the senior sell list and
+        // Player Advisor — this is exactly where "won't this youth's
+        // ceiling still fall short" gets answered with a real number
+        // instead of eyeballing the development curve alone.
+        const dynastyAcademyInfo = loadAcademyCache();
+        const dynastySquadContext = { size: players.length, academyInfo: dynastyAcademyInfo, financeInfo: loadFinanceCache() };
 
         const scored = youth.map(p => {
             let sellScore = 0;
@@ -7727,7 +7823,23 @@ table.ftp-table {
             // weaker signal \u2014 see youthTalentProtection().
             sellScore -= youthTalentProtection(p);
 
-            return { player: p, sellScore, reasons };
+            const ceilingResult = computePlayerCeiling(p, getAcademySpeedForPlayer(p, dynastyAcademyInfo), dynastySquadContext);
+            // A projected ceiling that still can't clear this role's
+            // current squad floor is a much stronger "won't catch up"
+            // signal than the curve-target checks above alone \u2014 those
+            // check position-relative-to-target today, this checks the
+            // realistic destination against players who'd actually compete
+            // for the spot.
+            const rolePeers = players.filter(sp => sp.age >= 21 && getPrimarySkillInfo(sp).name === getPrimarySkillInfo(p).name);
+            if (rolePeers.length > 0) {
+                const peerFloor = Math.min(...rolePeers.map(computePlayerValueSkillSum));
+                if (ceilingResult.ceiling < peerFloor) {
+                    sellScore += 12;
+                    reasons.push(`Projected ceiling (${ceilingResult.ceiling.toFixed(1)}) still below your weakest current senior ${getPrimarySkillInfo(p).name === 'keeping' ? 'keeper' : getPrimarySkillInfo(p).name === 'bowling' ? 'bowler' : 'batter'} (${peerFloor.toFixed(1)}) \u2014 unlikely to ever earn a senior spot here`);
+                }
+            }
+
+            return { player: p, sellScore, reasons, ceilingResult };
         }).sort((a, b) => b.sellScore - a.sellScore);
 
         const flagged = scored.filter(r => r.sellScore > 0);
@@ -7762,6 +7874,7 @@ table.ftp-table {
                     // it affected ranking here.
                     const valuePerK = computePlayerValuePerK(r.player);
                     if (valuePerK != null) statLine += ` \u00B7 ${valuePerK.toFixed(1)} skill/$K`;
+                    statLine += ` \u00B7 Dynasty ${r.ceilingResult.current.toFixed(1)}\u2192${r.ceilingResult.ceiling.toFixed(1)}`;
                     html += renderSellCandidateCard(i + 1, r.player, 0, ['Relative depth only \u2014 no actual development concern'], statLine);
                 });
                 return html;
@@ -7779,6 +7892,7 @@ table.ftp-table {
             // for why it's not folded into youth sellScore.
             const valuePerK = computePlayerValuePerK(r.player);
             if (valuePerK != null) statLine += ` \u00B7 ${valuePerK.toFixed(1)} skill/$K`;
+            statLine += ` \u00B7 Dynasty ${r.ceilingResult.current.toFixed(1)}\u2192${r.ceilingResult.ceiling.toFixed(1)}`;
             html += renderSellCandidateCard(i + 1, r.player, r.sellScore, r.reasons, statLine);
         });
 
@@ -8242,6 +8356,17 @@ table.ftp-table {
         const keepVerdict = evalResult.verdict === 'poor' || evalResult.verdict === 'weak' ? 'RELEASE' : 'KEEP';
         const badgeClass = keepVerdict === 'KEEP' ? 'green' : 'red';
 
+        // Computed once, up front, and reused by both the Dynasty Score
+        // line below AND the Training Potential panel further down — one
+        // simulateAdaptiveTrainingPlan() call per render, not two. See
+        // computePlayerCeiling()'s own doc comment for why current/ceiling
+        // (not value/$K) is the number that's actually safe to compare
+        // between a squad player and a market candidate of a different age.
+        const academyInfo = loadAcademyCache();
+        const academySpeed = getAcademySpeedForPlayer(player, academyInfo);
+        const squadContext = { size: squadPlayers.length, academyInfo, financeInfo: loadFinanceCache() };
+        const ceilingResult = computePlayerCeiling(player, academySpeed, squadContext);
+
         let html = `<div class="vj-flex-between vj-mb-4">
                 <span class="vj-fw-700" style="font-size:14px;">${player.name} <span class="vj-text-xs vj-text-muted">(${Math.round(player.age)}yo)</span></span>
                 <span class="ftp-stat-badge ${badgeClass}" style="font-size:13px;">${keepVerdict}</span>
@@ -8249,7 +8374,8 @@ table.ftp-table {
             <div class="vj-text-xs vj-text-muted vj-mb-4">Verdict: ${evalResult.verdict.toUpperCase()} · Rank ${rank}/10 · ${(() => { const pi = getPrimarySkillInfo(player); return pi.value ? (pi.name === 'keeping' ? 'Keep' : pi.name === 'bowling' ? 'Bowl' : 'Bat') + ' ' + skillLabel(pi.value) : ''; })()} · Tech ${skillLabel(player.technique)} · Field ${skillLabel(player.fielding)}${(() => {
                 const vpk = computePlayerValuePerK(player);
                 return vpk != null ? ` · ${vpk.toFixed(1)} skill/$K` : '';
-            })()}</div>`;
+            })()}</div>
+            <div class="vj-text-xs vj-mb-4"><span class="vj-fw-700">Dynasty Score:</span> ${ceilingResult.current.toFixed(1)} now → <span class="vj-fw-700" style="color:var(--vj-gold);">${ceilingResult.ceiling.toFixed(1)} ceiling</span> (${ceilingResult.label}, age/academy/training-aware — same units as the sell lists and transfer market, safe to compare across ages)</div>`;
 
         if (evalResult.strengths.length > 0) {
             html += `<div class="vj-text-xs vj-mt-4" style="color:var(--vj-green);">✓ ${evalResult.strengths.join(' · ')}</div>`;
@@ -8262,14 +8388,6 @@ table.ftp-table {
             if (yd) {
                 html += `<div class="vj-text-xs vj-mt-8"><span class="vj-fw-700">16-20 development curve:</span> ${yd.overallStatus === 'behind' ? '<span style="color:var(--vj-red);">Behind curve</span>' : '<span style="color:var(--vj-green);">On track</span>'}</div>`;
             }
-            // Value/$K is a CURRENT snapshot (skill vs today's wage) — it
-            // can't tell you whether this 17yo will outgrow a 25yo's
-            // current skill level, because it has no way to know the
-            // 17yo's future wage. That comparison is what the "Training
-            // Potential" projection below already answers (projected
-            // skills at 20) — pointed to here so the two numbers aren't
-            // read as contradictory or interchangeable.
-            html += `<div class="vj-text-xs vj-text-muted vj-mt-4">Value/$K above reflects skill vs TODAY's wage only — for whether this player could outgrow an older squadmate, compare the "Training Potential" projection below (skills at 20) against that player's current skills, not the $/K number.</div>`;
         }
         verdictEl.innerHTML = html;
 
@@ -8283,28 +8401,20 @@ table.ftp-table {
         // development window left for them.
         const trainingEl = document.getElementById('ftp-player-training');
         if (trainingEl) {
-            const academyInfo = loadAcademyCache();
-            const academySpeed = getAcademySpeedForPlayer(player, academyInfo);
-            const squadContext = { size: squadPlayers.length, academyInfo, financeInfo: loadFinanceCache() };
             const trainingRec = recommendTraining(player, squadContext);
             const academyNote = academyInfo ? `your current ${academyInfo.level} academy (${isYouth ? academyInfo.youthEfficiency : academyInfo.seniorEfficiency}% ${isYouth ? 'youth' : 'senior'} training efficiency)` : 'an unknown academy level (visit the Academy page to cache it for a more accurate estimate)';
 
             let tHtml = `<div class="vj-text-xs vj-text-muted vj-mb-4">Recommended now: <span class="vj-fw-700">${TRAINING_PROGRAM_LABELS[trainingRec.program] || trainingRec.program}</span>${trainingRec.projection && trainingRec.primarySkill ? ` — ${formatTrainingOutlook(trainingRec.projection, trainingRec.primarySkill, player[trainingRec.primarySkill])}` : ''}</div>`;
 
-            // 14 weeks per age-year (official manual + workbook's own
-            // Wk0-Wk14-per-age-column layout) — not 52. Youth horizon
-            // runs to age 20; senior/aging get a shorter, still-real
-            // window since there's no fixed development window left.
-            const planWeeks = isYouth ? Math.max(14, Math.round(Math.max(1, 20 - player.age) * 14)) : (player.age >= 30 ? 14 : 28);
-            const planLabel = isYouth ? 'Development plan to age 20' : (player.age >= 30 ? '1 age-year training outlook' : '2 age-year training outlook');
-
-            // Adaptive plan — the actual staged advice (fielding first,
-            // then primary skill for youth; maintenance-focused for
-            // aging players, etc), re-decided every simulated week via
-            // recommendTraining() itself. No single program is ever
-            // locked in for the whole horizon — nobody actually trains
-            // one skill for months, so this was removed as a comparison.
-            const plan = simulateAdaptiveTrainingPlan(player, planWeeks, academySpeed, squadContext);
+            // Reuses the plan and horizon already computed above for the
+            // Dynasty Score line — see computePlayerCeiling(). Derived
+            // from ceilingResult.label (not a separate isYouth ternary
+            // here) so the label can never disagree with the actual
+            // horizon/weeks the plan below was run for — a player right
+            // at the youth/senior boundary (e.g. 20.5yo) gets whichever
+            // branch computePlayerCeiling() actually used, consistently.
+            const planLabel = ceilingResult.label === 'to age 20' ? 'Development plan to age 20' : `${ceilingResult.label.replace('outlook', 'training outlook')}`;
+            const plan = ceilingResult.plan;
             tHtml += `<div class="vj-fw-700 vj-mb-4">${planLabel}</div>`;
             tHtml += `<div class="vj-text-xs vj-mb-4">${plan.timeline.map(t => `<span class="vj-fw-700">${TRAINING_PROGRAM_LABELS[t.program] || t.program}</span> (wk${t.fromWeek}${t.toWeek > t.fromWeek ? `-${t.toWeek}` : ''})`).join(' → ')}</div>`;
 
