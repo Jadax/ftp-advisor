@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         FTP Advisor
 // @namespace    http://tampermonkey.net/
-// @version      8.45
+// @version      8.46
 // @description  Comprehensive tactical advisor for From the Pavilion cricket game (v8.18: enhanced opponent scouting report, match-week rest scheduling, bowling allocation opponent-aware; v8.17: phase-specific batting tactics; v8.16: confidence scores, fixture integration; v7.0: full UI redesign)
 // @author       You
 // @license      MIT
@@ -2465,9 +2465,51 @@
                             fetchSquadSummaryView(`https://www.fromthepavilion.org/youths.htm?squadViewId=1&teamId=${TEAM_ID}`)
                         ]);
                         const existing = loadPlayerCache();
+                        // v8.46 — FOUND THE ACTUAL ROOT CAUSE of the "no
+                        // current senior X" saga (v8.35-v8.45 all fixed
+                        // real but different bugs; the raw-cache diagnostic
+                        // added in v8.45 finally proved this one): the
+                        // improved log showed "present, 13 total players"
+                        // for a user whose real squad is 16 seniors + 13
+                        // youths — the cache had silently become YOUTH-
+                        // ONLY. `fetchSquadFromPage(seniors.htm...)` above
+                        // has no `.catch()`, so if that request truly
+                        // rejects this whole `.then` never runs and the old
+                        // cache survives untouched — but if it RESOLVES
+                        // with a technically-valid response that just
+                        // parses to 0 rows (a transient markup/session
+                        // hiccup, no exception thrown), `seniors` is `[]`
+                        // and always was. `map` below used to be seeded
+                        // fresh from ONLY this round's `seniors`/`youth`
+                        // results — with youth.htm succeeding normally,
+                        // that silently replaced a real 16-player senior
+                        // squad with nothing, and nothing here ever fell
+                        // back to the previous cache for a role that came
+                        // back suspiciously empty (the existing fallback a
+                        // few lines down only re-seeds TALENTS onto players
+                        // already in `map`, it can't resurrect players that
+                        // never made it into `map` at all). Fixed the same
+                        // way opponent-talent fetches already protect
+                        // against this (v8.8): if either group comes back
+                        // empty while a real previous squad had players in
+                        // it, treat that as a failed fetch for that group
+                        // and keep the last known-good data instead of
+                        // wiping it.
+                        const existingPlayers = existing ? existing.players : [];
+                        const existingSeniors = existingPlayers.filter(p => p.isSenior);
+                        const existingYouth = existingPlayers.filter(p => p.isYouth);
+                        let seniorsToUse = seniors, youthToUse = youth;
+                        if (seniors.length === 0 && existingSeniors.length > 0) {
+                            console.warn(`[FTP Advisor] Senior squad fetch returned 0 players but the cache previously had ${existingSeniors.length} — treating as a failed fetch and keeping the last known-good senior data instead of wiping it.`);
+                            seniorsToUse = existingSeniors;
+                        }
+                        if (youth.length === 0 && existingYouth.length > 0) {
+                            console.warn(`[FTP Advisor] Youth squad fetch returned 0 players but the cache previously had ${existingYouth.length} — treating as a failed fetch and keeping the last known-good youth data instead of wiping it.`);
+                            youthToUse = existingYouth;
+                        }
                         const map = {};
-                        seniors.forEach(p => { map[p.id] = p; });
-                        youth.forEach(p => { if (!map[p.id]) map[p.id] = p; });
+                        seniorsToUse.forEach(p => { map[p.id] = p; });
+                        youthToUse.forEach(p => { if (!map[p.id]) map[p.id] = p; });
                         // Seed talents from the last known-good fetch before
                         // merging this round's summary-view result. If this
                         // round's squadViewId=1 fetch still failed after the
