@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         FTP Advisor
 // @namespace    http://tampermonkey.net/
-// @version      8.40
+// @version      8.41
 // @description  Comprehensive tactical advisor for From the Pavilion cricket game (v8.18: enhanced opponent scouting report, match-week rest scheduling, bowling allocation opponent-aware; v8.17: phase-specific batting tactics; v8.16: confidence scores, fixture integration; v7.0: full UI redesign)
 // @author       You
 // @license      MIT
@@ -3749,6 +3749,24 @@
             return hasSturdy ? maxPerSpell + 1 : maxPerSpell; // Sturdy: can bowl +1 over per spell
         }
 
+        // "A fresh, high-endurance bowler against the tail can work
+        // wonders" — real community bowling tactic (user-supplied,
+        // consistent with the manual's own "energy is partially
+        // replenished during drinks breaks" note already used for the
+        // v8.32 rest-across-break check). Endurance is already part of
+        // calculateBowlingScore's base formula, but WHO gets handed the
+        // death-overs slot was picked by raw skill rank alone — this adds
+        // a modest endurance-weighted nudge among genuinely death-capable
+        // candidates, not a skill override (max +8% for a Legendary(15)
+        // endurance bowler, same conservative-estimate philosophy as the
+        // unquantified triggered-talent bonuses elsewhere in this file).
+        // Shared by the 6+ and 5-bowler allocation paths so the formula
+        // lives in exactly one place.
+        function rankForDeathOvers(candidates) {
+            const deathScore = (b) => b.bowlScore * (1 + (b.endurance || 0) / 15 * 0.08);
+            return [...candidates].sort((a, b) => deathScore(b) - deathScore(a));
+        }
+
         const bowlers = lineup.filter(p => {
             const isKeeper = p.role === 'WK' || (p.keeping >= 4 && p.keeping > p.bowling);
             if (isKeeper) return false;
@@ -3831,6 +3849,19 @@
                     }
                 }
             }
+            // Death-overs freshness — re-pick sel[4]/sel[5] from a
+            // slightly wider pool (next few candidates after the
+            // openers/middle overs bowlers, not strictly the next-best
+            // skill rank) using rankForDeathOvers(). Runs BEFORE the Old
+            // Ball Bowler override below so a real talent match still
+            // wins over the generic endurance nudge.
+            const deathUsedIds = new Set([sel[0].id, sel[1].id, sel[2].id, sel[3].id]);
+            const deathPool = bowlers.filter(b => !deathUsedIds.has(b.id)).slice(0, 4);
+            if (deathPool.length >= 2) {
+                const rankedDeath = rankForDeathOvers(deathPool);
+                sel[4] = rankedDeath[0];
+                sel[5] = rankedDeath[1];
+            }
             // If we have an Old Ball Bowler talent, prioritize for death overs
             if (oldBallBowlers.length > 0) {
                 const closer = oldBallBowlers[0];
@@ -3868,10 +3899,12 @@
             let midBowler, deathBowler;
             if (pitchEffect.seam > 1.1) {
                 midBowler = bowlers.find(b => b.bowlerCategory === 'seam' && b.id !== shared.id && b.id !== bowlers[1].id) || bowlers[2];
-                deathBowler = bowlers.find(b => b.id !== shared.id && b.id !== bowlers[1].id && b.id !== midBowler.id) || bowlers[3];
             } else {
-                midBowler = bowlers[2]; deathBowler = bowlers[3];
+                midBowler = bowlers[2];
             }
+            // Death-overs freshness — see rankForDeathOvers().
+            const deathCandidates = bowlers.filter(b => b.id !== shared.id && b.id !== bowlers[1].id && b.id !== midBowler.id);
+            deathBowler = deathCandidates.length > 0 ? rankForDeathOvers(deathCandidates)[0] : bowlers[3];
 
             addSpellTo(gSpells, shared, Math.min(halfMax, perEnd), 'New ball', 'Gibson');
             addSpellTo(gSpells, midBowler, Math.min(maxPerSpell, perEnd - endTotal(gSpells)), 'Middle overs', 'Gibson');
@@ -4398,6 +4431,16 @@
                 html += `<div class="ftp-alert warning" style="margin-bottom:6px;"><span>⚠</span><div><strong>No rest across the drinks break:</strong> ${noRest.map(b => `${b.name} (${b.total} overs, all ${b.before === 0 ? 'after' : 'before'})`).join(', ')} — consider a shorter spell either side of the break instead of one long block, so they get a real rest window.</div></div>`;
             }
         }
+
+        // Endurance/freshness for the death overs (v8.41) — see
+        // rankForDeathOvers() in allocateBowlingSpells(): the plan above
+        // already leans toward a fresher, higher-endurance bowler for the
+        // closing spells where possible, since a bowler still firing at
+        // full effort late in the innings troubles the tail more than one
+        // who's been ground down by an earlier long spell. Shown here as
+        // a one-line explainer, not a separate recommendation, since it's
+        // baked into the allocation itself rather than a manual choice.
+        html += `<div class="vj-text-xs vj-text-muted vj-mb-4" style="text-align:center;">\u{1F4A8} Death-overs bowler selection favors freshness/endurance among close options — a sharp bowler against the tail beats a tired one with marginally better figures.</div>`;
 
         // Spell variety summary
         const seamerSpells = bowlingSpells.filter(s => s && s.player && s.player.bowlerCategory === 'seam');
