@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         FTP Advisor
 // @namespace    http://tampermonkey.net/
-// @version      8.46
+// @version      8.47
 // @description  Comprehensive tactical advisor for From the Pavilion cricket game (v8.18: enhanced opponent scouting report, match-week rest scheduling, bowling allocation opponent-aware; v8.17: phase-specific batting tactics; v8.16: confidence scores, fixture integration; v7.0: full UI redesign)
 // @author       You
 // @license      MIT
@@ -2433,7 +2433,21 @@
             (existingSquadCache.players.length === 0
              || !existingSquadCache.players.some(p => (p.batting || 0) > 0 || (p.bowling || 0) > 0 || (p.fielding || 0) > 0)
              || existingSquadCache.players.some(p => (p.isSenior || p.isYouth) &&
-                (p.batting || 0) === 0 && (p.bowling || 0) === 0 && (p.fielding || 0) === 0)));
+                (p.batting || 0) === 0 && (p.bowling || 0) === 0 && (p.fielding || 0) === 0)
+             // v8.47 — the v8.46 merge fix only PREVENTS a future wipe;
+             // it can't repair a cache that was already wiped by an
+             // earlier session before v8.46 shipped. A cache with real,
+             // correctly-scraped players in ONE role group and literally
+             // zero in the other (e.g. 13 real youth, 0 seniors) doesn't
+             // trip any of the checks above — every player it does have
+             // looks perfectly healthy. But a squad that's entirely one
+             // role group with NOTHING in the other is exactly what the
+             // v8.46 senior-wipe bug produces, and is suspicious enough on
+             // its own (a real senior club always has both) to force a
+             // refetch and let the v8.46 fix's fallback logic sort out
+             // which group (if either) is genuinely still missing.
+             || (existingSquadCache.players.some(p => p.isYouth) && !existingSquadCache.players.some(p => p.isSenior))
+             || (existingSquadCache.players.some(p => p.isSenior) && !existingSquadCache.players.some(p => p.isYouth))));
         // v8.45 — user reported the empty-cache symptom persisting even
         // after confirming v8.44 was installed (ruling out a stale-script
         // explanation). The v8.42 fix above only forces a refetch when
