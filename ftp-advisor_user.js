@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         FTP Advisor
 // @namespace    http://tampermonkey.net/
-// @version      8.38
+// @version      8.39
 // @description  Comprehensive tactical advisor for From the Pavilion cricket game (v8.18: enhanced opponent scouting report, match-week rest scheduling, bowling allocation opponent-aware; v8.17: phase-specific batting tactics; v8.16: confidence scores, fixture integration; v7.0: full UI redesign)
 // @author       You
 // @license      MIT
@@ -8246,7 +8246,10 @@ table.ftp-table {
                 <span class="vj-fw-700" style="font-size:14px;">${player.name} <span class="vj-text-xs vj-text-muted">(${Math.round(player.age)}yo)</span></span>
                 <span class="ftp-stat-badge ${badgeClass}" style="font-size:13px;">${keepVerdict}</span>
             </div>
-            <div class="vj-text-xs vj-text-muted vj-mb-4">Verdict: ${evalResult.verdict.toUpperCase()} · Rank ${rank}/10 · ${(() => { const pi = getPrimarySkillInfo(player); return pi.value ? (pi.name === 'keeping' ? 'Keep' : pi.name === 'bowling' ? 'Bowl' : 'Bat') + ' ' + skillLabel(pi.value) : ''; })()} · Tech ${skillLabel(player.technique)} · Field ${skillLabel(player.fielding)}</div>`;
+            <div class="vj-text-xs vj-text-muted vj-mb-4">Verdict: ${evalResult.verdict.toUpperCase()} · Rank ${rank}/10 · ${(() => { const pi = getPrimarySkillInfo(player); return pi.value ? (pi.name === 'keeping' ? 'Keep' : pi.name === 'bowling' ? 'Bowl' : 'Bat') + ' ' + skillLabel(pi.value) : ''; })()} · Tech ${skillLabel(player.technique)} · Field ${skillLabel(player.fielding)}${(() => {
+                const vpk = computePlayerValuePerK(player);
+                return vpk != null ? ` · ${vpk.toFixed(1)} skill/$K` : '';
+            })()}</div>`;
 
         if (evalResult.strengths.length > 0) {
             html += `<div class="vj-text-xs vj-mt-4" style="color:var(--vj-green);">✓ ${evalResult.strengths.join(' · ')}</div>`;
@@ -8259,6 +8262,14 @@ table.ftp-table {
             if (yd) {
                 html += `<div class="vj-text-xs vj-mt-8"><span class="vj-fw-700">16-20 development curve:</span> ${yd.overallStatus === 'behind' ? '<span style="color:var(--vj-red);">Behind curve</span>' : '<span style="color:var(--vj-green);">On track</span>'}</div>`;
             }
+            // Value/$K is a CURRENT snapshot (skill vs today's wage) — it
+            // can't tell you whether this 17yo will outgrow a 25yo's
+            // current skill level, because it has no way to know the
+            // 17yo's future wage. That comparison is what the "Training
+            // Potential" projection below already answers (projected
+            // skills at 20) — pointed to here so the two numbers aren't
+            // read as contradictory or interchangeable.
+            html += `<div class="vj-text-xs vj-text-muted vj-mt-4">Value/$K above reflects skill vs TODAY's wage only — for whether this player could outgrow an older squadmate, compare the "Training Potential" projection below (skills at 20) against that player's current skills, not the $/K number.</div>`;
         }
         verdictEl.innerHTML = html;
 
