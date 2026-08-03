@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         FTP Advisor
 // @namespace    http://tampermonkey.net/
-// @version      8.36
+// @version      8.37
 // @description  Comprehensive tactical advisor for From the Pavilion cricket game (v8.18: enhanced opponent scouting report, match-week rest scheduling, bowling allocation opponent-aware; v8.17: phase-specific batting tactics; v8.16: confidence scores, fixture integration; v7.0: full UI redesign)
 // @author       You
 // @license      MIT
@@ -7114,6 +7114,27 @@ table.ftp-table {
                             `reasons: ${e.eval.warnings.join(' | ') || '(none — check verdict logic)'}`);
                     });
                 }
+                // Whenever any senior candidate's peer comparison reports
+                // isGap (\"no current X in your squad\"), dump exactly which
+                // real senior players fed that comparison and how each one
+                // was role-classified. This is the fastest way to tell a
+                // real empty role from a classification/cache bug without
+                // re-reading the scoring code — a user report ("Eric
+                // Goodman ... you have no current batter") with a screenshot
+                // proving real batters exist could not be reproduced from
+                // code reading alone, so this makes the actual live
+                // classification visible in the console instead of guessing.
+                if (seniorEval.some(e => e.peerCompare && e.peerCompare.isGap)) {
+                    const gapRoles = [...new Set(seniorEval.filter(e => e.peerCompare && e.peerCompare.isGap).map(e => e.peerCompare.role))];
+                    console.log(`[FTP Transfer] SQUAD GAP reported for role(s): ${gapRoles.join(', ')}. Senior squad (age>=21) role breakdown:`);
+                    if (seniorPlayers.length === 0) {
+                        console.log('[FTP Transfer]   seniorPlayers is EMPTY — squad cache has zero players with age>=21. Check squad cache/age parsing.');
+                    }
+                    seniorPlayers.forEach(p => {
+                        const info = getPrimarySkillInfo(p);
+                        console.log(`[FTP Transfer]   ${p.name} (age ${(p.age||0).toFixed(2)}) — Bat ${p.batting} Bowl ${p.bowling} Keep ${p.keeping} — classified as: ${info.name} (value ${info.value})`);
+                    });
+                }
                 const priorityBuys = filtered;
 
                 // Sort: best buy to worst — ELITE first, then STRONG, then ADEQUATE; within verdict, highest rank first; cheapest first on ties
@@ -7199,7 +7220,7 @@ table.ftp-table {
                             const cmp = p.peerCompare;
                             if (cmp) {
                                 if (cmp.isGap) {
-                                    compareHtml = `<div class="vj-text-xs" style="color:var(--vj-green);line-height:1.4;margin-top:2px;">\u2191 Fills a real gap \u2014 you have no current ${cmp.role === 'keeping' ? 'wicketkeeper' : cmp.role === 'bowling' ? 'bowler' : 'batter'}</div>`;
+                                    compareHtml = `<div class="vj-text-xs" style="color:var(--vj-green);line-height:1.4;margin-top:2px;">\u2191 Fills a real gap \u2014 you have no current SENIOR ${cmp.role === 'keeping' ? 'wicketkeeper' : cmp.role === 'bowling' ? 'bowler' : 'batter'} (youth in that role, if any, aren't counted here \u2014 only players already eligible for the senior XI)</div>`;
                                 } else if (cmp.wouldReplace.length > 0) {
                                     const names = cmp.wouldReplace.map(r => r.player.name).join(', ');
                                     compareHtml = `<div class="vj-text-xs" style="color:var(--vj-green);line-height:1.4;margin-top:2px;">\u2191 Outranks ${cmp.wouldReplace.length} of your ${cmp.groupLabel} \u2014 would replace: ${names}</div>`;
@@ -8284,7 +8305,7 @@ table.ftp-table {
         if (!isYouth && squadPlayers.length > 0) {
             const cmp = comparePlayerToSquadPeers(player, squadPlayers);
             let cHtml = cmp.isGap
-                ? `<div class="vj-text-xs vj-text-muted vj-mb-4">You have no current ${cmp.role === 'keeping' ? 'wicketkeepers' : cmp.role === 'bowling' ? 'bowlers' : 'batters'} to compare against — this player would fill a genuine squad gap. This player ranks ${cmp.candidateRank}/10.</div>`
+                ? `<div class="vj-text-xs vj-text-muted vj-mb-4">You have no current SENIOR ${cmp.role === 'keeping' ? 'wicketkeepers' : cmp.role === 'bowling' ? 'bowlers' : 'batters'} to compare against (youth in that role aren't counted here) — this player would fill a genuine squad gap. This player ranks ${cmp.candidateRank}/10.</div>`
                 : `<div class="vj-text-xs vj-text-muted vj-mb-4">Compared against your squad's ${cmp.groupLabel}s (${cmp.allPeers.length} player${cmp.allPeers.length === 1 ? '' : 's'}). This player ranks ${cmp.candidateRank}/10.</div>`;
             if (cmp.wouldReplace.length > 0) {
                 cHtml += `<div class="vj-fw-700 vj-mb-4">Would replace (best sell first):</div>`;
