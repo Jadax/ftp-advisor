@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         FTP Advisor
 // @namespace    http://tampermonkey.net/
-// @version      8.37
+// @version      8.38
 // @description  Comprehensive tactical advisor for From the Pavilion cricket game (v8.18: enhanced opponent scouting report, match-week rest scheduling, bowling allocation opponent-aware; v8.17: phase-specific batting tactics; v8.16: confidence scores, fixture integration; v7.0: full UI redesign)
 // @author       You
 // @license      MIT
@@ -7103,6 +7103,21 @@ table.ftp-table {
                 console.log(`[FTP Transfer] Scanned ${evaluated.length} (${youthEval.length} youth, ${seniorEval.length} senior). ` +
                     `Youth pass: ${youthEval.filter(e => filteredSet.has(e)).length}/${youthEval.length}. ` +
                     `Senior pass (elite + squad upgrade): ${seniorEval.filter(e => filteredSet.has(e)).length}/${seniorEval.length}.`);
+                // Always print the senior role composition the squad-gap
+                // comparison is actually seeing, not just when isGap fires —
+                // the Amarpreet Narasinha report showed isGap=true in the
+                // rendered card but a console capture taken moments earlier
+                // (different render pass — updateTransferAdvisor runs twice
+                // per page load, once on stale cache and once after the
+                // background refresh) showed no SQUAD GAP line at all,
+                // meaning the two were from different evaluation passes.
+                // Logging this unconditionally on every pass removes that
+                // race entirely — whichever render the user is looking at,
+                // its own console output is right above it.
+                console.log(`[FTP Transfer] Senior squad (age>=21, ${seniorPlayers.length} players) role counts — ` +
+                    `batters: ${seniorPlayers.filter(p => getPrimarySkillInfo(p).name === 'batting').length}, ` +
+                    `bowlers: ${seniorPlayers.filter(p => getPrimarySkillInfo(p).name === 'bowling').length}, ` +
+                    `keepers: ${seniorPlayers.filter(p => getPrimarySkillInfo(p).name === 'keeping').length}`);
                 if (youthEval.length > 0 && youthEval.every(e => e.eval.verdict === 'poor' || e.eval.verdict === 'weak')) {
                     // Flattened to a plain string, not a logged object —
                     // browser consoles collapse nested objects to "{...}"
@@ -7115,7 +7130,7 @@ table.ftp-table {
                     });
                 }
                 // Whenever any senior candidate's peer comparison reports
-                // isGap (\"no current X in your squad\"), dump exactly which
+                // isGap ("no current X in your squad"), dump exactly which
                 // real senior players fed that comparison and how each one
                 // was role-classified. This is the fastest way to tell a
                 // real empty role from a classification/cache bug without
@@ -7124,8 +7139,19 @@ table.ftp-table {
                 // proving real batters exist could not be reproduced from
                 // code reading alone, so this makes the actual live
                 // classification visible in the console instead of guessing.
-                if (seniorEval.some(e => e.peerCompare && e.peerCompare.isGap)) {
-                    const gapRoles = [...new Set(seniorEval.filter(e => e.peerCompare && e.peerCompare.isGap).map(e => e.peerCompare.role))];
+                // Factored into a standalone fn (not inlined here) because
+                // the "Fetch Experience & Wages" click below re-runs
+                // comparePlayerToSquadPeers a second time on real talent
+                // data and can flip isGap independently of this first pass
+                // — that second call had no logging at all until this was
+                // pulled out, which is exactly the gap that made the
+                // Amarpreet Narasinha report ("no current senior bowler")
+                // impossible to diagnose: the log the user pasted back had
+                // no SQUAD GAP lines because isGap only went true AFTER the
+                // details fetch, on the second, previously-silent call.
+                function logSquadGapDiagnostic(evalList) {
+                    if (!evalList.some(e => e.peerCompare && e.peerCompare.isGap)) return;
+                    const gapRoles = [...new Set(evalList.filter(e => e.peerCompare && e.peerCompare.isGap).map(e => e.peerCompare.role))];
                     console.log(`[FTP Transfer] SQUAD GAP reported for role(s): ${gapRoles.join(', ')}. Senior squad (age>=21) role breakdown:`);
                     if (seniorPlayers.length === 0) {
                         console.log('[FTP Transfer]   seniorPlayers is EMPTY — squad cache has zero players with age>=21. Check squad cache/age parsing.');
@@ -7135,6 +7161,7 @@ table.ftp-table {
                         console.log(`[FTP Transfer]   ${p.name} (age ${(p.age||0).toFixed(2)}) — Bat ${p.batting} Bowl ${p.bowling} Keep ${p.keeping} — classified as: ${info.name} (value ${info.value})`);
                     });
                 }
+                logSquadGapDiagnostic(seniorEval);
                 const priorityBuys = filtered;
 
                 // Sort: best buy to worst — ELITE first, then STRONG, then ADEQUATE; within verdict, highest rank first; cheapest first on ties
@@ -7284,6 +7311,7 @@ table.ftp-table {
                             // with the same isWorthShowing gate used above.
                             p.peerCompare = (Math.round(p.age) >= 21) ? comparePlayerToSquadPeers(p, seniorPlayers) : null;
                         });
+                        logSquadGapDiagnostic(priorityBuys.filter(p => Math.round(p.age) >= 21));
                         // Re-filter with the exact same rule as the initial
                         // pass (elite + genuine squad upgrade for seniors).
                         const reFiltered = priorityBuys.filter(isWorthShowing);
