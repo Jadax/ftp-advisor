@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         FTP Advisor
 // @namespace    http://tampermonkey.net/
-// @version      8.43
+// @version      8.44
 // @description  Comprehensive tactical advisor for From the Pavilion cricket game (v8.18: enhanced opponent scouting report, match-week rest scheduling, bowling allocation opponent-aware; v8.17: phase-specific batting tactics; v8.16: confidence scores, fixture integration; v7.0: full UI redesign)
 // @author       You
 // @license      MIT
@@ -5981,8 +5981,19 @@ table.ftp-table {
             return;
         }
 
-        if (age >= 24 && age <= 27 && player.power < 8) {
-            setProgram('strength', `Age ${age}: Power training peaks mid-20s. Currently ${skillLabel(player.power)}. Strength trains power and endurance. Window closes after ~27.`, 'medium');
+        // Community-sourced staging order (real experienced-user input,
+        // not workbook-verified): fielding trains fastest so most players
+        // get it to their target level as early as possible (the youth
+        // fielding-to-Reliable staging already does this — see
+        // _recommendYouthTraining), then primary skill/technique is the
+        // focus through the mid-20s, THEN power/fitness starting around
+        // 25 — that timing still leaves enough runway to reach a decent
+        // level by 30 (when the aging path below switches to maintenance-
+        // only, no longer actively growing skills). Actual runway depends
+        // heavily on academy training speed, which this doesn't otherwise
+        // adjust for — a slow academy may need to start earlier.
+        if (age >= 25 && age <= 29 && player.power < 8) {
+            setProgram('strength', `Age ${age}: Power training window (community guidance: start ~25, focus primary/technique before that). Currently ${skillLabel(player.power)}. Strength trains power and endurance — actual pace depends on your academy speed.`, 'medium');
             return;
         }
 
@@ -6529,7 +6540,7 @@ table.ftp-table {
     // ============================================================
     // YOUTH RECRUIT EVALUATION
     // ============================================================
-    function evaluateYouthRecruit(player) {
+    function evaluateYouthRecruit(player, context) {
         // Returns: { verdict, verdictColor, score, breakdown, recommendedTraining, warnings }
         // Verdict: 'elite', 'strong', 'promising', 'average', 'weak', 'release'
         const result = {
@@ -6657,6 +6668,45 @@ table.ftp-table {
             result.warnings.push('PRODIGY — trains all skills faster while in youth squad. Maximize this!');
         }
 
+        // --- REAL-WORLD CONTEXT (v8.44, community-sourced, informational
+        // only — deliberately NOT folded into `score` above) ---
+        // Explicit user framing: "distribution of points, bowling type and
+        // talents are more important than rating... anything over 20k is
+        // usually an ok pull, and 25k is a good pull" — and separately,
+        // "a $1k waged youth pull will be a good one." Both are shown as
+        // context for the manager to weigh, not baked into the score,
+        // since the score is already driven by the actual skill
+        // distribution/talents this rating-tier commentary explicitly
+        // says matters more.
+        const rating = player.rating || 0;
+        if (rating > 0) {
+            if (rating >= 25000) result.breakdown.push(`Rating ${rating.toLocaleString()} — a good pull by rating alone (25k+), but distribution/bowling type/talents matter more than this number`);
+            else if (rating >= 20000) result.breakdown.push(`Rating ${rating.toLocaleString()} — an OK pull by rating alone (20k+), but distribution/bowling type/talents matter more than this number`);
+        }
+        const wage = player.wage || 0;
+        if (wage > 0 && wage <= 1000) {
+            result.breakdown.push(`Wage $${wage.toLocaleString()}/wk — a $1k-or-under youth pull is generally a good sign`);
+        }
+        // Squad-need context: same role-gap concept as the transfer
+        // advisor's comparePlayerToSquadPeers() isGap, but phrased for a
+        // youth prospect you already own rather than a market candidate —
+        // "are you in desperate need of a wicketkeeper, or will the
+        // player not play until they're 20" was explicit user guidance on
+        // what should factor into a keep/release call beyond raw skill.
+        if (context && context.squadStats) {
+            const ss = context.squadStats;
+            if (primaryName === 'keeping' && ss.keeperCount <= 1) {
+                result.breakdown.push(`Squad need: only ${ss.keeperCount} senior keeper${ss.keeperCount === 1 ? '' : 's'} — a genuine keeper prospect is worth more to you right now than the raw score alone suggests`);
+            } else if (primaryName === 'bowling' && ss.bowlerCount < 4) {
+                result.breakdown.push(`Squad need: only ${ss.bowlerCount} senior bowlers — a genuine bowling prospect is worth more to you right now than the raw score alone suggests`);
+            } else if (primaryName === 'batting' && ss.batterCount < 4) {
+                result.breakdown.push(`Squad need: only ${ss.batterCount} senior batters — a genuine batting prospect is worth more to you right now than the raw score alone suggests`);
+            }
+        }
+        if (context && context.academyLevel) {
+            result.breakdown.push(`Academy: ${context.academyLevel} — how fast this prospect actually develops (and how much runway you realistically have) depends heavily on this`);
+        }
+
         // --- VERDICT ---
         if (result.score >= 18) {
             result.verdict = 'elite';
@@ -6751,11 +6801,17 @@ table.ftp-table {
         </div>`;
 
         // Evaluate recruits
+        // Context for evaluateYouthRecruit()'s real-world commentary
+        // (v8.44, community-sourced) \u2014 squad-role-need and academy level,
+        // same computeSquadStats() shape used everywhere else in the file.
+        const recruitSquadStats = computeSquadStats(cache ? cache.players : []);
+        const recruitContext = { squadStats: recruitSquadStats, academyLevel: academyInfo?.level || null };
+
         const evalEl = document.getElementById('ftp-recruit-eval');
         const recentRecruits = youthPlayers.filter(p => p.experience <= 1 && p.age <= 17);
         if (recentRecruits.length > 0) {
             const recruit = recentRecruits.sort((a, b) => a.age - b.age)[0];
-            const eval_ = evaluateYouthRecruit(recruit);
+            const eval_ = evaluateYouthRecruit(recruit, recruitContext);
             const verdictBadge = eval_.verdict === 'elite' ? 'green' : eval_.verdict === 'strong' ? 'green' : eval_.verdict === 'promising' ? 'blue' : eval_.verdict === 'average' ? 'amber' : 'red';
 
             evalEl.innerHTML = `<div class="ftp-rec ${eval_.verdict === 'release' ? 'critical' : eval_.verdict === 'weak' ? 'high' : eval_.verdict === 'average' ? 'medium' : 'low'}">
@@ -6764,11 +6820,12 @@ table.ftp-table {
                 <div class="vj-text-xs vj-text-muted vj-mt-4">Bat ${skillLabel(recruit.batting)} \u00B7 Bowl ${skillLabel(recruit.bowling)} \u00B7 Keep ${skillLabel(recruit.keeping)} \u00B7 Tech ${skillLabel(recruit.technique)} \u00B7 End ${skillLabel(recruit.endurance)} \u00B7 Pwr ${skillLabel(recruit.power)} \u00B7 Field ${skillLabel(recruit.fielding)}</div>
                 <div class="ftp-rec-program vj-mt-4">\u2192 ${TRAINING_PROGRAM_LABELS[eval_.recommendedTraining] || eval_.recommendedTraining}</div>
                 ${eval_.warnings.length > 0 ? `<div class="ftp-rec-warnings vj-mt-4">\u26A0 ${eval_.warnings.join(' \u00B7 ')}</div>` : ''}
+                ${eval_.breakdown.filter(b => /Rating|Wage|Squad need|Academy:/.test(b)).map(b => `<div class="vj-text-xs vj-text-muted vj-mt-4">\u2022 ${b}</div>`).join('')}
             </div>`;
         } else if (youthPlayers.length > 0) {
             let html = '';
             const evalCache = new Map();
-            const getEval = (p) => { if (!evalCache.has(p.id)) evalCache.set(p.id, evaluateYouthRecruit(p)); return evalCache.get(p.id); };
+            const getEval = (p) => { if (!evalCache.has(p.id)) evalCache.set(p.id, evaluateYouthRecruit(p, recruitContext)); return evalCache.get(p.id); };
             const sorted = [...youthPlayers].sort((a, b) => getEval(b).score - getEval(a).score);
             sorted.slice(0, 10).forEach(p => {
                 const ev = getEval(p);
@@ -6930,13 +6987,29 @@ table.ftp-table {
         }
 
         // Estimate attendance based on actual supporters (from club page)
-        // Attendance is capped by capacity; not all supporters attend every match
-        // Typical attendance rate: 30-60% of supporters for home matches
-        const EST_ATTENDANCE_RATE = 0.45; // 45% of supporters attend a home match on average
+        // Attendance is capped by capacity; not all supporters attend every match.
+        // Real community data (v8.44) replacing a previous unsourced guess
+        // (0.45x, i.e. "45% of supporters attend"): crowd numbers run
+        // roughly supporter base x 7-8 depending on team mood — NOT a
+        // fraction of supporters, a MULTIPLE of it. The old 0.45x figure
+        // was understating realistic attendance by roughly 16-18x, which
+        // would have made every recommendation below think the ground was
+        // wildly over-capacity when it likely wasn't. Mood isn't currently
+        // scraped into a numeric scale (info.mood is a raw, unmapped
+        // string), so this uses the midpoint of the stated 7-8x range
+        // rather than fabricating a mood-to-multiplier mapping without
+        // real data to back specific values.
+        const ATTENDANCE_MULTIPLIER = 7.5;
         const estAttendance = supporters > 0
-            ? Math.min(Math.round(supporters * EST_ATTENDANCE_RATE), capacity)
+            ? Math.min(Math.round(supporters * ATTENDANCE_MULTIPLIER), capacity)
             : Math.min(Math.round((division <= 2 ? 3000 : division <= 3 ? 2000 : 1200)), capacity);
         const utilizationPct = capacity > 0 ? Math.round((estAttendance / capacity) * 100) : 0;
+        // Target capacity for a growing club — same source: "supporter
+        // base of 2000 -> capacity ~17,000-18,000" implies roughly 8.5-9x
+        // supporters, deliberately higher than the attendance multiplier
+        // to leave room for the supporter base to keep growing without
+        // selling out every week. Midpoint used for the same reason as above.
+        const TARGET_CAPACITY_MULTIPLIER = 8.5;
 
         rec.details.push(`Capacity: ${capacity.toLocaleString()} seats`);
         rec.details.push(`Weekly maintenance: $${weeklyMaintenance.toLocaleString()}/wk (${capacity} \u00D7 $1)`);
@@ -6944,7 +7017,7 @@ table.ftp-table {
         rec.details.push(`Est. weekly net gate contribution: $${netGatePerWeek.toLocaleString()}`);
         if (supporters > 0) {
             rec.details.push(`Supporters: ${supporters.toLocaleString()} (${supporterGrowth > 0 ? '+' : ''}${supporterGrowth}/wk)`);
-            rec.details.push(`Est. attendance: ~${estAttendance.toLocaleString()} (${utilizationPct}% full, ~${Math.round(EST_ATTENDANCE_RATE * 100)}% of supporters)`);
+            rec.details.push(`Est. attendance: ~${estAttendance.toLocaleString()} (${utilizationPct}% full, ~${ATTENDANCE_MULTIPLIER}x supporters — varies with team mood)`);
         } else {
             rec.details.push(`Est. attendance (Div ${division}): ~${estAttendance.toLocaleString()} (${utilizationPct}% full)`);
         }
@@ -6977,7 +7050,7 @@ table.ftp-table {
                 rec.priority = 'low';
                 rec.reason = `At ${utilizationPct}% utilization — reasonable balance. Gate revenue: ~$${estWeeklyGate.toLocaleString()}/wk, maintenance: $${weeklyMaintenance.toLocaleString()}/wk.`;
             } else {
-                const targetCap = Math.max(MIN_CAPACITY, estAttendance + 1000);
+                const targetCap = Math.max(MIN_CAPACITY, supporters > 0 ? Math.round(supporters * TARGET_CAPACITY_MULTIPLIER) : estAttendance + 1000);
                 if (targetCap >= capacity) {
                     rec.action = 'maintain';
                     rec.priority = 'low';
@@ -6995,7 +7068,7 @@ table.ftp-table {
                 rec.priority = 'low';
                 rec.reason = `Large ground (${capacity.toLocaleString()}) at ${utilizationPct}% utilization. Gate revenue should comfortably cover $${weeklyMaintenance.toLocaleString()}/wk maintenance.`;
             } else {
-                const targetCap = Math.max(MIN_CAPACITY, estAttendance + 1500);
+                const targetCap = Math.max(MIN_CAPACITY, supporters > 0 ? Math.round(supporters * TARGET_CAPACITY_MULTIPLIER) : estAttendance + 1500);
                 if (targetCap >= capacity) {
                     rec.action = 'maintain';
                     rec.priority = 'low';
