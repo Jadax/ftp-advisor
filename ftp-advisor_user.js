@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         FTP Advisor
 // @namespace    http://tampermonkey.net/
-// @version      8.34
+// @version      8.35
 // @description  Comprehensive tactical advisor for From the Pavilion cricket game (v8.18: enhanced opponent scouting report, match-week rest scheduling, bowling allocation opponent-aware; v8.17: phase-specific batting tactics; v8.16: confidence scores, fixture integration; v7.0: full UI redesign)
 // @author       You
 // @license      MIT
@@ -361,6 +361,15 @@
     function getPrimarySkillInfo(player) {
         const keeping = player.keeping || 0, batting = player.batting || 0, bowling = player.bowling || 0;
         if (keeping >= 4 && keeping >= batting && keeping >= bowling) return { value: keeping, name: 'keeping' };
+        // Both batting AND bowling reading exactly 0 means no skill data
+        // has actually loaded for this player (a scrape gap or stale
+        // cache entry) — not a genuine 0/0 allrounder. The tie-break
+        // below (bowling >= batting -> bowling) used to silently
+        // misclassify every such player as a bowler, which could make
+        // role-group logic (comparePlayerToSquadPeers, computeRoleSurplus)
+        // report "no batters in the squad" when real batters exist but
+        // just haven't loaded their skills into this player object yet.
+        if (batting === 0 && bowling === 0) return { value: 0, name: 'batting' };
         if (bowling >= batting) return { value: bowling, name: 'bowling' };
         return { value: batting, name: 'batting' };
     }
@@ -2287,9 +2296,20 @@
         // entries written by the buggy version of parsePlayerRow (before
         // this fix) still have hasFullSkills:true baked in even though
         // every stat is really 0.
+        // Also catches PARTIAL corruption — not just a whole-squad wipe.
+        // A single player with batting=bowling=fielding=0 while the rest
+        // of the squad looks fine is still a real problem: getPrimarySkillInfo()
+        // used to default an all-0 player to 'bowling', which could make
+        // comparePlayerToSquadPeers()/computeRoleSurplus() report "no
+        // batters in the squad" for a squad that demonstrably has some —
+        // just one whose row failed to scrape that refresh. Any senior/
+        // youth player missing ALL three core stats simultaneously is
+        // treated the same as a fully-corrupted cache.
         const existingSquadCache = loadPlayerCache();
         const squadCacheCorrupted = !!(existingSquadCache && existingSquadCache.players.length > 0 &&
-            !existingSquadCache.players.some(p => (p.batting || 0) > 0 || (p.bowling || 0) > 0 || (p.fielding || 0) > 0));
+            (!existingSquadCache.players.some(p => (p.batting || 0) > 0 || (p.bowling || 0) > 0 || (p.fielding || 0) > 0)
+             || existingSquadCache.players.some(p => (p.isSenior || p.isYouth) &&
+                (p.batting || 0) === 0 && (p.bowling || 0) === 0 && (p.fielding || 0) === 0)));
         if (force || isStale(CACHE_TIMESTAMP_KEY, STALE_SQUAD_HOURS) || squadCacheCorrupted) {
             labels.push('squad');
             promises.push(
