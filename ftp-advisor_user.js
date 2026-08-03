@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         FTP Advisor
 // @namespace    http://tampermonkey.net/
-// @version      8.32
+// @version      8.33
 // @description  Comprehensive tactical advisor for From the Pavilion cricket game (v8.18: enhanced opponent scouting report, match-week rest scheduling, bowling allocation opponent-aware; v8.17: phase-specific batting tactics; v8.16: confidence scores, fixture integration; v7.0: full UI redesign)
 // @author       You
 // @license      MIT
@@ -376,6 +376,61 @@
     // three independently-drifting definitions of "good enough".
     function keeperBattingMin(primaryMin) {
         return Math.max(0, (primaryMin || 0) - 2);
+    }
+
+    /**
+     * Role-aware, talent-aware "value" skill total for a wage-adjusted
+     * skill/$K metric. Replaces a previous version that summed
+     * batting+bowling+technique+fielding+endurance for EVERY player
+     * regardless of role — which diluted specialists (a pure batter's
+     * near-zero bowling dragged their score down same as it would an
+     * allrounder's) and, worse, never looked at keeping at all: a
+     * wicketkeeper's actual value driver was completely invisible to it.
+     *
+     * - Primary skill (batting/bowling/keeping, via getPrimarySkillInfo)
+     *   counted double — it's the actual reason this player is picked
+     *   and paid; everything else is supporting.
+     * - Technique/fielding/endurance count once each — real supporting
+     *   contributors for every role.
+     * - Keepers ALSO get half credit for batting (they need to be a
+     *   competent batsman too, not a specialist one — see
+     *   keeperBattingMin()'s reasoning from the transfer-scouting work).
+     * - Talents add a conservative flat bonus — same unquantified-but-
+     *   real convention already used in evaluateTransferTarget/
+     *   calculateBattingScore/calculateBowlingScore, not invented fresh
+     *   here. Prodigy is youth-only per the manual.
+     * - Age is deliberately NOT baked into the number — there's no
+     *   manual-confirmed decline rate to apply (see the age-30+ know-gap
+     *   note elsewhere in this file), so a fabricated age multiplier
+     *   would just be a guess wearing a precise-looking number. Age
+     *   context is shown alongside the value instead, left for the user
+     *   to weigh — an efficient 33-year-old and an efficient 19-year-old
+     *   are not the same signing/keep decision, but that's a judgement
+     *   call, not something to silently bake into the math.
+     */
+    function computePlayerValueSkillSum(player) {
+        const primaryInfo = getPrimarySkillInfo(player);
+        let sum = primaryInfo.value * 2;
+        sum += player.technique || 0;
+        sum += player.fielding || 0;
+        sum += player.endurance || 0;
+        if (primaryInfo.name === 'keeping') sum += (player.batting || 0) * 0.5;
+
+        const talents = player.talents || [];
+        const isYouth = (player.age || 0) < 21;
+        if (talents.some(t => /prodigy/i.test(t)) && isYouth) sum += 3;
+        if (talents.some(t => /skilled/i.test(t))) sum += 2;
+        if (talents.some(t => /gifted/i.test(t)) && isYouth) sum += 1;
+        if (talents.some(t => /new ball bowler|old ball bowler|^opener$|finisher|safe hands|natural leader/i.test(t))) sum += 1;
+
+        return sum;
+    }
+
+    // Returns null (not 0) when wage is unknown, so callers can tell
+    // "no data" apart from "genuinely free" and skip display accordingly.
+    function computePlayerValuePerK(player) {
+        if (!player || !player.wage || player.wage <= 0) return null;
+        return computePlayerValueSkillSum(player) / (player.wage / 1000);
     }
 
     // ============================================================
@@ -1325,6 +1380,15 @@
             p.talents = s.talents;
             if (s.currentTraining) p.currentTraining = s.currentTraining;
             if (s.isLeftHanded) p.isLeftHanded = true;
+            // Wage and rating are scraped here (parseSummaryViewBlock) but
+            // were never actually copied onto the main squad player object
+            // — parsePlayerRow (the grid view used for the squad cache)
+            // doesn't scrape either field at all. That silently meant
+            // p.wage/p.rating were always 0/undefined for your OWN squad
+            // everywhere they're used (sell-list rating comparison, any
+            // skill-per-$ value metric) despite being fetched right here.
+            if (s.wage != null && s.wage > 0) p.wage = s.wage;
+            if (s.rating != null && s.rating > 0) p.rating = s.rating;
         });
     }
 
@@ -7018,11 +7082,14 @@ table.ftp-table {
                             if (detailsFetched && p.captaincy != null && p.captaincy > 0) detailParts.push(`Capt ${skillLabel(p.captaincy)}`);
                             if (detailsFetched && p.wage != null && p.wage > 0) {
                                 detailParts.push(`Wage $${p.wage.toLocaleString()}/wk`);
-                                // Wage-adjusted value: skill points per $1K wage
-                                const skillSum = (p.batting || 0) + (p.bowling || 0) + (p.technique || 0) + (p.fielding || 0) + (p.endurance || 0);
-                                const skillPerK = skillSum / (p.wage / 1000);
-                                const valueColor = skillPerK >= 10 ? 'var(--vj-green)' : skillPerK >= 5 ? 'var(--vj-gold)' : 'var(--vj-red)';
-                                detailParts.push(`<span style="color:${valueColor};">Value ${skillPerK.toFixed(1)} skill/$K</span>`);
+                                // Role-aware, talent-aware value — see
+                                // computePlayerValueSkillSum() for why this
+                                // isn't a flat sum of unrelated skills.
+                                const skillPerK = computePlayerValuePerK(p);
+                                if (skillPerK != null) {
+                                    const valueColor = skillPerK >= 10 ? 'var(--vj-green)' : skillPerK >= 5 ? 'var(--vj-gold)' : 'var(--vj-red)';
+                                    detailParts.push(`<span style="color:${valueColor};">Value ${skillPerK.toFixed(1)} skill/$K</span>`);
+                                }
                             }
                             if (p.price) detailParts.push(`Price $${p.price.toLocaleString()}`);
                             if (detailsFetched && p.talents && p.talents.length > 0) detailParts.push(`<span style="color:var(--vj-gold);">${p.talents.join(', ')}</span>`);
@@ -7379,7 +7446,21 @@ table.ftp-table {
             // ranked low within his role — see seniorTalentProtection().
             sellScore -= seniorTalentProtection(p);
 
-            return { player: p, sellScore, reasons };
+            // Wage-adjusted value — see computePlayerValueSkillSum().
+            // Requested as "another layer of ranking who to sell": an
+            // overpaid player (low output for the wage) is a real reason
+            // to consider a swap even when nothing else stands out; a
+            // genuinely great-value player is harder to justify moving on
+            // purely for squad-depth reasons. Same 5/10 thresholds used
+            // on the transfer market for a consistent read across both.
+            const skillPerK = computePlayerValuePerK(p);
+            if (skillPerK != null) {
+                if (skillPerK < 3) { sellScore += 10; reasons.push(`Poor value: ${skillPerK.toFixed(1)} skill/$K — overpaid for current output`); }
+                else if (skillPerK < 5) { sellScore += 5; reasons.push(`Below-average value: ${skillPerK.toFixed(1)} skill/$K`); }
+                else if (skillPerK >= 10) { sellScore -= 5; }
+            }
+
+            return { player: p, sellScore, reasons, skillPerK };
         }).sort((a, b) => b.sellScore - a.sellScore);
 
         // Show top sell candidates (those with sellScore > 0 = some reason to sell)
@@ -7396,7 +7477,8 @@ table.ftp-table {
 
         let html = shapeHtml + `<div class="vj-text-xs vj-text-muted vj-mb-4">Ranked by urgency to sell. ${candidates.length} of ${seniors.length} seniors flagged.</div>`;
         candidates.forEach((r, i) => {
-            const statLine = `${formatAgeDisplay(r.player.age)} \u00B7 ${skillLabel(r.player.batting)}/${skillLabel(r.player.bowling)} \u00B7 R${r.player.rating || '?'}`;
+            let statLine = `${formatAgeDisplay(r.player.age)} \u00B7 ${skillLabel(r.player.batting)}/${skillLabel(r.player.bowling)} \u00B7 R${r.player.rating || '?'}`;
+            if (r.skillPerK != null) statLine += ` \u00B7 ${r.skillPerK.toFixed(1)} skill/$K`;
             html += renderSellCandidateCard(i + 1, r.player, r.sellScore, r.reasons, statLine);
         });
 
@@ -7521,7 +7603,15 @@ table.ftp-table {
                 </div>`;
                 html += `<div class="vj-text-xs vj-text-muted vj-mt-8 vj-mb-4">Squad is on the larger side (${youth.length}). If you want to trim, these rank lowest relatively \u2014 not a development problem, just the weakest of a strong group. Below 12 the game auto-drafts replacement recruits with poor skills (official manual), so don't cut past that.</div>`;
                 soft.forEach((r, i) => {
-                    const statLine = `age ${formatAgeDisplay(r.player.age)} \u00B7 ${skillLabel(r.player.batting)}/${skillLabel(r.player.bowling)} \u00B7 rank ${calculateRank(r.player, squadStats)}/10`;
+                    let statLine = `age ${formatAgeDisplay(r.player.age)} \u00B7 ${skillLabel(r.player.batting)}/${skillLabel(r.player.bowling)} \u00B7 rank ${calculateRank(r.player, squadStats)}/10`;
+                    // Shown for information only, not scored into
+                    // sellScore \u2014 youth wages are naturally low across the
+                    // board (community data: 16yo ~$500-2000/wk), so this
+                    // metric barely discriminates between them the way it
+                    // does for senior wages and would just add noise if
+                    // it affected ranking here.
+                    const valuePerK = computePlayerValuePerK(r.player);
+                    if (valuePerK != null) statLine += ` \u00B7 ${valuePerK.toFixed(1)} skill/$K`;
                     html += renderSellCandidateCard(i + 1, r.player, 0, ['Relative depth only \u2014 no actual development concern'], statLine);
                 });
                 return html;
@@ -7534,7 +7624,11 @@ table.ftp-table {
 
         let html = `<div class="vj-text-xs vj-text-muted vj-mb-4">Youth players behind the 16-20 development curve. ${flagged.length} of ${youth.length} flagged.</div>`;
         flagged.forEach((r, i) => {
-            const statLine = `age ${Math.round(r.player.age)} \u00B7 ${skillLabel(r.player.batting)}/${skillLabel(r.player.bowling)}`;
+            let statLine = `age ${Math.round(r.player.age)} \u00B7 ${skillLabel(r.player.batting)}/${skillLabel(r.player.bowling)}`;
+            // Display only here too \u2014 see the soft-fallback branch above
+            // for why it's not folded into youth sellScore.
+            const valuePerK = computePlayerValuePerK(r.player);
+            if (valuePerK != null) statLine += ` \u00B7 ${valuePerK.toFixed(1)} skill/$K`;
             html += renderSellCandidateCard(i + 1, r.player, r.sellScore, r.reasons, statLine);
         });
 
