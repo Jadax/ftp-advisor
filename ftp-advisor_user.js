@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         FTP Advisor
 // @namespace    http://tampermonkey.net/
-// @version      8.47
-// @description  Comprehensive tactical advisor for From the Pavilion cricket game (v8.18: enhanced opponent scouting report, match-week rest scheduling, bowling allocation opponent-aware; v8.17: phase-specific batting tactics; v8.16: confidence scores, fixture integration; v7.0: full UI redesign)
+// @version      8.48
+// @description  Comprehensive tactical advisor for From the Pavilion cricket game (v8.48: wage-discount normalization, hidden-value gauge, price-history anchoring, match-ratings batting staging; v8.18: enhanced opponent report, rest scheduling; v7.0: full UI redesign)
 // @author       You
 // @license      MIT
 // @match        https://www.fromthepavilion.org/*
@@ -260,6 +260,15 @@
     const GROUND_CACHE_KEY = 'ftp_ground_cache';
     const GROUND_TIMESTAMP_KEY = 'ftp_ground_cache_ts';
 
+    // Local transfer price-history ledger (the closest userscript-friendly
+    // analog to PavilionPy's persistent market archive). Every candidate we
+    // see on the transfer market is recorded by (role, age-band, primary
+    // skill), so future searches can anchor a candidate's asking price against
+    // "similar archetypes this club has actually seen listed for". Kept small
+    // and pruned — this is a rough value anchor, not a full market database.
+    const TRANSFER_PRICE_KEY = 'ftp_transfer_price_history';
+    const TRANSFER_PRICE_MAX = 400; // cap stored entries to bound GM storage
+
     // Staleness thresholds (hours)
     const STALE_SQUAD_HOURS = 24;
     const STALE_OPPONENT_HOURS = 24;
@@ -483,7 +492,144 @@
     // "no data" apart from "genuinely free" and skip display accordingly.
     function computePlayerValuePerK(player) {
         if (!player || !player.wage || player.wage <= 0) return null;
-        return computePlayerValueSkillSum(player) / (player.wage / 1000);
+        // The game displays the DISCOUNTED wage (loyalty discount:
+        // career youth-start 5% + 0.5%/season, capped at +5%). Undoing it
+        // gives the real wage so value/$K compares a discounted long-tenure
+        // player fairly against a fresh signing who pays full wage. Falls
+        // back to the displayed wage when no discount was scraped.
+        const disc = (player.wageDiscount != null && player.wageDiscount > 0) ? player.wageDiscount : 0;
+        const realWage = disc >= 100 ? player.wage : player.wage / (1 - disc / 100);
+        return computePlayerValueSkillSum(player) / (realWage / 1000);
+    }
+
+    // "Spare rating" / hidden-value estimate (idea lifted from PavilionPy's
+    // SpareSkills tracking). The game shows each skill as a whole level,
+    // but every level holds ~1000 hidden sub-levels, and the player's
+    // displayed Rating is derived from the FULL underlying skills — so two
+    // players with identical visible skill words can differ in Rating by
+    // hundreds/thousands of points. The rating not explained by the visible
+    // skill levels points at hidden sub-level progress, i.e. a player "about
+    // to pop" a level who's genuinely better (or worse) than their on-paper
+    // skills suggest.
+    //
+    // The exact per-level Rating weight is NOT manually confirmed, so this
+    // uses PavilionPy's community-model approximation (1000 × level, with
+    // atrocious=0 → 500) adapted to our 14-visible-level skill scale, then
+    // reports the residual as a fraction of the visible level contribution.
+    // It's a directional gauge (positive = hidden value, negative = flattered
+    // by visible skills), not an official formula — surfaced as an estimate.
+    function computeSpareRating(player) {
+        if (!player || !player.rating || player.rating <= 0) return null;
+        const skillKeys = ['batting', 'bowling', 'technique', 'power', 'keeping', 'fielding', 'endurance'];
+        let visibleWeight = 0;
+        let skillSum = 0;
+        skillKeys.forEach(k => {
+            const lvl = player[k] || 0;
+            // level 0 (atrocious) is minimum baseline, levels 1-15 scale ~linearly
+            const weight = lvl <= 0 ? 500 : 500 + (lvl - 1) * 1000;
+            visibleWeight += weight;
+            skillSum += lvl;
+        });
+        if (visibleWeight <= 0) return null;
+        const spare = player.rating - visibleWeight;
+        // Express as fraction of the visible contribution + a rounded $ of rating
+        return {
+            spare,
+            ratio: spare / visibleWeight,
+            visibleWeight,
+            skillSum,
+            // Direction + intensity label for display
+            label: spare > visibleWeight * 0.03 ? 'hidden-potential' :
+                   spare < -visibleWeight * 0.03 ? 'flattered' : 'match'
+        };
+    }
+
+    function spareRatingBadge(spare) {
+        if (!spare) return '';
+        if (spare.label === 'hidden-potential') {
+            return `<span class="ftp-stat-badge green" title="Rating exceeds what this player's visible skills alone predict — likely hidden sub-level progress (about to pop a skill) or strong underlying quality. Estimate, not official." style="font-size:9px;cursor:help;">\u2B06 Hidden potential (+${Math.abs(spare.spare).toLocaleString()})</span>`;
+        } else if (spare.label === 'flattered') {
+            return `<span class="ftp-stat-badge amber" title="Rating is below what this player's visible skills alone predict — may be flattered by their stat line." style="font-size:9px;cursor:help;">\u2B07 Flattered</span>`;
+        }
+        return `<span class="ftp-stat-badge neutral" title="Rating broadly matches visible skills." style="font-size:9px;cursor:help;">\u27A1 Fair value</span>`;
+    }
+
+    // ── Transfer price-history ledger (local comparable-pricing anchor) ──
+    // Records every transfer candidate seen, keyed by (role, age-band,
+    // primary skill), so subsequent searches can say "players like this are
+    // typically listed around $X and have sold here before." Records persist
+    // in GM storage between sessions — a lightweight stand-in for a server
+    // market archive. Entries are cheap {t, primary, isYouth, role, price}
+    // and capped at TRANSFER_PRICE_MAX.
+    function loadPriceHistory() {
+        try {
+            const raw = GM_getValue(TRANSFER_PRICE_KEY, null);
+            return raw ? JSON.parse(raw) : [];
+        } catch (e) { return []; }
+    }
+
+    function recordPlayerPrice(player) {
+        if (!player) return;
+        const price = player.price || 0;
+        if (price <= 0 && !(player.wage > 0)) return; // nothing meaningful to record
+        const primaryInfo = getPrimarySkillInfo(player);
+        const entry = {
+            t: Date.now(),
+            role: primaryInfo.name, // 'batting' | 'bowling' | 'keeping'
+            isYouth: (player.age || 0) < 21,
+            primary: primaryInfo.value,
+            price: price || 0,
+            wage: player.wage || 0
+        };
+        try {
+            let hist = loadPriceHistory();
+            // Keep only recent entries (60 days) to bound growth
+            const cutoff = Date.now() - 60 * 24 * 60 * 60 * 1000;
+            hist = hist.filter(e => e.t >= cutoff);
+            hist.push(entry);
+            if (hist.length > TRANSFER_PRICE_MAX) {
+                hist = hist.slice(hist.length - TRANSFER_PRICE_MAX);
+            }
+            GM_setValue(TRANSFER_PRICE_KEY, JSON.stringify(hist));
+        } catch (e) { /* non-fatal; ignore storage failures */ }
+    }
+
+    // Returns { count, lo, med, hi } of like-archetype listings we've seen,
+    // or null when there's no data. Buckets by role + age band + primary
+    // skill within ±1.
+    function anchorPriceForPlayer(player) {
+        if (!player) return null;
+        const primaryInfo = getPrimarySkillInfo(player);
+        const role = primaryInfo.name;
+        const isYouth = (player.age || 0) < 21;
+        const primary = primaryInfo.value;
+        const cutoff = Date.now() - 60 * 24 * 60 * 60 * 1000;
+        let matches = loadPriceHistory().filter(e =>
+            e.t >= cutoff &&
+            e.role === role &&
+            e.isYouth === isYouth &&
+            e.price > 0 &&
+            Math.abs(e.primary - primary) <= 1
+        );
+        // Slide the primary range to ±2 if too few matches
+        if (matches.length < 3) {
+            const all = loadPriceHistory().filter(e =>
+                e.t >= cutoff && e.role === role && e.isYouth === isYouth && e.price > 0
+            );
+            matches = all.filter(e => Math.abs(e.primary - primary) <= 2);
+        }
+        if (matches.length === 0) return null;
+        const prices = matches.map(e => e.price).sort((a, b) => a - b);
+        const mid = i => prices[Math.floor(prices.length * i)];
+        return { count: prices.length, lo: mid(0.25), med: mid(0.5), hi: mid(0.75) };
+    }
+
+    function priceAnchorLine(player) {
+        const anchor = anchorPriceForPlayer(player);
+        if (!anchor) return '';
+        const medFmt = '$' + anchor.med.toLocaleString();
+        const range = anchor.count >= 6 ? ` (${'$' + anchor.lo.toLocaleString()}–${'$' + anchor.hi.toLocaleString()})` : '';
+        return `<div class="vj-text-xs vj-text-muted" style="line-height:1.4;margin-top:2px;">\u2691 Listings like this: ~${medFmt}${range} (${anchor.count} seen)</div>`;
     }
 
     // Shared by projectYouthToAge20() and computePlayerCeiling() so "weeks
@@ -2826,7 +2972,7 @@
                         }
                         const parser = new DOMParser();
                         const doc = parser.parseFromString(resp.responseText, 'text/html');
-                        const result = { experience: null, wage: null, talents: [], captaincy: null };
+                        const result = { experience: null, wage: null, wageDiscount: null, talents: [], captaincy: null };
 
                         // Quick sanity check: if we got the login page, bail
                         if (doc.querySelector('input[name="username"]') || resp.responseText.length < 500) {
@@ -2835,11 +2981,18 @@
                         }
 
                         // Parse age/rating/wage from first <p> in .panel .padded
+                        // Format: "16y0w | 13,555 rating | $500 wage (0% discount)".
+                        // The wage shown is the DISCOUNTED wage — the game applies a
+                        // loyalty discount (career youth-start = 5% + 0.5%/season,
+                        // capped at +5%). To compare value fairly across players we
+                        // also recover the real (pre-discount) wage from the % shown.
                         const paddedPs = doc.querySelectorAll('.panel .padded p');
                         if (paddedPs.length > 0) {
                             const infoText = paddedPs[0].textContent;
                             const wageMatch = infoText.match(/\$([\d,]+)\s*wage/);
                             if (wageMatch) result.wage = parseInt(wageMatch[1].replace(/,/g, ''));
+                            const discMatch = infoText.match(/\((\d+)%\s*discount\)/i);
+                            if (discMatch) result.wageDiscount = parseInt(discMatch[1], 10) || 0;
                         }
 
                         // Scan ALL th/td pairs across ALL tables
@@ -2871,15 +3024,15 @@
                             }
                         }
 
-                        debugLog(`[FTP] Player ${playerId}: exp=${result.experience}, wage=${result.wage}, capt=${result.captaincy}, talents=${result.talents.length}`);
+                        debugLog(`[FTP] Player ${playerId}: exp=${result.experience}, wage=${result.wage}, disc=${result.wageDiscount}%, capt=${result.captaincy}, talents=${result.talents.length}`);
                         resolve(result);
                     } catch (e) {
                         debugLog(`[FTP] Player ${playerId}: parse error`, e);
-                        resolve({ experience: null, wage: null, talents: [], captaincy: null });
+                        resolve({ experience: null, wage: null, wageDiscount: null, talents: [], captaincy: null });
                     }
                 },
-                onerror: (e) => { debugLog(`[FTP] Player ${playerId}: network error`, e); resolve({ experience: null, wage: null, talents: [], captaincy: null }); },
-                ontimeout: () => { debugLog(`[FTP] Player ${playerId}: timeout`); resolve({ experience: null, wage: null, talents: [], captaincy: null }); }
+                onerror: (e) => { debugLog(`[FTP] Player ${playerId}: network error`, e); resolve({ experience: null, wage: null, wageDiscount: null, talents: [], captaincy: null }); },
+                ontimeout: () => { debugLog(`[FTP] Player ${playerId}: timeout`); resolve({ experience: null, wage: null, wageDiscount: null, talents: [], captaincy: null }); }
             });
         });
     }
@@ -2893,6 +3046,7 @@
             const details = await fetchPlayerPageDetails(p.id);
             if (details.experience !== null) p.experience = details.experience;
             if (details.wage !== null) p.wage = details.wage;
+            if (details.wageDiscount != null) p.wageDiscount = details.wageDiscount;
             if (details.talents.length > 0) p.talents = details.talents;
             if (details.captaincy !== null) p.captaincy = details.captaincy;
             if (onUpdate) onUpdate(i, players.length);
@@ -4388,6 +4542,27 @@
 
         document.getElementById('ftp-data-status').innerHTML += cacheHtml;
 
+        // Confidence badge shown in the context header — computed here
+        // (after cache/opponentCache are declared) and injected into the
+        // already-rendered context container.
+        try {
+            const tacticsConf = computeConfidence({
+                cacheAgeHours: cache ? cache.ageHours : null,
+                playersWithSkills: cache ? cache.players.filter(p => (p.batting || 0) > 0).length : 0,
+                totalPlayers: availablePlayers.length,
+                hasAcademyInfo: false,
+                hasFinanceInfo: false,
+                hasOpponentData: !!opponentCache && opponentCache.players.length > 0,
+                matchTypeKnown: context.matchType !== 'Unknown',
+            });
+            const ctxEl = document.getElementById('ftp-context');
+            if (ctxEl) {
+                ctxEl.insertAdjacentHTML('afterbegin', `<div class="vj-flex vj-gap-6 vj-mb-4" style="flex-wrap:wrap;">${renderConfidenceBadge(tacticsConf)}</div>`);
+            }
+        } catch (e) {
+            console.warn('[FTP Advisor] Could not render confidence badge:', e);
+        }
+
         // Enrich players with cached data
         let enrichedPlayers = availablePlayers.map(p => {
             const cached = cache ? cache.players.find(cp => cp.id === p.id) : null;
@@ -4523,6 +4698,27 @@
             ? 'N=Normal D=Defensive A=Aggressive \u00B7 T20: aggressive middle/death to maximise scoring rate'
             : 'C = Captain \u00B7 WK = Wicketkeeper \u00B7 N=Normal D=Defensive A=Aggressive \u00B7 OD: anchor at #3, aggressive tail';
         html += `<div class="vj-text-xs vj-text-muted vj-mt-4" style="text-align:center;">${tacticNote}</div>`;
+
+        // Batting-strength by phase — mirrors the game's own Match Ratings
+        // split (Top Order 1-4 / Middle 5-8 / Tail 9-11) so you can see at a
+        // glance whether the recommended XI has a top-heavy or balanced
+        // batting profile, and whether a phase looks thin.
+        const battingRaw = battingOrder.map(p => ({ pos: p.position, v: p.batting || 0, n: p.name }));
+        if (battingRaw.length >= 11) {
+            const sections = [
+                { label: 'Top 1-4', rows: battingRaw.filter(r => r.pos <= 4) },
+                { label: 'Middle 5-8', rows: battingRaw.filter(r => r.pos >= 5 && r.pos <= 8) },
+                { label: 'Tail 9-11', rows: battingRaw.filter(r => r.pos >= 9) }
+            ];
+            const avg = rows => rows.length ? rows.reduce((s, r) => s + r.v, 0) / rows.length : 0;
+            const badges = sections.map(s => {
+                const a = avg(s.rows);
+                const color = a >= 7 ? 'green' : a >= 5 ? 'amber' : 'red';
+                return `<span class="ftp-stat-badge ${color}" title="${s.rows.map(r => `${r.n} (${skillLabel(r.v)})`).join(', ')}" style="font-size:9px;cursor:help;">${s.label}: ${a.toFixed(1)}</span>`;
+            }).join(' ');
+            html += `<div class="vj-text-xs vj-text-muted vj-mt-4" style="display:flex;gap:4px;flex-wrap:wrap;justify-content:center;">${badges}</div>`;
+        }
+
         document.getElementById('ftp-batting').innerHTML = html;
     }
 
@@ -7481,6 +7677,11 @@ table.ftp-table {
                 logSquadGapDiagnostic(seniorEval);
                 const priorityBuys = filtered;
 
+                // Record every candidate's price into the local price-history
+                // ledger so future searches can anchor asking prices against
+                // "similar listings this club has seen before."
+                evaluated.forEach(p => recordPlayerPrice(p));
+
                 // Sort: best buy to worst — ELITE first, then STRONG, then ADEQUATE; within verdict, highest rank first; cheapest first on ties
                 const verdictOrder = { elite: 0, strong: 1, adequate: 2 };
                 priorityBuys.sort((a, b) => (verdictOrder[a.eval.verdict] ?? 9) - (verdictOrder[b.eval.verdict] ?? 9) || b.eval.rank - a.eval.rank || (a.price || 0) - (b.price || 0));
@@ -7557,11 +7758,22 @@ table.ftp-table {
                             // it doesn't take a per-player detail fetch to see.
                             if (primaryInfo.name !== 'keeping' && (p.keeping || 0) >= 6) detailParts.push(`Keep ${skillLabel(p.keeping)}`);
                             if (p.bowlerType) detailParts.push(`<span class="vj-fw-700">${p.bowlerType.toUpperCase()}</span>`);
-                            if (p.rating) detailParts.push(`Rating ${p.rating.toLocaleString()}`);
+                            if (p.rating) {
+                                detailParts.push(`Rating ${p.rating.toLocaleString()}`);
+                                // Hidden-value (spare rating) gauge — a transparent
+                                // estimate of whether this player's displayed skills
+                                // under-/over-state their true quality (hidden
+                                // sub-level progress). See computeSpareRating().
+                                const spare = computeSpareRating(p);
+                                detailParts.push(spareRatingBadge(spare) || '');
+                            }
                             if (detailsFetched && p.experience != null && p.experience > 0) detailParts.push(`Exp ${skillLabel(p.experience)}`);
                             if (detailsFetched && p.captaincy != null && p.captaincy > 0) detailParts.push(`Capt ${skillLabel(p.captaincy)}`);
                             if (detailsFetched && p.wage != null && p.wage > 0) {
-                                detailParts.push(`Wage $${p.wage.toLocaleString()}/wk`);
+                                const discNote = (p.wageDiscount != null && p.wageDiscount > 0)
+                                    ? ` <span title="Loyalty wage discount ${p.wageDiscount}% — shown wage understates true cost">(-${p.wageDiscount}%)</span>`
+                                    : '';
+                                detailParts.push(`Wage $${p.wage.toLocaleString()}/wk${discNote}`);
                                 // Role-aware, talent-aware value — see
                                 // computePlayerValueSkillSum() for why this
                                 // isn't a flat sum of unrelated skills.
@@ -7614,6 +7826,7 @@ table.ftp-table {
                                     return '';
                                 })()}
                                 ${compareHtml}
+                                ${priceAnchorLine(p)}
                             </div>`;
                         });
                     }
@@ -8632,7 +8845,7 @@ table.ftp-table {
             <div class="vj-text-xs vj-text-muted vj-mb-4">Verdict: ${evalResult.verdict.toUpperCase()} · Rank ${rank}/10 · ${(() => { const pi = getPrimarySkillInfo(player); return pi.value ? (pi.name === 'keeping' ? 'Keep' : pi.name === 'bowling' ? 'Bowl' : 'Bat') + ' ' + skillLabel(pi.value) : ''; })()} · Tech ${skillLabel(player.technique)} · Field ${skillLabel(player.fielding)}${(() => {
                 const vpk = computePlayerValuePerK(player);
                 return vpk != null ? ` · ${vpk.toFixed(1)} skill/$K` : '';
-            })()}</div>
+            })()} ${spareRatingBadge(computeSpareRating(player))}</div>
             <div class="vj-text-xs vj-mb-4"><span class="vj-fw-700">Dynasty Score:</span> ${ceilingResult.current.toFixed(1)} now → <span class="vj-fw-700" style="color:var(--vj-gold);">${ceilingResult.ceiling.toFixed(1)} ceiling</span> (${ceilingResult.label}, age/academy/training-aware — same units as the sell lists and transfer market, safe to compare across ages)</div>`;
 
         if (evalResult.strengths.length > 0) {
