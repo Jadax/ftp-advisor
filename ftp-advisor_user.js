@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         FTP Advisor
 // @namespace    http://tampermonkey.net/
-// @version      8.48
-// @description  Comprehensive tactical advisor for From the Pavilion cricket game (v8.48: wage-discount normalization, hidden-value gauge, price-history anchoring, match-ratings batting staging; v8.18: enhanced opponent report, rest scheduling; v7.0: full UI redesign)
+// @version      8.49
+// @description  Comprehensive tactical advisor for From the Pavilion cricket game (v8.49: comprehensive Buy Rating - who to buy, what gap/which player to replace, senior vs youth logic; v8.48: wage-discount normalization, hidden-value gauge, price-history anchoring; v7.0: full UI redesign)
 // @author       You
 // @license      MIT
 // @match        https://www.fromthepavilion.org/*
@@ -699,6 +699,186 @@
             weeks, label, projectedSkills, plan
         };
     }
+
+    // ─────────────────────────────────────────────────────────────
+    // COMPREHENSIVE BUY RATING
+    // ─────────────────────────────────────────────────────────────
+    // The single number for "should I buy this market player?" — answers
+    // the questions the raw Dynasty Score can't:
+    //   * "21y2 is 44 dynasty, 21y3 is 42 — is the 21y2 better?" → Dynasty
+    //     is quality-only (skill sum). It says nothing about stat
+    //     distribution, wage/cost, or squad fit, so "44 vs 42" is NOT a
+    //     buy verdict on its own. BuyRating folds all of that in.
+    //   * "which of my current players does he replace / what hole does
+    //     he fill, so I know whom to sell?" → explicit squad pairing.
+    //
+    // Age logic is deliberately different for senior vs youth, because
+    // "buy" means a different thing:
+    //   * SENIOR (21+): buy to contribute to the first team NOW. Weight
+    //     current quality + value-for-money + squad fit (gap or upgrade).
+    //   * YOUTH (<21): buy to DEVELOP into a future first-team player.
+    //     Weight the ceiling at 20 (training potential) + current dev
+    //     curve + how much that costs + whether the squad has a future
+    //     need in that role.
+    //
+    // Score 0-100. Returns { score, label, fit, replace, breakdown[] },
+    // where `fit` is 'gap' | 'upgrade' | 'depth' | 'none' and `replace`
+    // is the exact squad player this signing would displace (senior) or
+    // null. Every component is a named, weighted term so the number is
+    // explainable rather than a black box.
+    // Requires opts: { squadStats, seniorPlayers, youthPlayers, academySpeed,
+    //                  squadContext, ceilingResult } (precomputed by caller
+    //                  so the expensive training simulation runs once).
+    function computeBuyRating(player, opts) {
+        if (!opts) return { score: 0, label: 'no-context', fit: 'none', replace: null, breakdown: [] };
+        const breakdown = [];
+        const isYouth = Math.round(player.age) < 21;
+        const ceilingResult = opts.ceilingResult;
+        const squadStats = opts.squadStats;
+        const primaryInfo = getPrimarySkillInfo(player);
+        const role = primaryInfo.name;
+        const roleLabel = role === 'keeping' ? 'wicketkeeper' : role === 'bowling' ? 'bowler' : 'batter';
+
+        // 1) Squad fit — the most important "buy OR not" driver.
+        //    A gap-fill (no senior player in this role) or a clear upgrade
+        //    over the current worst-in-role is worth far more than a
+        //    same-calibre depth signing.
+        let fit = 'none', replace = null;
+        let myBestRole = null;
+        const rolePeers = opts.seniorPlayers.filter(p => p.age >= 21 && getPrimarySkillInfo(p).name === role);
+        if (rolePeers.length === 0) {
+            fit = 'gap';
+            breakdown.push(`Fills a squad gap — you have NO senior ${roleLabel} in this role`);
+        } else {
+            // Compare candidate vs each squad peer in the same role by
+            // the SAME quality metric (Dynasty current), so "better"
+            // means better at the thing that counts for first-team.
+            const myRoleAverages = computeSquadStats(rolePeers);
+            myBestRole = rolePeers.slice().sort((a, b) => computePlayerValueSkillSum(b) - computePlayerValueSkillSum(a))[0];
+            const myBestSkill = computePlayerValueSkillSum(myBestRole);
+            const candidateQuality = ceilingResult.current;
+            // Whip the lowest-ranked same-role player if we're clearly better
+            const myWorstSkill = rolePeers.reduce((min, p) => Math.min(min, computePlayerValueSkillSum(p)), Infinity);
+            if (candidateQuality > myBestSkill * 1.05) {
+                fit = 'upgrade';
+                replace = myBestRole;
+                breakdown.push(`Clear upgrade — outranks your best current ${roleLabel} (${myBestRole.name})`);
+            } else if (candidateQuality > myWorstSkill) {
+                // Better than the weakest same-role player → replaces them
+                const worst = rolePeers.reduce((w, p) => computePlayerValueSkillSum(p) < computePlayerValueSkillSum(w) ? p : w, rolePeers[0]);
+                fit = 'upgrade';
+                replace = worst;
+                breakdown.push(`Improves your weakest ${roleLabel} (${worst.name}) — replace them`);
+            } else {
+                fit = 'depth';
+                breakdown.push(`Depth only — not clearly better than your current ${roleLabel}s`);
+            }
+        }
+
+        // 2) Core quality distilled to a 0-~40 contribution.
+        //    SENIOR: use current quality (first-team now). Youth: use the
+        //    projected ceiling at 20 (future first-team), since today's
+        //    numbers barely matter for a 16yo development buy.
+        const qualityRef = isYouth ? ceilingResult.ceiling : ceilingResult.current;
+        // computePlayerValueSkillSum spans roughly 0-40; compress to /40.
+        const qualityScore = Math.max(0, Math.min(40, qualityRef));
+
+        // 3) Age/trajectory factor (0-10).
+        //    Senior: reward youth-in-senior (long runway), penalise 30+
+        //    (declining). Youth: younger = more development runway.
+        let ageScore;
+        if (isYouth) {
+            const age = Math.round(player.age);
+            ageScore = age <= 16 ? 10 : age <= 17 ? 9 : age <= 18 ? 8 : age <= 19 ? 6 : 4;
+        } else if (Math.round(player.age) <= 24) { ageScore = 10; }
+        else if (Math.round(player.age) <= 27) { ageScore = 7; }
+        else if (Math.round(player.age) <= 29) { ageScore = 4; }
+        else { ageScore = 1; }
+
+        // 4) Stat distribution (0-10) — a specialist's value comes from a
+        //    deep primary + supporting skills, not a flat all-rounder sum.
+        //    Punish a big gap in the skill that matters most for the role.
+        let distScore = 5;
+        if (role === 'batting') {
+            const support = ((player.technique||0) + (player.power||0)) / 2;
+            distScore = 4 + Math.min(6, ((player.batting||0) - 5) + (support - 4) * 0.5);
+        } else if (role === 'bowling') {
+            const support = ((player.endurance||0) + (player.technique||0)) / 2;
+            distScore = 4 + Math.min(6, ((player.bowling||0) - 5) + (support - 4) * 0.5);
+        } else if (role === 'keeping') {
+            const support = (player.batting||0); // keepers must bat (keeperBattingMin logic)
+            distScore = 4 + Math.min(6, ((player.keeping||0) - 4) + (((player.batting||0) - 4) * 0.5));
+        }
+        distScore = Math.max(0, Math.min(10, distScore));
+
+        // 5) Value for money (0-15). Quality (skill) per $1k of the real
+        //    (discount-adjusted) wage. Cheap+skilled = excellent value.
+        let valueScore = 0;
+        const vpk = computePlayerValuePerK(player);
+        if (vpk != null) {
+            // vpk ~ 5-15 typical; map to 0-15
+            valueScore = Math.max(0, Math.min(15, (vpk - 3) * 1.5));
+        } else {
+            valueScore = 6; // wage unknown — neutral, don't punish
+        }
+
+        // 6) Cost anchor vs typical listing (0-10). If this candidate's
+        //    asking price is far above what similar archetypes have sold
+        //    for locally (price-history ledger), it's a worse buy.
+        let costScore = 5;
+        const anchor = anchorPriceForPlayer(player);
+        if (anchor && player.price > 0) {
+            if (player.price <= anchor.med) costScore = 10;
+            else if (player.price <= anchor.hi) costScore = 6;
+            else costScore = 3;
+        }
+
+        // 7) Talent bonus (0-5) — role-aligned talents add real upside
+        //    already counted in skill-sum, but reward a meaningful talent
+        //    set explicitly here.
+        const talentScore = Math.min(5, countAlignedTalents(player) * 1.5);
+
+        // Weight by senior/youth emphasis. Seniors: quality/fit/value heavy,
+        // ceiling irrelevant. Youth: ceiling/fit/age heavy, wage light.
+        let score, label;
+        if (isYouth) {
+            const sc = qualityScore * 0.55;                    // ceiling at 20 dominates
+            const fitc = (fit === 'gap' ? 0 : fit === 'upgrade' ? 0 : fit === 'depth' ? 0 : -15) ; // youth fit handled below
+            score = sc + ageScore * 1.2 + distScore * 0.6 + valueScore * 0.5 + costScore * 0.4 + talentScore * 0.8;
+            // Add squad-fit term for youth on top (future need in the role)
+            if (fit === 'gap') score += 10;
+            else if (fit === 'upgrade') score += 6;
+            else if (fit === 'depth') score += 2;
+            score = Math.max(0, Math.min(100, score));
+            label = score >= 75 ? 'elite-signing' : score >= 55 ? 'strong-signing' : score >= 35 ? 'reasonable' : 'pass';
+        } else {
+            score = qualityScore * 1.0 + ageScore + distScore * 0.8 + valueScore * 0.9 + costScore * 0.6 + talentScore;
+            if (fit === 'gap') score += 10;
+            else if (fit === 'upgrade') score += 8;
+            else if (fit === 'depth') score -= 6; // can't justify a signing that isn't a clear upgrade
+            score = Math.max(0, Math.min(100, score));
+            label = score >= 75 ? 'elite-signing' : score >= 55 ? 'strong-signing' : score >= 35 ? 'reasonable' : 'pass';
+        }
+
+        return {
+            score: Math.round(score * 10) / 10,
+            label, fit, replace,
+            role, roleLabel,
+            parts: { quality: qualityScore, age: ageScore, dist: distScore, value: valueScore, cost: costScore, talent: talentScore },
+            breakdown
+        };
+    }
+
+    // Renders the Buy Score as a compact, colour-coded card badge.
+    function buyRatingBadge(buy) {
+        if (!buy || buy.score == null) return '';
+        const color = buy.label === 'elite-signing' ? 'green'
+            : buy.label === 'strong-signing' ? 'teal'
+            : buy.label === 'reasonable' ? 'amber' : 'red';
+        const fitIcon = buy.fit === 'gap' ? '\u{1F193}' : buy.fit === 'upgrade' ? '\u{1F680}' : buy.fit === 'depth' ? '\u{1F4A4}' : '\u26AA';
+        return `<span class="ftp-stat-badge ${color}" title="${buy.breakdown.join('; ') || 'No breakdown'}" style="font-size:10px;cursor:help;">${fitIcon} BUY ${buy.score}/100</span>`;
+    }
+
 
     // ============================================================
     // FORM / EXPERIENCE MULTIPLIERS
@@ -7685,7 +7865,6 @@ table.ftp-table {
                 // Sort: best buy to worst — ELITE first, then STRONG, then ADEQUATE; within verdict, highest rank first; cheapest first on ties
                 const verdictOrder = { elite: 0, strong: 1, adequate: 2 };
                 priorityBuys.sort((a, b) => (verdictOrder[a.eval.verdict] ?? 9) - (verdictOrder[b.eval.verdict] ?? 9) || b.eval.rank - a.eval.rank || (a.price || 0) - (b.price || 0));
-
                 function renderTransferResults(players, totalScanned, ageFilteredCount, verdictFilteredCount, detailsFetched) {
                     // peerCompare was already computed per-candidate up in
                     // the `evaluated` map (it now gates which seniors even
@@ -7745,6 +7924,19 @@ table.ftp-table {
                             // second simulateAdaptiveTrainingPlan() call.
                             const ceilingResult = computePlayerCeiling(p, getAcademySpeedForPlayer(p, academyInfoForProjection), squadContextForProjection);
 
+                            // Comprehensive Buy Rating — the single verdict for
+                            // "should I buy this player", folding in stat
+                            // distribution, role fit, age trajectory, wage value,
+                            // cost anchor and squad fit (gap vs who they
+                            // replace). See computeBuyRating(). Precomputed here
+                            // once per candidate.
+                            const buyRating = computeBuyRating(p, {
+                                squadStats, seniorPlayers, youthPlayers,
+                                academySpeed: getAcademySpeedForPlayer(p, academyInfoForProjection),
+                                squadContext: squadContextForProjection,
+                                ceilingResult
+                            });
+
                             // Build detail line — show experience/wage only if fetched
                             const detailParts = [
                                 `${primaryName} ${skillLabel(primarySkill)}`,
@@ -7803,12 +7995,29 @@ table.ftp-table {
                                 <div class="vj-flex-between">
                                     <span class="vj-fw-700" style="font-size:12px;">#${i+1} ${p.name} <span class="vj-text-xs vj-text-muted">(${formatAgeDisplay(p.age)})</span></span>
                                     <div style="display:flex;gap:4px;align-items:center;">
+                                        ${buyRatingBadge(buyRating)}
                                         <span class="ftp-stat-badge ${badgeClass}">${ev.verdict.toUpperCase()}</span>
                                     </div>
                                 </div>
                                 <div class="vj-text-xs vj-text-muted" style="line-height:1.4;margin-top:2px;">
                                     ${detailParts.join(' \u00B7 ')}
                                 </div>
+                                ${(() => {
+                                    // Explicit "why buy" pairing from the Buy Rating —
+                                    // the answer to "which player does he replace, or
+                                    // what hole does he fill?"
+                                    if (!buyRating) return '';
+                                    if (buyRating.fit === 'gap') {
+                                        return `<div class="vj-text-xs" style="color:var(--vj-green);line-height:1.4;margin-top:2px;">\u{1F193} BUY to fill a gap — no senior ${buyRating.roleLabel} in your squad</div>`;
+                                    }
+                                    if (buyRating.fit === 'upgrade' && buyRating.replace) {
+                                        return `<div class="vj-text-xs" style="color:var(--vj-green);line-height:1.4;margin-top:2px;">\u{1F680} BUY over ${buyRating.replace.name} (${Math.round(buyRating.replace.age)}yo ${buyRating.roleLabel}) — clear upgrade, sell/replace them</div>`;
+                                    }
+                                    if (buyRating.fit === 'depth') {
+                                        return `<div class="vj-text-xs vj-text-muted" style="line-height:1.4;margin-top:2px;">\u{1F4A4} Depth signing — not clearly better than your current ${buyRating.roleLabel}s</div>`;
+                                    }
+                                    return '';
+                                })()}
                                 ${ev.warnings.length > 0 ? `<div class="vj-text-xs vj-text-muted" style="color:var(--vj-red);line-height:1.4;margin-top:2px;">\u26A0 ${ev.warnings.join(' \u00B7 ')}</div>` : ''}
                                 ${ev.strengths.length > 0 ? `<div class="vj-text-xs vj-text-muted" style="color:var(--vj-green);line-height:1.4;margin-top:2px;">\u2713 ${ev.strengths.join(' \u00B7 ')}</div>` : ''}
                                 ${(() => {
