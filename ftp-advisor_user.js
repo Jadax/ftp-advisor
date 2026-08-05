@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         FTP Advisor
 // @namespace    http://tampermonkey.net/
-// @version      8.50
-// @description  Comprehensive tactical advisor for From the Pavilion cricket game (v8.50: transfer results sorted by Buy Rating; v8.49: comprehensive Buy Rating; v8.48: wage-discount normalization, hidden-value gauge, price-history anchoring; v7.0: full UI redesign)
+// @version      8.51
+// @description  Comprehensive tactical advisor for From the Pavilion cricket game (v8.51: Squad Plan - coherent sell-vs-buy roster advisor on squad page; v8.50: transfer results sorted by Buy Rating; v8.49: comprehensive Buy Rating; v7.0: full UI redesign)
 // @author       You
 // @license      MIT
 // @match        https://www.fromthepavilion.org/*
@@ -5821,6 +5821,7 @@ table.ftp-table {
                 { id: 'ftp-refresh', label: '\u21BB', title: 'Refresh' }
             ],
             sections: [
+                { id: 'ftp-squad-plan', label: 'Squad Plan', icon: '\u{1F4E9}', iconColor: 'amber' },
                 { id: 'ftp-squad-stats', label: 'Squad Overview', icon: '\u{1F4CA}', iconColor: 'green' },
                 { id: 'ftp-squad-sell-seniors', label: 'Sell Candidates (Seniors)', icon: '\u{1F4B0}', iconColor: 'red', collapsible: true, collapsed: true },
                 { id: 'ftp-squad-sell-youth', label: 'Sell Candidates (Youth)', icon: '\u{1F331}', iconColor: 'amber', collapsible: true, collapsed: true }
@@ -5883,6 +5884,8 @@ table.ftp-table {
 
         // Keep/sell recommendations for own team
         if (isMyTeam && !isLimitedView) {
+            const planEl = document.getElementById('ftp-squad-plan');
+            if (planEl) planEl.innerHTML = buildSquadPlan(players);
             const seniorSellEl = document.getElementById('ftp-squad-sell-seniors');
             const youthSellEl = document.getElementById('ftp-squad-sell-youth');
             if (seniorSellEl) seniorSellEl.innerHTML = generateSeniorSellList(players);
@@ -8588,6 +8591,91 @@ table.ftp-table {
         html += `<div class="vj-text-xs vj-text-muted vj-mt-4">Free roster spots for better youth recruits or transfer targets.</div>`;
         html += `<div class="ftp-alert info" style="margin-top:6px;"><span>\u2139</span><div><strong>Transfer settlement:</strong> Listing fee $1,000. Youth recruits are exempt from the 7-day relist wait. Settlement same as seniors (50%+ for &lt;100 days in squad).</div></div>`;
         return html;
+    }
+
+    // ============================================================
+    // SQUAD PLAN — the coherent "who to sell, who to buy, and why"
+    // ============================================================
+    // This ties the two halves of roster management together into one
+    // plan, instead of leaving sell-lists and demand-lists as separate
+    // islands:
+    //   * SENIOR: current count vs the ~13-14 target, role-by-role vs
+    //     SENIOR_ROLE_TARGETS, exactly how many to offload to reach it,
+    //     and — crucially — cross-references WHAT you're buying. A
+    //     transfer target flagged "BUY over <player>" means that player
+    //     is now a sell when the signing lands; a transfer-advisor squad
+    //     gap ("no senior X") names the hole a buy must fill.
+    //   * YOUTH: behind the development curve is a strong sell/retire
+    //     signal (youth must meet YOUTH_DEV_CURVE minimums to be worth
+    //     carrying to a senior spot — that's the gate for "good future
+    //     player"), AND the plan surfaces whether the youth squad has
+    //     room to both keep on-track prospects AND recruit replacements
+    //     for the ones you cut (never trim below the manual's 12-youth
+    //     floor, which otherwise triggers an auto-draft of poor recruits).
+    // Returns HTML for the Squad Plan panel section.
+    function buildSquadPlan(players) {
+        if (!players || players.length === 0) return '<div class="vj-text-sm vj-text-muted">No players found.</div>';
+        const seniors = players.filter(p => p.isSenior && p.age >= 21);
+        const youth = players.filter(p => p.isYouth && p.age < 21);
+        const squadStats = computeSquadStats(players);
+
+        const shape = squadStats ? {
+            batters: squadStats.batterCount, bowlers: squadStats.bowlerCount,
+            keepers: squadStats.keeperCount, allrounders: squadStats.allrounderCount
+        } : null;
+
+        // ── SENIOR half ─────────────────────────────────────────
+        const SENIOR_TARGET_TOTAL = SENIOR_ROLE_TARGETS.keeping + SENIOR_ROLE_TARGETS.bowling + SENIOR_ROLE_TARGETS.batting; // 14
+        const seniorOver = Math.max(0, seniors.length - SENIOR_TARGET_TOTAL);
+        let seniorHtml = '';
+
+        if (shape) {
+            const roleRows = [
+                `keep ${shape.keepers} (≤${SENIOR_ROLE_TARGETS.keeping})`,
+                `bowl ${shape.bowlers} (≤${SENIOR_ROLE_TARGETS.bowling})`,
+                `bat ${shape.batters} (≤${SENIOR_ROLE_TARGETS.batting})`
+            ];
+            seniorHtml += `<div class="ftp-stat-row"><span class="ftp-stat-label">Senior count</span><span class="ftp-stat-value">${seniors.length} <span class="vj-text-xs vj-text-muted">(target ~${SENIOR_TARGET_TOTAL})</span></span></div>`;
+            seniorHtml += `<div class="ftp-stat-row"><span class="ftp-stat-label">Role split</span><span class="ftp-stat-value vj-text-xs">${roleRows.join(' \u00B7 ')}</span></div>`;
+        }
+
+        seniorHtml += `<div class="ftp-stat-row"><span class="ftp-stat-label">Room for buys</span><span class="ftp-stat-value">${Math.max(0, seniorOver)} over target ${seniorOver > 0 ? `<span style="color:var(--vj-red);">\u2014 sell ${seniorOver} first to make space</span>` : `<span style="color:var(--vj-green);">\u2014 you can add ${Math.max(0, SENIOR_TARGET_TOTAL - seniors.length)} before trimming</span>`}</span></div>`;
+
+        // Tie directly to the transfer advisor's gap analysis: a role
+        // under its target is a buying opportunity; a role over is where
+        // the sell candidates live.
+        if (shape) {
+            const under = [];
+            if (shape.keepers < SENIOR_ROLE_TARGETS.keeping) under.push(`keeper (${shape.keepers}/${SENIOR_ROLE_TARGETS.keeping})`);
+            if (shape.bowlers < SENIOR_ROLE_TARGETS.bowling) under.push(`bowler (${shape.bowlers}/${SENIOR_ROLE_TARGETS.bowling})`);
+            if (shape.batters < SENIOR_ROLE_TARGETS.batting) under.push(`batter (${shape.batters}/${SENIOR_ROLE_TARGETS.batting})`);
+            const over = [];
+            if (shape.keepers > SENIOR_ROLE_TARGETS.keeping) over.push('keeper');
+            if (shape.bowlers > SENIOR_ROLE_TARGETS.bowling) over.push('bowler');
+            if (shape.batters > SENIOR_ROLE_TARGETS.batting) over.push('batter');
+            if (under.length > 0) seniorHtml += `<div class="vj-text-xs" style="color:var(--vj-green);margin-top:4px;">\u{1F4E5} Buy to fill: ${under.join(', ')} (these are transfer-advisor gap/shortage roles)</div>`;
+            if (over.length > 0) seniorHtml += `<div class="vj-text-xs" style="color:var(--vj-red);margin-top:4px;">\u{1F4E4} Sell from: ${over.join(', ')} (these are the role groups with depth to spare)</div>`;
+        }
+
+        // ── YOUTH half ──────────────────────────────────────────
+        let youthHtml = '';
+        const youthYd = youth.map(p => ({ p, yd: evaluateYouthDevelopment(p) }));
+        const youthBehind = youthYd.filter(x => x.yd && x.yd.overallStatus === 'behind');
+        youthHtml += `<div class="ftp-stat-row"><span class="ftp-stat-label">Youth count</span><span class="ftp-stat-value">${youth.length} <span class="vj-text-xs vj-text-muted">(keep ≥12 to avoid auto-draft)</span></span></div>`;
+        youthHtml += `<div class="ftp-stat-row"><span class="ftp-stat-label">Behind curve</span><span class="ftp-stat-value" style="color:${youthBehind.length > 0 ? 'var(--vj-red)' : 'var(--vj-green)'};">${youthBehind.length} player${youthBehind.length === 1 ? '' : 's'}</span></div>`;
+        youthHtml += `<div class="vj-text-xs vj-text-muted" style="margin-top:4px;line-height:1.5;">Youth must meet the age-based development-curve minimums (primary/technique/fielding against the 16-20 targets) to justify carrying to a senior spot. Behind on 2+ stats \u2014 especially at age 19-20 with no time left to catch up \u2014 is a strong sell/retire signal; see the Youth sell list below for the exact candidates.</div>`;
+        if (youthBehind.length === 0 && youth.length > 14) {
+            youthHtml += `<div class="vj-text-xs vj-text-muted" style="margin-top:4px;">All youth are on track or ahead \u2014 only trim the weakest if you want extra room, and never below 12.</div>`;
+        }
+
+        return `<div class="ftp-info-box" style="border-left:3px solid var(--vj-gold);">
+            <div class="vj-fw-700 vj-mb-4">Squad Plan \u2014 who to sell vs who to buy</div>
+            <div class="vj-fw-700" style="font-size:11px;margin-top:2px;">SENIOR</div>
+            ${seniorHtml}
+            <div class="vj-fw-700" style="font-size:11px;margin-top:8px;">YOUTH</div>
+            ${youthHtml}
+            <div class="vj-text-xs vj-text-muted vj-mt-8" style="border-top:1px solid var(--vj-border);padding-top:6px;">Works with the Transfer Advisor: a market candidate rated \u201cBUY over &lt;name&gt;\u201d names the senior to move on the moment the signing lands, and the transfer advisor\u2019s squad-gap analysis here tells you which role to target. Sell first, buy into the freed spot.</div>
+        </div>`;
     }
 
     // ============================================================
