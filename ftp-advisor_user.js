@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         FTP Advisor
 // @namespace    http://tampermonkey.net/
-// @version      8.56
-// @description  Comprehensive tactical advisor for From the Pavilion cricket game (v8.55: buy rating now weighs transfer price/affordability so a cheap buy clearly beats a 9x-pricier one; v8.54: release hardening).
+// @version      8.57
+// @description  Comprehensive tactical advisor for From the Pavilion cricket game (v8.57: price-independent Overall Rating for every player + ledger-driven fair-price advice; v8.56: youth buy-rating quality cap parity).
 // @author       Tushant Sharma
 // @license      MIT
 // @match        https://www.fromthepavilion.org/*
@@ -388,8 +388,9 @@
     // primary skill), so subsequent searches can say "players like this are
     // typically listed around $X and have sold here before." Records persist
     // in GM storage between sessions — a lightweight stand-in for a server
-    // market archive. Entries are cheap {t, primary, isYouth, role, price}
-    // and capped at TRANSFER_PRICE_MAX.
+    // market archive. Entries are cheap {t, primary, isYouth, age, sum, role,
+    // price} and capped at TRANSFER_PRICE_MAX (age/sum added v8.57 so fair
+    // prices can be age-banded and quality-scaled).
     function loadPriceHistory() {
         try {
             const raw = GM_getValue(TRANSFER_PRICE_KEY, null);
@@ -406,7 +407,9 @@
             t: Date.now(),
             role: primaryInfo.name, // 'batting' | 'bowling' | 'keeping'
             isYouth: (player.age || 0) < 21,
+            age: Math.round(player.age || 0), // v8.57 — pricing scales hugely with age (a 16yo and a 20yo are NOT the same market), so anchors must bucket by age band too
             primary: primaryInfo.value,
+            sum: computePlayerValueSkillSum(player), // visible-quality baseline so computeFairPrice can scale the anchor to a specific candidate (visible only — talents aren't in the transfer list scrape)
             price: price || 0,
             wage: player.wage || 0
         };
@@ -423,42 +426,77 @@
         } catch (e) { /* non-fatal; ignore storage failures */ }
     }
 
-    // Returns { count, lo, med, hi } of like-archetype listings we've seen,
-    // or null when there's no data. Buckets by role + age band + primary
-    // skill within ±1.
+    // Returns { count, lo, med, hi, sumMed } of like-archetype listings we've
+    // seen, or null when there's no data. Buckets by role + age band + primary
+    // skill within ±1 (sliding wider when sparse). `sumMed` is the median
+    // recorded QUALITY (skill-sum) of those listings, so computeFairPrice can
+    // scale the price anchor to a specific candidate's quality rather than
+    // treating every listing of that archetype as worth the same.
     function anchorPriceForPlayer(player) {
         if (!player) return null;
         const primaryInfo = getPrimarySkillInfo(player);
         const role = primaryInfo.name;
         const isYouth = (player.age || 0) < 21;
+        const age = Math.round(player.age || 0);
         const primary = primaryInfo.value;
         const cutoff = Date.now() - 60 * 24 * 60 * 60 * 1000;
-        let matches = loadPriceHistory().filter(e =>
-            e.t >= cutoff &&
-            e.role === role &&
-            e.isYouth === isYouth &&
-            e.price > 0 &&
-            Math.abs(e.primary - primary) <= 1
-        );
-        // Slide the primary range to ±2 if too few matches
+        const base = (e) => e.t >= cutoff && e.role === role && e.isYouth === isYouth && e.price > 0;
+        // Legacy entries saved before v8.57 have no `age` — match them at any
+        // age (coarser but same role/age-group archetype) until they expire
+        // out of the 60-day window. Newer entries match the candidate's own
+        // rounded age within tolerance.
+        const byAge = (e, tol) => e.age == null || Math.abs(e.age - age) <= tol;
+        let matches = loadPriceHistory().filter(e => base(e) && byAge(e, 1) && Math.abs(e.primary - primary) <= 1);
+        // Slide both the primary range and the age tolerance wider if too few
         if (matches.length < 3) {
-            const all = loadPriceHistory().filter(e =>
-                e.t >= cutoff && e.role === role && e.isYouth === isYouth && e.price > 0
-            );
-            matches = all.filter(e => Math.abs(e.primary - primary) <= 2);
+            matches = loadPriceHistory().filter(e => base(e) && byAge(e, 2) && Math.abs(e.primary - primary) <= 2);
         }
         if (matches.length === 0) return null;
         const prices = matches.map(e => e.price).sort((a, b) => a - b);
         const mid = i => prices[Math.floor(prices.length * i)];
-        return { count: prices.length, lo: mid(0.25), med: mid(0.5), hi: mid(0.75) };
+        const sums = matches.map(e => e.sum).filter(s => s > 0).sort((a, b) => a - b);
+        const sumMed = sums.length ? sums[Math.floor(sums.length / 2)] : null;
+        return { count: prices.length, lo: mid(0.25), med: mid(0.5), hi: mid(0.75), sumMed };
     }
 
-    function priceAnchorLine(player) {
+    // "What should I pay" — the price-aware half of the overall-rating pair.
+    // computeOverallRating() is deliberately price-independent (so it works
+    // identically for owned players who have no price); THIS function answers
+    // the market-only question, scaled from the local price-history ledger's
+    // anchor by how this candidate's quality compares to the archetype's
+    // typical quality (a player well above the usual skill level of similar
+    // listings is worth more than the raw median). Returns { fair, lo, hi,
+    // count } or null when there's no usable comparable data yet.
+    function computeFairPrice(player) {
+        if (!player) return null;
         const anchor = anchorPriceForPlayer(player);
-        if (!anchor) return '';
-        const medFmt = '$' + anchor.med.toLocaleString();
-        const range = anchor.count >= 6 ? ` (${'$' + anchor.lo.toLocaleString()}–${'$' + anchor.hi.toLocaleString()})` : '';
-        return `<div class="vj-text-xs vj-text-muted" style="line-height:1.4;margin-top:2px;">\u2691 Listings like this: ~${medFmt}${range} (${anchor.count} seen)</div>`;
+        if (!anchor) return null;
+        // Scale by quality ratio when the ledger knows the archetype's typical
+        // quality; fall back to the raw anchor median for legacy entries that
+        // predate the sum field. Clamped so an extreme outlier can't produce a
+        // ludicrous fair price (0.5x-2x the archetype median).
+        const candidateQuality = computePlayerValueSkillSum(player);
+        const ratio = anchor.sumMed ? Math.max(0.5, Math.min(2, candidateQuality / anchor.sumMed)) : 1;
+        return {
+            fair: anchor.med * ratio,
+            lo: anchor.lo * ratio,
+            hi: anchor.hi * ratio,
+            count: anchor.count
+        };
+    }
+
+    function fairPriceLine(player) {
+        const fp = computeFairPrice(player);
+        if (!fp) return '';
+        const asking = player.price || 0;
+        const ratio = asking > 0 ? asking / fp.fair : 0;
+        let tag = '', color = 'var(--vj-text-muted)';
+        if (asking <= 0) tag = 'no asking price yet';
+        else if (ratio <= 0.85) { tag = 'below market — good deal'; color = 'var(--vj-green)'; }
+        else if (ratio >= 1.15) { tag = 'above market — negotiate or pass'; color = 'var(--vj-red)'; }
+        else tag = 'at market';
+        const range = fp.count >= 6 ? ` ($${Math.round(fp.lo).toLocaleString()}–$${Math.round(fp.hi).toLocaleString()})` : '';
+        return `<div class="vj-text-xs" style="color:${color};line-height:1.4;margin-top:2px;">\u2696 Fair price ~$${Math.round(fp.fair).toLocaleString()}${range} (${fp.count} similar seen)${asking > 0 ? ` \u00B7 asking $${asking.toLocaleString()} \u2192 ${tag}` : ''}</div>`;
     }
 
     // Shared by projectYouthToAge20() and computePlayerCeiling() so "weeks
@@ -528,7 +566,7 @@
     function computePlayerCeiling(player, academySpeed, squadContext, projectToAge) {
         const age = player.age || 0;
         const isYouth = age < 20;
-        // `projectToAge` (used by the Buy Rating for youth) overrides the
+        // `projectToAge` (used by the Overall Rating for youth) overrides the
         // default horizon so a youth is projected to a SENIOR-COMPARABLE
         // age (e.g. 22 — a few years into their senior career) rather than
         // being truncated at 20. Without it, a 16yo is judged on only 4
@@ -552,133 +590,86 @@
     }
 
     // ─────────────────────────────────────────────────────────────
-    // COMPREHENSIVE BUY RATING
+    // OVERALL RATING (price-independent)
     // ─────────────────────────────────────────────────────────────
-    // The single number for "should I buy this market player?" — answers
-    // the questions the raw Dynasty Score can't:
+    // The single "how good is this player?" number, usable for ANY player —
+    // owned (no price) or on the market — because it deliberately excludes
+    // price and squad fit. It answers the question Dynasty alone can't:
     //   * "21y2 is 44 dynasty, 21y3 is 42 — is the 21y2 better?" → Dynasty
     //     is quality-only (skill sum). It says nothing about stat
-    //     distribution, wage/cost, or squad fit, so "44 vs 42" is NOT a
-    //     buy verdict on its own. BuyRating folds all of that in.
-    //   * "which of my current players does he replace / what hole does
-    //     he fill, so I know whom to sell?" → explicit squad pairing.
+    //     distribution, wage efficiency, or talents, so "44 vs 42" is NOT a
+    //     rating on its own. OverallRating folds all of that in.
+    //   * Price and squad fit are deliberately NOT part of it: price is a
+    //     market fact (owned players don't have one, so a price-dependent
+    //     rating would break them), and squad fit is already reported by
+    //     comparePlayerToSquadPeers on transfer cards ("outranks your current
+    //     X" / "fills a gap") and on the Player Advisor. Conflating price into
+    //     the rating is exactly what the old
+    //     Buy Rating did (v8.49), and it made the score swing wildly with the
+    //     asking price (a $5k vs $50k listing of near-equal quality differed
+    //     by ~10 points purely on cost) while saying nothing useful to an
+    //     owner. Instead: this rating = quality of the player, and
+    //     computeFairPrice() (see the price-ledger block above) = "what
+    //     should I actually pay" for a market player.
     //
     // Age logic is deliberately different for senior vs youth, because
-    // "buy" means a different thing:
-    //   * SENIOR (21+): buy to contribute to the first team NOW. Weight
-    //     current quality + value-for-money + squad fit (gap or upgrade).
-    //   * YOUTH (<21): buy to DEVELOP into a future first-team player.
-    //     Weight the ceiling at 20 (training potential) + current dev
-    //     curve + how much that costs + whether the squad has a future
-    //     need in that role.
+    // "current quality" means different things:
+    //   * SENIOR (21+): current quality (first-team now).
+    //   * YOUTH (<21): the projected ceiling at a SENIOR-COMPARABLE age (22 —
+    //     a few years into their senior career), because the whole point of a
+    //     youth is the senior they'll become, and they keep training past 20.
+    //     Truncating at the age-20 promotion boundary made every 16yo look
+    //     worse than any senior (apples-to-oranges). This is the ONE youth
+    //     horizon used everywhere a youth's quality is compared to a senior's
+    //     — the transfer overall rating, the Player Advisor, and the Squad
+    //     Plan's youth sell ranking all project to 22.
     //
-    // Score 0-100. Returns { score, label, fit, replace, breakdown[] },
-    // where `fit` is 'gap' | 'upgrade' | 'depth' | 'none' and `replace`
-    // is the exact squad player this signing would displace (senior) or
-    // null. Every component is a named, weighted term so the number is
-    // explainable rather than a black box.
-    // Requires opts: { squadStats, seniorPlayers, youthPlayers, academySpeed,
-    //                  squadContext, ceilingResult } (precomputed by caller
-    //                  so the expensive training simulation runs once).
-    function computeBuyRating(player, opts) {
-        if (!opts) return { score: 0, label: 'no-context', fit: 'none', replace: null, breakdown: [] };
+    // Score 0-100. Returns { score, label, parts, breakdown[] }. Every
+    // component is a named, weighted term so the number is explainable rather
+    // than a black box.
+    // Requires opts: { academySpeed, squadContext, seniorCeiling } — the
+    // senior-comparable (to-22) projection is precomputed by the caller so the
+    // expensive training simulation runs once per candidate; computeOverallRating
+    // falls back to self-computing it only for direct callers that don't pass
+    // it (e.g. test harnesses).
+    function computeOverallRating(player, opts) {
+        if (!opts) return { score: 0, label: 'no-context', parts: {}, breakdown: [] };
         const breakdown = [];
         const isYouth = Math.round(player.age) < 21;
-        const ceilingResult = opts.ceilingResult;
-        const squadStats = opts.squadStats;
         const primaryInfo = getPrimarySkillInfo(player);
         const role = primaryInfo.name;
         const roleLabel = role === 'keeping' ? 'wicketkeeper' : role === 'bowling' ? 'bowler' : 'batter';
 
-        // 1) Core quality distilled to a 0-~40 contribution — computed
-        //    first because the squad-fit comparison below uses it.
-        //    SENIOR: use current quality (first-team now). Youth: use the
+        // 1) Core quality distilled to a 0-55 contribution — the dominant
+        //    term. SENIOR: current skill-sum (first-team now). Youth: the
         //    projected ceiling at a SENIOR-COMPARABLE age (22 — a few years
         //    into their senior career), because the whole point of a youth
-        //    buy is what they'll contribute as a SENIOR, and they keep
-        //    training past 20. Truncating at the age-20 promotion boundary
-        //    (the old "ceilingResult.ceiling") made every 16yo look far
-        //    worse than any senior, since a 16yo was graded on only ~4
-        //    years of development while a 21yo senior is graded on their
-        //    current value — apples-to-oranges, and wrong for a player who
-        //    becomes a senior. Projecting to ~22 makes the youth ceiling
-        //    comparable in the same units as a senior's current. The "at 20"
-        //    projection is still shown on the card as the promo boundary.
+        //    is the senior they'll become, and they keep training past 20.
+        //    Truncating at the age-20 promotion boundary (the old
+        //    "ceilingResult.ceiling") made every 16yo look far worse than any
+        //    senior. Projecting to ~22 makes the youth ceiling comparable in
+        //    the same units as a senior's current. Cap 55 keeps headroom on
+        //    the 0-100 scale while matching the real observed range of
+        //    skill-sums (a ~50+ senior is already exceptional — a Spectacular
+        //    primary plus strong supporting skills).
         let qualityRef;
         if (isYouth) {
             // Prefer the caller-precomputed senior-comparable projection
             // (age 22) so the expensive simulation isn't re-run here. The
-            // fallback self-computes for direct callers that only pass
-            // ceilingResult (e.g. test harnesses). This horizon is
-            // deliberately different from ceilingResult (to-20, shown on
-            // the card as the promo boundary): the buy rating is about
-            // what they'll contribute as a SENIOR.
+            // fallback self-computes for direct callers that don't pass it
+            // (e.g. test harnesses). This horizon is deliberately different
+            // from ceilingResult (to-20, still shown on the card as the
+            // promo boundary): the rating is about what they'll contribute
+            // as a SENIOR.
             qualityRef = (opts.seniorCeiling && opts.seniorCeiling.ceiling != null)
                 ? opts.seniorCeiling.ceiling
                 : computePlayerCeiling(player, opts.academySpeed, opts.squadContext, 22).ceiling;
         } else {
-            qualityRef = ceilingResult.current;
+            qualityRef = computePlayerValueSkillSum(player);
         }
-        // Compress the quality value into its 0-~40 (senior) / 0-50 (youth)
-        // contribution. The senior cap matches the real range of CURRENT
-        // skill-sums (a 40+ senior is already exceptional). A youth's
-        // PROJECTED ceiling can legitimately exceed that — elite prospects
-        // project to 50+ by age 22 — and the whole point of a youth buy is
-        // the future senior they become, so youth cap higher (50): a
-        // prospect who projects to a better senior than anything currently
-        // on the squad should be able to outrank those seniors, not just
-        // tie them. The bound keeps the max youth total under the
-        // theoretical senior max (~100).
-        const qualityCap = isYouth ? 50 : 40;
-        const qualityScore = Math.max(0, Math.min(qualityCap, qualityRef));
+        const qualityScore = Math.max(0, Math.min(55, qualityRef));
 
-        // 2) Squad fit — the most important "buy OR not" driver.
-        //    A gap-fill (no senior player in this role) or a clear upgrade
-        //    over the current best-in-role is worth far more than a
-        //    same-calibre depth signing.
-        let fit = 'none', replace = null;
-        let myBestRole = null;
-        const rolePeers = opts.seniorPlayers.filter(p => p.age >= 21 && getPrimarySkillInfo(p).name === role);
-        if (rolePeers.length === 0) {
-            fit = 'gap';
-            breakdown.push(`Fills a squad gap — you have NO senior ${roleLabel} in this role`);
-        } else {
-            // Compare candidate vs each squad peer in the same role by
-            // the SAME quality metric (skill-sum), so "better" means
-            // better at the thing that counts for first-team. Youth
-            // compare their PROJECTED ceiling at 22, not their current
-            // value — a 16yo's current sum will almost never beat a
-            // senior's, which silently demoted every youth to "depth".
-            // Projection-vs-current answers the real question: "will this
-            // kid eventually take a current senior's spot?"
-            myBestRole = rolePeers.slice().sort((a, b) => computePlayerValueSkillSum(b) - computePlayerValueSkillSum(a))[0];
-            const myBestSkill = computePlayerValueSkillSum(myBestRole);
-            const candidateQuality = qualityRef;
-            // Whip the lowest-ranked same-role player if we're clearly better
-            const myWorstSkill = rolePeers.reduce((min, p) => Math.min(min, computePlayerValueSkillSum(p)), Infinity);
-            if (candidateQuality > myBestSkill * 1.05) {
-                fit = 'upgrade';
-                replace = myBestRole;
-                breakdown.push(isYouth
-                    ? `Projects to outrank your best current ${roleLabel} (${myBestRole.name}) by ~22`
-                    : `Clear upgrade — outranks your best current ${roleLabel} (${myBestRole.name})`);
-            } else if (candidateQuality > myWorstSkill) {
-                // Better than the weakest same-role player → replaces them
-                const worst = rolePeers.reduce((w, p) => computePlayerValueSkillSum(p) < computePlayerValueSkillSum(w) ? p : w, rolePeers[0]);
-                fit = 'upgrade';
-                replace = worst;
-                breakdown.push(isYouth
-                    ? `Projects to beat your weakest ${roleLabel} (${worst.name}) by ~22 — grows into the spot`
-                    : `Improves your weakest ${roleLabel} (${worst.name}) — replace them`);
-            } else {
-                fit = 'depth';
-                breakdown.push(isYouth
-                    ? `Depth only — even projected to ~22, not clearly better than your current ${roleLabel}s`
-                    : `Depth only — not clearly better than your current ${roleLabel}s`);
-            }
-        }
-
-        // 3) Age/trajectory factor (0-10).
+        // 2) Age/trajectory factor (0-10).
         //    Senior: reward youth-in-senior (long runway), penalise 30+
         //    (declining). Youth: younger = more development runway.
         let ageScore;
@@ -690,7 +681,7 @@
         else if (Math.round(player.age) <= 29) { ageScore = 4; }
         else { ageScore = 1; }
 
-        // 4) Stat distribution (0-10) — a specialist's value comes from a
+        // 3) Stat distribution (0-10) — a specialist's value comes from a
         //    deep primary + supporting skills, not a flat all-rounder sum.
         //    Punish a big gap in the skill that matters most for the role.
         let distScore = 5;
@@ -706,8 +697,12 @@
         }
         distScore = Math.max(0, Math.min(10, distScore));
 
-        // 5) Value for money (0-15). Quality (skill) per $1k of the real
+        // 4) Value for money (0-15). Quality (skill) per $1k of the real
         //    (discount-adjusted) wage. Cheap+skilled = excellent value.
+        //    NOTE: uses WAGE only — the one-time transfer price is handled
+        //    by computeFairPrice() (see the price-ledger block), not folded
+        //    into the rating, so owned players (no price) and market
+        //    candidates are rated on the same scale.
         let valueScore = 0;
         const vpk = computePlayerValuePerK(player);
         if (vpk != null) {
@@ -717,88 +712,52 @@
             valueScore = 6; // wage unknown — neutral, don't punish
         }
 
-        // 6) Cost (0-15). Price is what you ACTUALLY pay to acquire the
-        //    player (a one-time transfer fee on top of ongoing wages), so it
-        //    must differentiate a real buy from a luxury — an $8k and a
-        //    $75k senior of near-equal quality are NOT equally good buys,
-        //    and the wage-only valueScore can't see that (it only uses
-        //    wage). Score high when the price is cheap relative to both the
-        //    local market anchor (price-history ledger, when available) and
-        //    an absolute affordability ceiling; score low when expensive.
-        let costScore = 6; // neutral when price unknown
-        const anchor = anchorPriceForPlayer(player);
-        if (player.price > 0) {
-            // Absolute affordability ceiling (best-effort, community-sourced:
-            // most good senior signings are <$20k; $50k+ is a premium outlay).
-            // Cheap is always good value; expensive is a large risk.
-            if (player.price <= 8000) costScore = 15;
-            else if (player.price <= 15000) costScore = 12;
-            else if (player.price <= 30000) costScore = 9;
-            else if (player.price <= 60000) costScore = 6;
-            else costScore = 3; // $60k+ — premium, only justified by exceptional quality
-            // Refine with the local market anchor when we have real
-            // comparable-history: a price below what this archetype usually
-            // sells for is a better buy than one far above it.
-            if (anchor && anchor.med > 0) {
-                if (player.price <= anchor.med * 0.8) costScore = Math.max(costScore, 15);
-                else if (player.price <= anchor.med * 1.2) costScore = Math.min(costScore, 13);
-                else if (player.price <= anchor.hi) costScore = Math.min(costScore, 10);
-                else costScore = Math.min(costScore, 5); // above the whole range = overpriced
-            }
-        }
-
-        // 7) Talent bonus (0-5) — role-aligned talents add real upside
+        // 5) Talent bonus (0-5) — role-aligned talents add real upside
         //    already counted in skill-sum, but reward a meaningful talent
         //    set explicitly here.
         const talentScore = Math.min(5, countAlignedTalents(player) * 1.5);
 
-        // Weight by senior/youth emphasis. Seniors: quality/fit/value heavy,
-        // ceiling irrelevant. Youth: ceiling/fit/age heavy, wage light.
+        // Weight by senior/youth emphasis. No price, no squad-fit terms —
+        // those are market decisions (computeFairPrice / comparePlayerToSquadPeers),
+        // not player-quality, and leaving them out is what lets this one
+        // number be shown identically for an owned player and a market
+        // candidate. Youth quality is their projected SENIOR ceiling (age
+        // 22) — already senior-comparable units, so it's weighted at parity
+        // (1.0), not discounted. The old 0.55 discount on top of the
+        // projection (and the v8.55 cost term) structurally capped every
+        // youth below seniors and made scores swing on asking price; a
+        // curve-meeting youth can now legitimately outrank an older senior,
+        // which is the whole point of the projection.
         let score, label;
         if (isYouth) {
-            // Youth quality is their projected SENIOR ceiling (age 22) —
-            // already senior-comparable units, so it's weighted at parity
-            // (1.0), not discounted. The old 0.55 discount on top of the
-            // projection structurally capped every youth below seniors:
-            // even an elite curve-meeting 16yo stalled at ~70 ("strong-
-            // signing") while a comparable senior buy hit 80+ — backwards
-            // for a player who projects to a BETTER senior than the 25yo.
-            // Parity lets a curve-meeting youth legitimately outrank an
-            // 80+ senior buy, which is the whole point of the projection.
-            const sc = qualityScore * 1.0;
-            score = sc + ageScore * 1.2 + distScore * 0.6 + valueScore * 0.5 + costScore * 0.6 + talentScore * 0.8;
-            // Add squad-fit term for youth on top (future need in the role)
-            if (fit === 'gap') score += 10;
-            else if (fit === 'upgrade') score += 6;
-            else if (fit === 'depth') score += 2;
+            score = qualityScore * 1.0 + ageScore * 1.2 + distScore * 0.6 + valueScore * 0.4 + talentScore * 0.8;
             score = Math.max(0, Math.min(100, score));
-            label = score >= 75 ? 'elite-signing' : score >= 55 ? 'strong-signing' : score >= 35 ? 'reasonable' : 'pass';
+            label = score >= 75 ? 'elite' : score >= 55 ? 'strong' : score >= 35 ? 'reasonable' : 'pass';
         } else {
-            score = qualityScore * 1.0 + ageScore + distScore * 0.8 + valueScore * 0.9 + costScore * 0.9 + talentScore;
-            if (fit === 'gap') score += 10;
-            else if (fit === 'upgrade') score += 8;
-            else if (fit === 'depth') score -= 6; // can't justify a signing that isn't a clear upgrade
+            score = qualityScore * 1.0 + ageScore + distScore * 0.8 + valueScore * 0.8 + talentScore * 1.0;
             score = Math.max(0, Math.min(100, score));
-            label = score >= 75 ? 'elite-signing' : score >= 55 ? 'strong-signing' : score >= 35 ? 'reasonable' : 'pass';
+            label = score >= 75 ? 'elite' : score >= 55 ? 'strong' : score >= 35 ? 'reasonable' : 'pass';
         }
 
         return {
             score: Math.round(score * 10) / 10,
-            label, fit, replace,
-            role, roleLabel,
-            parts: { quality: qualityScore, age: ageScore, dist: distScore, value: valueScore, cost: costScore, talent: talentScore },
+            label, role, roleLabel,
+            parts: { quality: qualityScore, age: ageScore, dist: distScore, value: valueScore, talent: talentScore },
             breakdown
         };
     }
 
-    // Renders the Buy Score as a compact, colour-coded card badge.
-    function buyRatingBadge(buy) {
-        if (!buy || buy.score == null) return '';
-        const color = buy.label === 'elite-signing' ? 'green'
-            : buy.label === 'strong-signing' ? 'teal'
-            : buy.label === 'reasonable' ? 'amber' : 'red';
-        const fitIcon = buy.fit === 'gap' ? '\u{1F193}' : buy.fit === 'upgrade' ? '\u{1F680}' : buy.fit === 'depth' ? '\u{1F4A4}' : '\u26AA';
-        return `<span class="ftp-stat-badge ${color}" title="${buy.breakdown.join('; ') || 'No breakdown'}" style="font-size:10px;cursor:help;">${fitIcon} BUY ${buy.score}/100</span>`;
+    // Renders the Overall Score as a compact, colour-coded card badge.
+    // Price-independent, so it reads identically on a transfer card and an
+    // owned player's page — the badge never carries a fit icon because squad
+    // fit is reported separately (comparePlayerToSquadPeers lines on transfer
+    // cards).
+    function overallRatingBadge(r) {
+        if (!r || r.score == null) return '';
+        const color = r.label === 'elite' ? 'green'
+            : r.label === 'strong' ? 'teal'
+            : r.label === 'reasonable' ? 'amber' : 'red';
+        return `<span class="ftp-stat-badge ${color}" title="${r.breakdown.join('; ') || 'No breakdown'}" style="font-size:10px;cursor:help;">\u2605 OVERALL ${r.score}/100</span>`;
     }
 
 
@@ -7819,7 +7778,7 @@ table.ftp-table {
                 logSquadGapDiagnostic(seniorEval);
                 const priorityBuys = filtered;
 
-                // Academy/squad context for per-candidate Dynasty + Buy Rating
+                // Academy/squad context for per-candidate Dynasty + Overall Rating
                 // projections. Computed once here and reused by every render
                 // pass (initial and after "Fetch Experience, Wages & Talents")
                 // so the expensive training simulation runs once per candidate
@@ -7828,10 +7787,11 @@ table.ftp-table {
                 const squadContextForProjection = { size: seniorPlayers.length + youthPlayers.length, academyInfo: academyInfoForProjection, financeInfo: loadFinanceCache() };
 
                 // Precompute and cache each candidate's Dynasty (ceilingResult)
-                // and comprehensive Buy Rating on the player object, so both
-                // the sort below and renderTransferResults can read them back
-                // instead of recomputing. Stored as _ceilingResult/_buyRating.
-                function computeCandidateBuyData(p) {
+                // and price-independent Overall Rating on the player object, so
+                // both the sort below and renderTransferResults can read them
+                // back instead of recomputing. Stored as _ceilingResult/
+                // _overallRating.
+                function computeCandidateRating(p) {
                     const academySpeed = getAcademySpeedForPlayer(p, academyInfoForProjection);
                     const ceilingResult = computePlayerCeiling(p, academySpeed, squadContextForProjection);
                     p._ceilingResult = ceilingResult;
@@ -7840,34 +7800,34 @@ table.ftp-table {
                     // career) — a deliberately different horizon from the
                     // age-20 promo-boundary projection in ceilingResult,
                     // which stays on the card as the "Projected at 20" line.
-                    // Precomputed HERE rather than inside computeBuyRating so
-                    // the expensive training simulation still runs once per
+                    // Precomputed HERE rather than inside computeOverallRating
+                    // so the expensive training simulation still runs once per
                     // candidate (see the v8.49 design note).
                     const seniorCeiling = (Math.round(p.age) < 21)
                         ? computePlayerCeiling(p, academySpeed, squadContextForProjection, 22)
                         : null;
-                    p._buyRating = computeBuyRating(p, {
-                        squadStats, seniorPlayers, youthPlayers,
+                    p._overallRating = computeOverallRating(p, {
                         academySpeed,
                         squadContext: squadContextForProjection,
-                        ceilingResult, seniorCeiling
+                        seniorCeiling
                     });
                     return p;
                 }
-                priorityBuys.forEach(computeCandidateBuyData);
+                priorityBuys.forEach(computeCandidateRating);
 
                 // Record every candidate's price into the local price-history
                 // ledger so future searches can anchor asking prices against
                 // "similar listings this club has seen before."
                 evaluated.forEach(p => recordPlayerPrice(p));
 
-                // Sort: best BUY RATING first (the comprehensive "should I buy"
-                // verdict), then verdict/rank/price as tiebreakers — the list
-                // now answers "what should I actually sign" rather than just
-                // "what's a high-skill player".
+                // Sort: best OVERALL RATING first (the price-independent
+                // "how good is this player" verdict), then verdict/rank/price
+                // as tiebreakers — the list answers "who's the best player
+                // here" with the fair-price line on each card separating a
+                // great deal from a great-but-overpriced player.
                 const verdictOrder = { elite: 0, strong: 1, adequate: 2 };
                 priorityBuys.sort((a, b) =>
-                    (b._buyRating && b._buyRating.score || 0) - (a._buyRating && a._buyRating.score || 0) ||
+                    (b._overallRating && b._overallRating.score || 0) - (a._overallRating && a._overallRating.score || 0) ||
                     (verdictOrder[a.eval.verdict] ?? 9) - (verdictOrder[b.eval.verdict] ?? 9) ||
                     (a.price || 0) - (b.price || 0));
                 function renderTransferResults(players, totalScanned, ageFilteredCount, verdictFilteredCount, detailsFetched) {
@@ -7903,13 +7863,13 @@ table.ftp-table {
                             const primaryInfo = getPrimarySkillInfo(p);
                             const primarySkill = primaryInfo.value;
                             const primaryName = primaryInfo.name === 'keeping' ? 'Keep' : primaryInfo.name === 'bowling' ? 'Bowl' : 'Bat';
-                            // Dynasty + Buy Rating were precomputed once per
+                            // Dynasty + Overall Rating were precomputed once per
                             // candidate in updateTransferAdvisor() (so they
                             // could drive the sort) and stored on the player
                             // object — read them back rather than re-running
                             // the expensive training simulation here.
                             const ceilingResult = p._ceilingResult;
-                            const buyRating = p._buyRating;
+                            const overallRating = p._overallRating;
 
                             // Build detail line — show experience/wage only if fetched
                             const detailParts = [
@@ -7969,29 +7929,13 @@ table.ftp-table {
                                 <div class="vj-flex-between">
                                     <span class="vj-fw-700" style="font-size:12px;">#${i+1} ${p.name} <span class="vj-text-xs vj-text-muted">(${formatAgeDisplay(p.age)})</span></span>
                                     <div style="display:flex;gap:4px;align-items:center;">
-                                        ${buyRatingBadge(buyRating)}
+                                        ${overallRatingBadge(overallRating)}
                                         <span class="ftp-stat-badge ${badgeClass}">${ev.verdict.toUpperCase()}</span>
                                     </div>
                                 </div>
                                 <div class="vj-text-xs vj-text-muted" style="line-height:1.4;margin-top:2px;">
                                     ${detailParts.join(' \u00B7 ')}
                                 </div>
-                                ${(() => {
-                                    // Explicit "why buy" pairing from the Buy Rating —
-                                    // the answer to "which player does he replace, or
-                                    // what hole does he fill?"
-                                    if (!buyRating) return '';
-                                    if (buyRating.fit === 'gap') {
-                                        return `<div class="vj-text-xs" style="color:var(--vj-green);line-height:1.4;margin-top:2px;">\u{1F193} BUY to fill a gap — no senior ${buyRating.roleLabel} in your squad</div>`;
-                                    }
-                                    if (buyRating.fit === 'upgrade' && buyRating.replace) {
-                                        return `<div class="vj-text-xs" style="color:var(--vj-green);line-height:1.4;margin-top:2px;">\u{1F680} BUY over ${buyRating.replace.name} (${Math.round(buyRating.replace.age)}yo ${buyRating.roleLabel}) — clear upgrade, sell/replace them</div>`;
-                                    }
-                                    if (buyRating.fit === 'depth') {
-                                        return `<div class="vj-text-xs vj-text-muted" style="line-height:1.4;margin-top:2px;">\u{1F4A4} Depth signing — not clearly better than your current ${buyRating.roleLabel}s</div>`;
-                                    }
-                                    return '';
-                                })()}
                                 ${ev.warnings.length > 0 ? `<div class="vj-text-xs vj-text-muted" style="color:var(--vj-red);line-height:1.4;margin-top:2px;">\u26A0 ${ev.warnings.join(' \u00B7 ')}</div>` : ''}
                                 ${ev.strengths.length > 0 ? `<div class="vj-text-xs vj-text-muted" style="color:var(--vj-green);line-height:1.4;margin-top:2px;">\u2713 ${ev.strengths.join(' \u00B7 ')}</div>` : ''}
                                 ${(() => {
@@ -8009,7 +7953,7 @@ table.ftp-table {
                                     return '';
                                 })()}
                                 ${compareHtml}
-                                ${priceAnchorLine(p)}
+                                ${fairPriceLine(p)}
                             </div>`;
                         });
                     }
@@ -8038,13 +7982,13 @@ table.ftp-table {
                             // with the same isWorthShowing gate used above.
                             p.peerCompare = (Math.round(p.age) >= 21) ? comparePlayerToSquadPeers(p, seniorPlayers) : null;
                         });
-                        // Recompute Dynasty + Buy Rating now that wage/talent
-                        // are known (they feed the buy rating's value/cost and
+                        // Recompute Dynasty + Overall Rating now that wage/
+                        // talent are known (they feed the rating's value and
                         // talent terms), then re-sort the same way as the first
-                        // pass so the list stays ordered by best-buy.
-                        priorityBuys.forEach(computeCandidateBuyData);
+                        // pass so the list stays ordered by best player.
+                        priorityBuys.forEach(computeCandidateRating);
                         priorityBuys.sort((a, b) =>
-                            (b._buyRating && b._buyRating.score || 0) - (a._buyRating && a._buyRating.score || 0) ||
+                            (b._overallRating && b._overallRating.score || 0) - (a._overallRating && a._overallRating.score || 0) ||
                             (verdictOrder[a.eval.verdict] ?? 9) - (verdictOrder[b.eval.verdict] ?? 9) ||
                             (a.price || 0) - (b.price || 0));
                         logSquadGapDiagnostic(priorityBuys.filter(p => Math.round(p.age) >= 21));
@@ -8246,9 +8190,16 @@ table.ftp-table {
             if (overallSkill < 4) { s += 10; reasons.push('Very low overall skill'); }
             if (ydEval && behindStats.length === 0 && ydEval.rows.some(r => r.status === 'ahead')) s -= 10;
             s -= youthTalentProtection(p);
-            // Ceiling still can't clear the current weakest same-role senior
+            // Ceiling still can't clear the current weakest same-role senior.
+            // Projected to age 22 (the SAME senior-comparable horizon the
+            // overall rating uses — computePlayerCeiling's 4th param) so a
+            // youth is judged on the senior they'll become, not truncated
+            // at the age-20 promotion boundary. A to-20 ceiling would flag
+            // every mid-teen as "won't catch up" even when their realistic
+            // post-20 training would clear the squad floor — the exact
+            // inconsistency this check exists to avoid.
             const rolePeers = (allPlayers || []).filter(sp => sp.age >= 21 && getPrimarySkillInfo(sp).name === getPrimarySkillInfo(p).name);
-            const ceilingResult = computePlayerCeiling(p, getAcademySpeedForPlayer(p, dynastyAcademyInfo), dynastySquadContext);
+            const ceilingResult = computePlayerCeiling(p, getAcademySpeedForPlayer(p, dynastyAcademyInfo), dynastySquadContext, 22);
             if (rolePeers.length > 0) {
                 const peerFloor = Math.min(...rolePeers.map(computePlayerValueSkillSum));
                 if (ceilingResult.ceiling < peerFloor) { s += 12; reasons.push(`Ceiling (${ceilingResult.ceiling.toFixed(1)}) below weakest senior ${getPrimarySkillInfo(p).name === 'keeping' ? 'keeper' : getPrimarySkillInfo(p).name === 'bowling' ? 'bowler' : 'batter'}`); }
@@ -8343,9 +8294,10 @@ table.ftp-table {
     //   * SENIOR: current count vs the ~13-14 target, role-by-role vs
     //     SENIOR_ROLE_TARGETS, exactly how many to offload to reach it,
     //     and — crucially — cross-references WHAT you're buying. A
-    //     transfer target flagged "BUY over <player>" means that player
-    //     is now a sell when the signing lands; a transfer-advisor squad
-    //     gap ("no senior X") names the hole a buy must fill.
+    //     transfer candidate whose peer comparison says "would replace:
+    //     <player>" means that player is now a sell when the signing
+    //     lands; a transfer-advisor squad gap ("no senior X") names the
+    //     hole a buy must fill.
     //   * YOUTH: behind the development curve is a strong sell/retire
     //     signal (youth must meet YOUTH_DEV_CURVE minimums to be worth
     //     carrying to a senior spot — that's the gate for "good future
@@ -8422,7 +8374,7 @@ table.ftp-table {
             ${seniorHtml}
             <div class="vj-fw-700" style="font-size:11px;margin-top:8px;">YOUTH</div>
             ${youthHtml}
-            <div class="vj-text-xs vj-text-muted vj-mt-8" style="border-top:1px solid var(--vj-border);padding-top:6px;">Works with the Transfer Advisor: a market candidate rated \u201cBUY over &lt;name&gt;\u201d names the senior to move on the moment the signing lands, and the transfer advisor\u2019s squad-gap analysis here tells you which role to target. Sell first, buy into the freed spot.</div>
+            <div class="vj-text-xs vj-text-muted vj-mt-8" style="border-top:1px solid var(--vj-border);padding-top:6px;">Works with the Transfer Advisor: a market candidate whose peer comparison reads \u201cwould replace: &lt;name&gt;\u201d names the senior to move on the moment the signing lands, and the transfer advisor\u2019s squad-gap analysis here tells you which role to target. Sell first, buy into the freed spot.</div>
         </div>`;
     }
 
@@ -8891,10 +8843,25 @@ table.ftp-table {
         const academySpeed = getAcademySpeedForPlayer(player, academyInfo);
         const squadContext = { size: squadPlayers.length, academyInfo, financeInfo: loadFinanceCache() };
         const ceilingResult = computePlayerCeiling(player, academySpeed, squadContext);
+        // Overall Rating — the price-independent quality number, shown the
+        // SAME way on an owned player's page as on a transfer card. Uses the
+        // canonical youth horizon everywhere else uses it (the to-22 senior-
+        // comparable projection for youth; current quality for seniors), so a
+        // youth can't be rated higher/lower depending on which page you look
+        // at them on. The to-22 projection is precomputed here (not inside
+        // the rating) so the training simulation still runs once per render —
+        // an extra one-time call for youth only.
+        const overallSeniorCeiling = isYouth
+            ? computePlayerCeiling(player, academySpeed, squadContext, 22)
+            : null;
+        const overallRating = computeOverallRating(player, { academySpeed, squadContext, seniorCeiling: overallSeniorCeiling });
 
         let html = `<div class="vj-flex-between vj-mb-4">
                 <span class="vj-fw-700" style="font-size:14px;">${player.name} <span class="vj-text-xs vj-text-muted">(${Math.round(player.age)}yo)</span></span>
-                <span class="ftp-stat-badge ${badgeClass}" style="font-size:13px;">${keepVerdict}</span>
+                <div style="display:flex;gap:4px;align-items:center;">
+                    <span class="ftp-stat-badge ${badgeClass}" style="font-size:13px;">${keepVerdict}</span>
+                    ${overallRatingBadge(overallRating)}
+                </div>
             </div>
             <div class="vj-text-xs vj-text-muted vj-mb-4">Verdict: ${evalResult.verdict.toUpperCase()} · Rank ${rank}/10 · ${(() => { const pi = getPrimarySkillInfo(player); return pi.value ? (pi.name === 'keeping' ? 'Keep' : pi.name === 'bowling' ? 'Bowl' : 'Bat') + ' ' + skillLabel(pi.value) : ''; })()} · Tech ${skillLabel(player.technique)} · Field ${skillLabel(player.fielding)}${(() => {
                 const vpk = computePlayerValuePerK(player);
