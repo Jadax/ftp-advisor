@@ -1,9 +1,9 @@
 // ==UserScript==
 // @name         FTP Advisor
 // @namespace    http://tampermonkey.net/
-// @version      8.53
-// @description  Comprehensive tactical advisor for From the Pavilion cricket game (v8.53: bowling spells now enforce rest across the drinks break; Squad Plan sections consolidated; v8.52: Squad Plan embeds ranked sells; v7.0: full UI redesign)
-// @author       You
+// @version      8.54
+// @description  Comprehensive tactical advisor for From the Pavilion cricket game (v8.54: release hardening — removed dead Pro/AI scaffolds + unused sell-list code, trimmed narrative comments, author metadata).
+// @author       Tushant Sharma
 // @license      MIT
 // @match        https://www.fromthepavilion.org/*
 // @grant        GM_xmlhttpRequest
@@ -21,12 +21,7 @@
 (function() {
     'use strict';
 
-    // Verbose per-item logging (one line per scraped row / per fetched
-    // player) is off by default — this is a public userscript and those
-    // fire inside loops, spamming the console of every user who opens
-    // devtools for any other reason. Real errors/warnings and the
-    // deliberate [FTP Transfer] funnel summary are NOT gated by this.
-    // Turn on from the console with:  localStorage.ftpDebug = '1'
+    // Debug logging off by default (public userscript). Enable: localStorage.ftpDebug = '1'
     const FTP_DEBUG = (() => {
         try { return localStorage.getItem('ftpDebug') === '1'; } catch (e) { return false; }
     })();
@@ -82,173 +77,7 @@
 
     const TEAM_ID = getTeamId();
 
-    // ============================================================
-    // PRO TIER (scaffold — not wired to any feature yet)
-    // Everything currently in this script is pure local computation on
-    // data already visible to the user in their own browser. Gating any
-    // of it behind a "license check" would be security theater — anyone
-    // can read (and strip) the check in Tampermonkey's own source editor
-    // — and would rightly get the script flagged as hostile if listed on
-    // GreasyFork. So: free tier = 100% of current functionality, always.
-    // The only genuinely defensible paid feature is one that CANNOT run
-    // client-side at all: cross-device sync of cached squad/training
-    // history, multi-season trend tracking, or league-wide benchmarking
-    // against other Pro users — anything that requires a server holding
-    // state the script itself doesn't have. This block is that scaffold;
-    // LICENSE_API_URL is a placeholder, nothing calls validateLicense()
-    // yet. Recommended: use a payment processor with a built-in license
-    // API (Lemon Squeezy or Gumroad) instead of building your own auth
-    // server — they handle payment + license issuance + a validate
-    // endpoint for no fixed cost until there's revenue to justify more.
-    // ============================================================
-    const LICENSE_KEY_CACHE = 'ftp_license_key';
-    const LICENSE_VALID_CACHE = 'ftp_license_valid';
-    const LICENSE_API_URL = 'REPLACE_WITH_LICENSE_VALIDATION_ENDPOINT';
-
-    function getStoredLicenseKey() {
-        return GM_getValue(LICENSE_KEY_CACHE, null);
-    }
-
-    function isProUser() {
-        // Reads the last cached validation result — never blocks the UI
-        // waiting on a network round-trip. Call validateLicense()
-        // separately (e.g. on script load, or a "Refresh Pro Status"
-        // button) to keep it current.
-        return GM_getValue(LICENSE_VALID_CACHE, false) === true;
-    }
-
-    function validateLicense(key) {
-        return new Promise((resolve) => {
-            if (!key) { resolve(false); return; }
-            GM_xmlhttpRequest({
-                method: 'POST',
-                url: LICENSE_API_URL,
-                data: JSON.stringify({ key }),
-                headers: { 'Content-Type': 'application/json' },
-                timeout: 10000,
-                onload: (response) => {
-                    try {
-                        const result = JSON.parse(response.responseText);
-                        const valid = result.valid === true;
-                        GM_setValue(LICENSE_VALID_CACHE, valid);
-                        resolve(valid);
-                    } catch (e) {
-                        resolve(false);
-                    }
-                },
-                onerror: () => resolve(false),
-                ontimeout: () => resolve(false)
-            });
-        });
-    }
-
-    // ============================================================
-    // AI CENTRAL RECOMMENDATIONS (scaffold — not wired to any UI yet)
-    // Architecture: every existing recommend*() function
-    // (recommendLineup, recommendTraining, recommendTossDecision, etc.)
-    // already computes a rule-based recommendation from real game data.
-    // The AI layer should sit ON TOP of that, not replace it — feed the
-    // same structured data plus the rule-based verdict as context, and
-    // let an LLM synthesize/explain/cross-check, rather than becoming a
-    // black box that recomputes everything itself. Deterministic scoring
-    // stays the source of truth (free, instant, auditable); the LLM is
-    // for what it's actually good at — natural-language synthesis across
-    // many signals at once.
-    //
-    // Three real decisions block wiring this up further — not things I
-    // can decide unilaterally:
-    // 1. WHICH provider/endpoint (Anthropic/OpenAI/etc) — the request
-    //    shape below is a placeholder, not a real API contract.
-    // 2. WHERE the API key lives. GM_setValue is local, unencrypted
-    //    storage — fine for a user's own key, NOT safe to hardcode a
-    //    shared key into a public script. Realistic options: (a) user
-    //    pastes their own key via a one-time prompt (same pattern as
-    //    getTeamId()), or (b) a thin proxy server you control holding
-    //    the real key, which would also double as the Pro-tier license
-    //    gate above — "AI recommendations" could BE the paid feature.
-    // 3. Cost. LLM calls cost money per request — must be opt-in and
-    //    user-triggered, never automatic on page load.
-    // ============================================================
-    const AI_API_KEY_CACHE = 'ftp_ai_api_key';
-    const AI_ENDPOINT_URL = 'REPLACE_WITH_LLM_ENDPOINT';
-
-    function getStoredAIKey() {
-        return GM_getValue(AI_API_KEY_CACHE, null);
-    }
-
-    // One-time prompt, same pattern as getTeamId(). Not wired to any
-    // button yet — provider/endpoint (AI_ENDPOINT_URL) is still a
-    // placeholder, so there's nothing for a stored key to call yet.
-    // Call this from a settings UI once a provider is chosen.
-    function promptForAIKey() {
-        const entered = prompt('FTP Advisor: paste your LLM API key (stored locally via GM_setValue, only ever sent to the configured AI endpoint):');
-        if (entered && entered.trim()) {
-            GM_setValue(AI_API_KEY_CACHE, entered.trim());
-            return true;
-        }
-        return false;
-    }
-
-    /**
-     * Single assembly point for AI context. Summarizes the same inputs
-     * the rule-based advisors already compute (not raw scraped player
-     * arrays — too large/noisy) so every future AI feature shares one
-     * context shape instead of re-deriving it.
-     */
-    function buildAIContextSnapshot({ squadStats, matchContext, opponentAnalysis, financeInfo, ruleBasedRecommendation } = {}) {
-        return {
-            squad: squadStats ? {
-                count: squadStats.count, avgPrimary: squadStats.avgPrimary,
-                avgTechnique: squadStats.avgTechnique, avgFielding: squadStats.avgFielding,
-                bowlerCount: squadStats.bowlerCount, batterCount: squadStats.batterCount,
-                allrounderCount: squadStats.allrounderCount, keeperCount: squadStats.keeperCount
-            } : null,
-            match: matchContext ? {
-                format: matchContext.matchType, pitch: matchContext.pitchType,
-                weather: matchContext.weather, venue: matchContext.venue
-            } : null,
-            opposition: opponentAnalysis ? {
-                relativeStrength: opponentAnalysis.relativeStrength,
-                keyBowler: opponentAnalysis.keyBowler ? opponentAnalysis.keyBowler.name : null
-            } : null,
-            finances: financeInfo ? {
-                availableFunds: financeInfo.availableFunds, weeklyNet: financeInfo.weeklyNet
-            } : null,
-            // The deterministic advisor's own output — the AI reasons
-            // ABOUT this, it does not recompute it from scratch.
-            ruleBasedRecommendation: ruleBasedRecommendation || null
-        };
-    }
-
-    /**
-     * Stub — not called from anywhere yet. Sends a context snapshot and
-     * a plain-string question to the configured endpoint. Left generic
-     * so whatever UI is built on top decides what to ask (explain this
-     * lineup, critique this transfer target, season strategy chat, etc).
-     */
-    function getAICentralRecommendation(prompt, contextSnapshot) {
-        return new Promise((resolve, reject) => {
-            const apiKey = getStoredAIKey();
-            if (!apiKey) { reject(new Error('No AI API key configured')); return; }
-            GM_xmlhttpRequest({
-                method: 'POST',
-                url: AI_ENDPOINT_URL,
-                headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${apiKey}` },
-                data: JSON.stringify({ prompt, context: contextSnapshot }),
-                timeout: 30000,
-                onload: (response) => {
-                    try {
-                        resolve(JSON.parse(response.responseText));
-                    } catch (e) {
-                        reject(new Error('Invalid response from AI endpoint'));
-                    }
-                },
-                onerror: () => reject(new Error('AI endpoint request failed')),
-                ontimeout: () => reject(new Error('AI endpoint request timed out'))
-            });
-        });
-    }
-
+    // Cache keys
     const CACHE_KEY = 'ftp_squad_cache';
     const CACHE_TIMESTAMP_KEY = 'ftp_squad_cache_ts';
     const OPPONENT_CACHE_PREFIX = 'ftp_opponent_';
@@ -2717,80 +2546,28 @@
         const labels = [];
 
         // 1. Squad (senior + youth)
-        // Also force a refetch if the existing cache looks corrupted (no
-        // player has real skill data) regardless of its age — this is how
-        // a squad page visited via the default nav link (no squadViewId
-        // param, defaults to the skill-less Overall Summary view) used to
-        // silently overwrite good cached skills with zeros, with nothing
-        // to self-correct it since a "fresh" bad cache isn't stale.
-        // Checks actual skill values, not the hasFullSkills flag — cache
-        // entries written by the buggy version of parsePlayerRow (before
-        // this fix) still have hasFullSkills:true baked in even though
-        // every stat is really 0.
-        // Also catches PARTIAL corruption — not just a whole-squad wipe.
-        // A single player with batting=bowling=fielding=0 while the rest
-        // of the squad looks fine is still a real problem: getPrimarySkillInfo()
-        // used to default an all-0 player to 'bowling', which could make
-        // comparePlayerToSquadPeers()/computeRoleSurplus() report "no
-        // batters in the squad" for a squad that demonstrably has some —
-        // just one whose row failed to scrape that refresh. Any senior/
-        // youth player missing ALL three core stats simultaneously is
-        // treated the same as a fully-corrupted cache.
+        // Force a refetch if the existing cache is corrupted, not just
+        // stale — a squad page visited via the default nav link (no
+        // squadViewId, skill-less summary view) can otherwise overwrite
+        // good cached skills with zeros. Check actual skill values, not
+        // hasFullSkills (entries written before the bug that fixed it
+        // still bake that flag true). Also catches PARTIAL corruption:
+        // a single player with all three core stats 0 (a scrape gap that
+        // makes getPrimarySkillInfo() default them to 'bowling', causing
+        // false "no batters in your squad" reports) is treated the same
+        // as a full wipe. And an empty-but-present cache (players.length
+        // === 0), a cache that fails to load at all (null), or one that
+        // has players in only ONE role group (real senior/youth clubs
+        // always have both — a wipe leaves exactly one empty) all force
+        // a refetch so a bad cache can never persist silently.
         const existingSquadCache = loadPlayerCache();
-        // REAL BUG (found via a user report of a recurring false "no
-        // current senior bowler/batter" squad-gap): this whole check used
-        // to require `existingSquadCache.players.length > 0` as a
-        // precondition — so a cache that had become a genuinely EMPTY
-        // array (0 players, confirmed live via the [FTP Transfer] Senior
-        // squad role-count diagnostic showing "0 players" / "seniorPlayers
-        // is EMPTY") was NEVER treated as corrupted, since the `.length >
-        // 0` guard short-circuited the whole expression to false before
-        // even reaching the corruption checks below. Combined with a
-        // freshly-written timestamp (isStale() also false — "All data is
-        // fresh"), this let a fully-empty squad cache persist indefinitely
-        // with nothing to self-heal it, even though the user's actual live
-        // squad clearly has players. Exactly how the cache first became an
-        // empty array (a transient fetch hiccup that wrote `[]` before an
-        // earlier version of this code existed, or similar) is now moot —
-        // the real fix is making sure it can never get PERMANENTLY stuck
-        // that way again. Now an empty-but-present cache object is treated
-        // the same as a fully-zeroed one.
         const squadCacheCorrupted = !!(existingSquadCache &&
             (existingSquadCache.players.length === 0
              || !existingSquadCache.players.some(p => (p.batting || 0) > 0 || (p.bowling || 0) > 0 || (p.fielding || 0) > 0)
              || existingSquadCache.players.some(p => (p.isSenior || p.isYouth) &&
                 (p.batting || 0) === 0 && (p.bowling || 0) === 0 && (p.fielding || 0) === 0)
-             // v8.47 — the v8.46 merge fix only PREVENTS a future wipe;
-             // it can't repair a cache that was already wiped by an
-             // earlier session before v8.46 shipped. A cache with real,
-             // correctly-scraped players in ONE role group and literally
-             // zero in the other (e.g. 13 real youth, 0 seniors) doesn't
-             // trip any of the checks above — every player it does have
-             // looks perfectly healthy. But a squad that's entirely one
-             // role group with NOTHING in the other is exactly what the
-             // v8.46 senior-wipe bug produces, and is suspicious enough on
-             // its own (a real senior club always has both) to force a
-             // refetch and let the v8.46 fix's fallback logic sort out
-             // which group (if either) is genuinely still missing.
              || (existingSquadCache.players.some(p => p.isYouth) && !existingSquadCache.players.some(p => p.isSenior))
              || (existingSquadCache.players.some(p => p.isSenior) && !existingSquadCache.players.some(p => p.isYouth))));
-        // v8.45 — user reported the empty-cache symptom persisting even
-        // after confirming v8.44 was installed (ruling out a stale-script
-        // explanation). The v8.42 fix above only forces a refetch when
-        // `existingSquadCache` is a real object with an empty/corrupted
-        // `players` array — but `existingSquadCache &&` short-circuits to
-        // "not corrupted" whenever `loadPlayerCache()` returns null
-        // outright (data key missing/unparseable). If the DATA write in
-        // `_saveCache()` ever fails/throws (quota, serialization issue)
-        // while a PREVIOUS successful save already wrote a recent
-        // timestamp, `isStale()` would read that old-but-recent timestamp
-        // and report "not stale" even though the actual cached data is
-        // now unreadable — the exact desync that would reproduce this
-        // symptom while looking identical to "all data is fresh" in the
-        // console. Also forcing a refetch whenever the cache fails to
-        // load at all closes that gap; this is purely additive (only ever
-        // adds a refetch trigger, never removes one) so it can't regress
-        // the cases already fixed.
         if (force || isStale(CACHE_TIMESTAMP_KEY, STALE_SQUAD_HOURS) || squadCacheCorrupted || !existingSquadCache) {
             labels.push('squad');
             promises.push(
@@ -2805,36 +2582,14 @@
                             fetchSquadSummaryView(`https://www.fromthepavilion.org/youths.htm?squadViewId=1&teamId=${TEAM_ID}`)
                         ]);
                         const existing = loadPlayerCache();
-                        // v8.46 — FOUND THE ACTUAL ROOT CAUSE of the "no
-                        // current senior X" saga (v8.35-v8.45 all fixed
-                        // real but different bugs; the raw-cache diagnostic
-                        // added in v8.45 finally proved this one): the
-                        // improved log showed "present, 13 total players"
-                        // for a user whose real squad is 16 seniors + 13
-                        // youths — the cache had silently become YOUTH-
-                        // ONLY. `fetchSquadFromPage(seniors.htm...)` above
-                        // has no `.catch()`, so if that request truly
-                        // rejects this whole `.then` never runs and the old
-                        // cache survives untouched — but if it RESOLVES
-                        // with a technically-valid response that just
-                        // parses to 0 rows (a transient markup/session
-                        // hiccup, no exception thrown), `seniors` is `[]`
-                        // and always was. `map` below used to be seeded
-                        // fresh from ONLY this round's `seniors`/`youth`
-                        // results — with youth.htm succeeding normally,
-                        // that silently replaced a real 16-player senior
-                        // squad with nothing, and nothing here ever fell
-                        // back to the previous cache for a role that came
-                        // back suspiciously empty (the existing fallback a
-                        // few lines down only re-seeds TALENTS onto players
-                        // already in `map`, it can't resurrect players that
-                        // never made it into `map` at all). Fixed the same
-                        // way opponent-talent fetches already protect
-                        // against this (v8.8): if either group comes back
-                        // empty while a real previous squad had players in
-                        // it, treat that as a failed fetch for that group
-                        // and keep the last known-good data instead of
-                        // wiping it.
+                        // If one group (seniors or youth) comes back empty
+                        // while the previous cache had real players in that
+                        // group, treat it as a failed fetch and keep the last
+                        // known-good data instead of silently wiping it (a
+                        // transient markup/session hiccup can return 0 rows
+                        // without throwing). Same protection opponent-talent
+                        // fetches use, applied here to prevent a partial squad
+                        // wipe from persisting to cache.
                         const existingPlayers = existing ? existing.players : [];
                         const existingSeniors = existingPlayers.filter(p => p.isSenior);
                         const existingYouth = existingPlayers.filter(p => p.isYouth);
@@ -4737,7 +4492,7 @@
             Array.from(select.options).forEach(opt => {
                 if (opt.value && !seen.has(opt.value)) {
                     seen.add(opt.value);
-                    players.push({ id: opt.value, name: opt.textContent.trim() });
+                    players.push({ id: opt.value, name: escapeHtml(opt.textContent.trim()) });
                 }
             });
         });
@@ -7922,27 +7677,15 @@ table.ftp-table {
                     `Senior pass (elite + squad upgrade): ${seniorEval.filter(e => filteredSet.has(e)).length}/${seniorEval.length}.`);
                 // Always print the senior role composition the squad-gap
                 // comparison is actually seeing, not just when isGap fires —
-                // the Amarpreet Narasinha report showed isGap=true in the
-                // rendered card but a console capture taken moments earlier
-                // (different render pass — updateTransferAdvisor runs twice
-                // per page load, once on stale cache and once after the
-                // background refresh) showed no SQUAD GAP line at all,
-                // meaning the two were from different evaluation passes.
-                // Logging this unconditionally on every pass removes that
-                // race entirely — whichever render the user is looking at,
-                // its own console output is right above it.
-                // v8.45 — this now also logs the RAW cache state
-                // (cache === null vs cache.players.length) so a future
-                // report can immediately tell apart three previously-
-                // indistinguishable scenarios that all produce the same
-                // "seniorPlayers is EMPTY" symptom: (1) loadPlayerCache()
-                // returned null (data never saved, or unreadable), (2)
-                // cache exists but players array is genuinely empty, (3)
-                // cache has real players but all of them fail the
-                // age>=21 filter (which would point at an age-parsing bug
-                // instead of a cache problem, and hasn't been ruled out
-                // yet since the old log only ever showed the already-
-                // filtered seniorPlayers.length).
+                // updateTransferAdvisor runs twice per page load (once on
+                // stale cache, once after the background refresh), so logging
+                // unconditionally on every pass removes the race where a
+                // user's captured console output came from a different pass
+                // than the rendered card. Also logs the RAW cache state
+                // (null vs players.length) so a future "seniorPlayers is
+                // EMPTY" report can immediately tell apart (1) cache never
+                // saved/unreadable, (2) genuinely empty array, (3) all
+                // players fail the age>=21 filter (an age-parsing bug).
                 console.log(`[FTP Transfer] Raw squad cache: ${cache === null ? 'NULL (loadPlayerCache() returned nothing)' : `present, ${allPlayers.length} total players (all ages)`}`);
                 console.log(`[FTP Transfer] Senior squad (age>=21, ${seniorPlayers.length} players) role counts — ` +
                     `batters: ${seniorPlayers.filter(p => getPrimarySkillInfo(p).name === 'batting').length}, ` +
@@ -7959,26 +7702,15 @@ table.ftp-table {
                             `reasons: ${e.eval.warnings.join(' | ') || '(none — check verdict logic)'}`);
                     });
                 }
-                // Whenever any senior candidate's peer comparison reports
-                // isGap ("no current X in your squad"), dump exactly which
-                // real senior players fed that comparison and how each one
-                // was role-classified. This is the fastest way to tell a
-                // real empty role from a classification/cache bug without
-                // re-reading the scoring code — a user report ("Eric
-                // Goodman ... you have no current batter") with a screenshot
-                // proving real batters exist could not be reproduced from
-                // code reading alone, so this makes the actual live
-                // classification visible in the console instead of guessing.
-                // Factored into a standalone fn (not inlined here) because
-                // the "Fetch Experience & Wages" click below re-runs
-                // comparePlayerToSquadPeers a second time on real talent
-                // data and can flip isGap independently of this first pass
-                // — that second call had no logging at all until this was
-                // pulled out, which is exactly the gap that made the
-                // Amarpreet Narasinha report ("no current senior bowler")
-                // impossible to diagnose: the log the user pasted back had
-                // no SQUAD GAP lines because isGap only went true AFTER the
-                // details fetch, on the second, previously-silent call.
+                // Whenever a senior candidate's peer comparison reports
+                // isGap ("no current X in your squad"), dump which real
+                // senior players fed it and how each was role-classified —
+                // the fastest way to distinguish a real empty role from a
+                // classification/cache bug without re-reading the scoring
+                // code. Factored as a standalone fn because the "Fetch
+                // Experience & Wages" click re-runs comparePlayerToSquadPeers
+                // a second time on real talent data and can flip isGap
+                // independently of this first pass.
                 function logSquadGapDiagnostic(evalList) {
                     if (!evalList.some(e => e.peerCompare && e.peerCompare.isGap)) return;
                     const gapRoles = [...new Set(evalList.filter(e => e.peerCompare && e.peerCompare.isGap).map(e => e.peerCompare.role))];
@@ -8340,39 +8072,9 @@ table.ftp-table {
         </div>`;
     }
 
-    // ============================================================
-    // SELL RECOMMENDATIONS — SQUAD PAGE
-    // Always shows a prioritized list of players to sell, ranked by
-    // urgency. Uses age, skill levels, technique, rating vs peers,
-    // and replaceability to score each player.
-    // ============================================================
-    // Shared by generateSeniorSellList() and generateYouthSellList() —
-    // the two were near-byte-identical rec cards (rank/name/statLine
-    // header, sellScore badge, reason bullets) that had drifted into two
-    // separate copies. Consolidated first since it's the one pair of the
-    // ~6 duplicated rec-card sites (see CLAUDE.md tech debt) provably
-    // identical enough to merge without needing live-browser verification
-    // — output is byte-for-byte the same as each site produced before.
-    // The other sites (training, youth recruit, transfer results,
-    // opponent scouting) have real structural differences and are left
-    // alone until they can be checked live.
-    function renderSellCandidateCard(rank, player, sellScore, reasons, statLine) {
-        const sev = sellScore >= 20 ? 'critical' : sellScore >= 10 ? 'high' : 'medium';
-        const badgeColor = sev === 'critical' ? 'red' : sev === 'high' ? 'amber' : 'neutral';
-        const reasonColor = sev === 'critical' ? 'red' : sev === 'high' ? 'amber' : 'muted';
-        return `<div class="ftp-rec ${sev}" style="padding:6px 8px;margin-bottom:4px;">
-                <div class="vj-flex-between">
-                    <span class="vj-fw-700" style="font-size:12px;">${rank}. ${player.name} <span class="vj-text-xs vj-text-muted">(${statLine})</span></span>
-                    <span class="ftp-stat-badge ${badgeColor}">${sellScore}pts</span>
-                </div>
-                ${reasons.length ? reasons.map(r2 => `<div class="vj-text-xs" style="color:var(--vj-${reasonColor});">• ${r2}</div>`).join('') : ''}
-            </div>`;
-    }
-
-    // Ranked SENIOR sell list for the Squad Plan — compact version of
-    // generateSeniorSellList()'s scoring, so the plan ITSELF shows who to
-    // sell first (priority down) rather than pointing at a buried
-    // collapsible. Returns HTML list; empty HTML when nobody's flagged.
+    // Ranked SENIOR sell list for the Squad Plan — who to sell first, by
+    // urgency (depth/age/weakness), shown directly in the plan.
+    // Returns HTML; empty HTML when nobody's flagged.
     function buildSeniorSellRanking(seniors, squadStats, seniorOver) {
         if (!seniors || seniors.length === 0) return '';
         const avg = (arr, key) => arr.length ? arr.reduce((s, p) => s + (p[key] || 0), 0) / arr.length : 0;
@@ -8418,9 +8120,9 @@ table.ftp-table {
         return html;
     }
 
-    // Ranked YOUTH sell list for the Squad Plan — compact version of
-    // generateYouthSellList()'s scoring. Behind-curve prospects (the ones
-    // failing YOUTH_DEV_CURVE minimums) ranked first, priority down.
+    // Ranked YOUTH sell list for the Squad Plan — who to sell/retire first.
+    // Behind-curve prospects (failing YOUTH_DEV_CURVE minimums) ranked
+    // highest, priority down.
     function buildYouthSellRanking(youth, allPlayers, squadStats) {
         if (!youth || youth.length === 0) return '<div class="vj-text-xs vj-text-muted" style="margin-top:4px;">No youth in cached squad \u2014 the youth squad is on a separate page.</div>';
         const dynastyAcademyInfo = loadAcademyCache();
@@ -8513,143 +8215,12 @@ table.ftp-table {
         return protect;
     }
 
-    function generateSeniorSellList(players) {
-        if (!players || players.length === 0) return '<div class="vj-text-sm vj-text-muted">No players found.</div>';
-        const seniors = players.filter(p => p.isSenior);
-        if (seniors.length === 0) return '<div class="vj-text-sm vj-text-muted">No senior players found.</div>';
-
-        const avg = (arr, key) => arr.length > 0 ? arr.reduce((s, p) => s + (p[key] || 0), 0) / arr.length : 0;
-        const avgRating = avg(seniors, 'rating');
-        // getPrimarySkillInfo(), not max(batting, bowling) — otherwise a
-        // genuine keeper gets judged (and flagged for sale below) on
-        // mediocre batting/bowling instead of their actual keeping skill.
-        const avgPrimary = avg(seniors.map(p => ({...p, primary: getPrimarySkillInfo(p).value})), 'primary');
-        const squadStats = computeSquadStats(players);
-        const surplusMap = squadStats ? computeRoleSurplus(seniors, squadStats) : new Map();
-        // Dynasty Score inputs — same computePlayerCeiling() shared with
-        // the Player Advisor and Transfer Advisor, so "who's better" reads
-        // the same across squad and market. Computed once here, not per
-        // player, since academy/squad context doesn't vary per player.
-        const dynastyAcademyInfo = loadAcademyCache();
-        const dynastySquadContext = { size: players.length, academyInfo: dynastyAcademyInfo, financeInfo: loadFinanceCache() };
-
-        const scored = seniors.map(p => {
-            let sellScore = 0;
-            const reasons = [];
-            const primary = getPrimarySkillInfo(p).value;
-            const isAllrounder = (p.batting || 0) >= 7 && (p.bowling || 0) >= 7;
-
-            // Age penalty — older = more urgent to replace
-            if (p.age >= 35) { sellScore += 20; reasons.push(`Age ${p.age} — well past peak`); }
-            else if (p.age >= 32) { sellScore += 15; reasons.push(`Age ${p.age} — declining`); }
-            else if (p.age >= 30) { sellScore += 10; reasons.push(`Age ${p.age} — past prime`); }
-            else if (p.age >= 28) { sellScore += 5; }
-
-            // Primary skill deficit — the most important factor
-            if (primary < 5) { sellScore += 15; reasons.push(`Primary skill ${skillLabel(primary)} — too weak for senior cricket`); }
-            else if (primary < 7) { sellScore += 10; reasons.push(`Primary skill ${skillLabel(primary)} — below standard`); }
-            else if (primary < 9) { sellScore += 5; }
-
-            // Technique — community rule: technique amplifies all performance
-            if ((p.technique || 0) < 5) { sellScore += 10; reasons.push(`Technique ${skillLabel(p.technique)} — limits ceiling`); }
-            else if ((p.technique || 0) < 7) { sellScore += 5; }
-
-            // Rating relative to squad average
-            if (avgRating > 0 && (p.rating || 0) < avgRating * 0.5) {
-                sellScore += 15; reasons.push(`Rating ${p.rating || '?'} — far below squad avg (${Math.round(avgRating)})`);
-            } else if (avgRating > 0 && (p.rating || 0) < avgRating * 0.7) {
-                sellScore += 10; reasons.push(`Rating below squad average`);
-            } else if (avgRating > 0 && (p.rating || 0) < avgRating * 0.85) {
-                sellScore += 5;
-            }
-
-            // Squad depth surplus — see computeRoleSurplus(). This is what
-            // makes a "16 good players" squad still produce real
-            // candidates: being the 5th bowler when 6 is the target isn't
-            // a flaw, but being the 8th is depth you don't need.
-            const surplus = surplusMap.get(p.id);
-            if (surplus && surplus.isSurplus) {
-                const overBy = surplus.positionInRole - surplus.roleTarget;
-                const bonus = overBy === 1 ? 12 : overBy === 2 ? 9 : 6;
-                sellScore += bonus;
-                const roleLabel = surplus.role === 'keeping' ? 'keeper' : surplus.role === 'bowling' ? 'bowler' : 'batter';
-                reasons.push(`Squad depth: #${surplus.positionInRole} of ${surplus.roleCount} ${roleLabel}s (target ~${surplus.roleTarget}) — lowest-priority for a trimmed squad`);
-            }
-
-            // All-rounder bonus — harder to replace
-            if (isAllrounder) { sellScore -= 10; }
-
-            // Captain/keeper bonus — harder to replace
-            if (p.isCaptain) { sellScore -= 5; reasons.push('Captain — hard to replace'); }
-            if (p.role === 'WK' || (p.keeping || 0) >= 6) { sellScore -= 5; }
-
-            // Bowler type premium/value — don't sell a genuine fast bowler cheaply
-            if (['rf', 'lf'].includes(p.bowlerType)) { sellScore -= 8; }
-            else if (['rfm', 'lfm', 'rws', 'lws'].includes(p.bowlerType)) { sellScore -= 5; }
-
-            // Talents make a player harder to replace even when he's
-            // ranked low within his role — see seniorTalentProtection().
-            sellScore -= seniorTalentProtection(p);
-
-            // Wage-adjusted value — see computePlayerValueSkillSum().
-            // Requested as "another layer of ranking who to sell": an
-            // overpaid player (low output for the wage) is a real reason
-            // to consider a swap even when nothing else stands out; a
-            // genuinely great-value player is harder to justify moving on
-            // purely for squad-depth reasons. Same 5/10 thresholds used
-            // on the transfer market for a consistent read across both.
-            const skillPerK = computePlayerValuePerK(p);
-            if (skillPerK != null) {
-                if (skillPerK < 3) { sellScore += 10; reasons.push(`Poor value: ${skillPerK.toFixed(1)} skill/$K — overpaid for current output`); }
-                else if (skillPerK < 5) { sellScore += 5; reasons.push(`Below-average value: ${skillPerK.toFixed(1)} skill/$K`); }
-                else if (skillPerK >= 10) { sellScore -= 5; }
-            }
-
-            // Dynasty Score (display only, like skillPerK above) — this
-            // player's realistic ceiling given their real age/academy
-            // speed, not just today's stats. Not folded into sellScore:
-            // a senior already close to their ceiling isn't a sell signal
-            // by itself, it's expected — the number is here so it reads
-            // consistently against the Player Advisor and transfer market
-            // when deciding whether a specific transfer target is really
-            // an upgrade over this player long-term, not just today.
-            const ceilingResult = computePlayerCeiling(p, getAcademySpeedForPlayer(p, dynastyAcademyInfo), dynastySquadContext);
-
-            return { player: p, sellScore, reasons, skillPerK, ceilingResult };
-        }).sort((a, b) => b.sellScore - a.sellScore);
-
-        // Show top sell candidates (those with sellScore > 0 = some reason to sell)
-        const candidates = scored.filter(r => r.sellScore > 0);
-
-        const shapeHtml = squadStats ? `<div class="vj-text-xs vj-text-muted vj-mb-4">Squad shape: ${squadStats.keeperCount} keeper${squadStats.keeperCount === 1 ? '' : 's'} (target ${SENIOR_ROLE_TARGETS.keeping}) · ${squadStats.bowlerCount} bowler${squadStats.bowlerCount === 1 ? '' : 's'} (target ${SENIOR_ROLE_TARGETS.bowling}) · ${squadStats.batterCount} batter${squadStats.batterCount === 1 ? '' : 's'} (target ${SENIOR_ROLE_TARGETS.batting}) — aiming for a ~${SENIOR_ROLE_TARGETS.keeping + SENIOR_ROLE_TARGETS.bowling + SENIOR_ROLE_TARGETS.batting}-player senior squad.</div>` : '';
-
-        if (candidates.length === 0) {
-            return shapeHtml + `<div class="ftp-info-box success">
-                <div class="vj-fw-700">No strong sell candidates</div>
-                <div class="vj-text-xs vj-text-secondary vj-mt-4">Every senior is either performing well or filling a real role need — nobody is depth you don't need. Focus on upgrading the weakest through transfers.</div>
-            </div>`;
-        }
-
-        let html = shapeHtml + `<div class="vj-text-xs vj-text-muted vj-mb-4">Ranked by urgency to sell. ${candidates.length} of ${seniors.length} seniors flagged.</div>`;
-        candidates.forEach((r, i) => {
-            let statLine = `${formatAgeDisplay(r.player.age)} \u00B7 ${skillLabel(r.player.batting)}/${skillLabel(r.player.bowling)} \u00B7 R${r.player.rating || '?'}`;
-            if (r.skillPerK != null) statLine += ` \u00B7 ${r.skillPerK.toFixed(1)} skill/$K`;
-            statLine += ` \u00B7 Dynasty ${r.ceilingResult.current.toFixed(1)}\u2192${r.ceilingResult.ceiling.toFixed(1)}`;
-            html += renderSellCandidateCard(i + 1, r.player, r.sellScore, r.reasons, statLine);
-        });
-
-        html += `<div class="vj-text-xs vj-text-muted vj-mt-4">Replace with transfers: prioritize fast bowlers, wrist spinners, and high-technique players aged 16-27. Compare a transfer target's Dynasty ceiling (shown on its market card) against this player's ceiling above, not just current stats \u2014 a younger replacement's ceiling matters more than their day-one numbers.</div>`;
-        html += `<div class="ftp-alert info" style="margin-top:6px;"><span>\u2139</span><div><strong>Transfer settlement:</strong> Listing fee $1,000 (non-refundable). Settlement: 50% + (days in squad/2)% if <100 days, 100% if 100+ days. Bidding on your own player resets days-in-squad to 0.</div></div>`;
-        return html;
-    }
-
-    // Training talents make a youth prospect worth persevering with even
-    // when they're currently behind the curve — Prodigy especially
-    // (trains ALL skills faster while in the youth squad, official
-    // manual) means "behind now" is much less predictive of "behind at
-    // 20" than for a talent-less player on the same curve. Silent score
-    // reduction, same pattern as seniorTalentProtection() — not surfaced
-    // as a sell reason since it's the opposite of one.
+    // Youth equivalent of seniorTalentProtection(): a training talent
+    // (Prodigy especially — trains ALL skills faster while in the youth
+    // squad, official manual) makes "behind the curve now" much less
+    // predictive of "behind at 20", so it protects a prospect from being
+    // flagged for sale. Silent score reduction, same pattern as the senior
+    // version — not surfaced as a sell reason since it's the opposite of one.
     function youthTalentProtection(player) {
         const talents = player.talents || [];
         let protect = 0;
@@ -8659,165 +8230,6 @@ table.ftp-table {
         return protect;
     }
 
-    function generateYouthSellList(players) {
-        if (!players || players.length === 0) return '<div class="vj-text-sm vj-text-muted">No players found.</div>';
-        const youth = players.filter(p => p.isYouth);
-        if (youth.length === 0) return '<div class="vj-text-sm vj-text-muted">No youth players found.</div>';
-        const squadStats = computeSquadStats(players);
-        // Same computePlayerCeiling() inputs as the senior sell list and
-        // Player Advisor — this is exactly where "won't this youth's
-        // ceiling still fall short" gets answered with a real number
-        // instead of eyeballing the development curve alone.
-        const dynastyAcademyInfo = loadAcademyCache();
-        const dynastySquadContext = { size: players.length, academyInfo: dynastyAcademyInfo, financeInfo: loadFinanceCache() };
-
-        const scored = youth.map(p => {
-            let sellScore = 0;
-            const reasons = [];
-            const ydEval = evaluateYouthDevelopment(p);
-            const primaryName = getYouthPrimarySkillName(p);
-            const primaryValue = p[primaryName] || 0;
-            let behindStats = [];
-            let aheadStats = [];
-
-            if (ydEval) {
-                behindStats = ydEval.rows.filter(r => r.status === 'behind');
-                aheadStats = ydEval.rows.filter(r => r.status === 'ahead');
-
-                // Behind on 2+ stats = development failure
-                if (behindStats.length >= 2) {
-                    sellScore += 15;
-                    reasons.push(`Behind on ${behindStats.length} stats: ${behindStats.map(r => r.label).join(', ')}`);
-                } else if (behindStats.length === 1) {
-                    sellScore += 8;
-                    reasons.push(`Behind on ${behindStats[0].label} (${behindStats[0].value} vs target ${behindStats[0].min})`);
-                }
-
-                // Age 20 and behind = final youth year wasted
-                if (p.age >= 20 && behindStats.length >= 1) {
-                    sellScore += 20;
-                    reasons.push(`Age 20 — final youth year, behind development curve`);
-                }
-
-                // Age 19+ and primary significantly behind
-                if (p.age >= 19 && ydEval.rows[0] && ydEval.rows[0].status === 'behind' && (ydEval.rows[0].min - ydEval.rows[0].value) >= 2) {
-                    sellScore += 15;
-                    reasons.push(`Primary skill ${ydEval.rows[0].min - ydEval.rows[0].value} behind target — unlikely to catch up`);
-                }
-            } else {
-                // Outside youth window
-                if (p.age > 20) {
-                    const primarySkill = getPrimarySkillInfo(p).value;
-                    if (primarySkill < 7) {
-                        sellScore += 12;
-                        reasons.push(`Age ${p.age} with primary skill only ${primarySkill} — should have progressed more`);
-                    }
-                }
-            }
-
-            // Very low overall skill regardless of age
-            const overallSkill = ((p.batting || 0) + (p.bowling || 0) + (p.technique || 0) + (p.fielding || 0)) / 4;
-            if (overallSkill < 4) {
-                sellScore += 10;
-                reasons.push(`Very low overall skill (${overallSkill.toFixed(1)} avg) — unlikely to develop`);
-            } else if (overallSkill < 5) {
-                sellScore += 5;
-            }
-
-            // Technique deficit (community rule: technique critical)
-            if ((p.technique || 0) < 4 && ydEval) {
-                sellScore += 8;
-                reasons.push(`Technique ${skillLabel(p.technique)} — limits development ceiling`);
-            }
-
-            // Ahead of curve = keep
-            if (ydEval && behindStats.length === 0 && aheadStats.length >= 1) {
-                sellScore -= 10;
-            }
-
-            // Training talents (Prodigy especially) make "behind now" a
-            // weaker signal \u2014 see youthTalentProtection().
-            sellScore -= youthTalentProtection(p);
-
-            const ceilingResult = computePlayerCeiling(p, getAcademySpeedForPlayer(p, dynastyAcademyInfo), dynastySquadContext);
-            // A projected ceiling that still can't clear this role's
-            // current squad floor is a much stronger "won't catch up"
-            // signal than the curve-target checks above alone \u2014 those
-            // check position-relative-to-target today, this checks the
-            // realistic destination against players who'd actually compete
-            // for the spot.
-            const rolePeers = players.filter(sp => sp.age >= 21 && getPrimarySkillInfo(sp).name === getPrimarySkillInfo(p).name);
-            if (rolePeers.length > 0) {
-                const peerFloor = Math.min(...rolePeers.map(computePlayerValueSkillSum));
-                if (ceilingResult.ceiling < peerFloor) {
-                    sellScore += 12;
-                    reasons.push(`Projected ceiling (${ceilingResult.ceiling.toFixed(1)}) still below your weakest current senior ${getPrimarySkillInfo(p).name === 'keeping' ? 'keeper' : getPrimarySkillInfo(p).name === 'bowling' ? 'bowler' : 'batter'} (${peerFloor.toFixed(1)}) \u2014 unlikely to ever earn a senior spot here`);
-                }
-            }
-
-            return { player: p, sellScore, reasons, ceilingResult };
-        }).sort((a, b) => b.sellScore - a.sellScore);
-
-        const flagged = scored.filter(r => r.sellScore > 0);
-
-        if (flagged.length === 0) {
-            // Everyone's on track or ahead \u2014 but a squad that's grown
-            // large still needs a real answer to "who first if I have
-            // to trim". Below the manual-confirmed floor (promotions
-            // that drop the youth squad under 12 trigger the game's own
-            // auto-draft of REPLACEMENT recruits with poor skills,
-            // rulespage=youthacademy) trimming would be actively
-            // counterproductive, so this only appears once there's
-            // genuine room: show the 2 lowest-ranked (calculateRank,
-            // same metric transfer scouting uses) as soft, non-urgent
-            // candidates rather than pretending nobody exists.
-            let html = '';
-            if (youth.length > 14) {
-                const ranked = [...scored].sort((a, b) => calculateRank(a.player, squadStats) - calculateRank(b.player, squadStats));
-                const soft = ranked.slice(0, 2);
-                html += `<div class="ftp-info-box success">
-                    <div class="vj-fw-700">No urgent sell candidates</div>
-                    <div class="vj-text-xs vj-text-secondary vj-mt-4">All ${youth.length} youth players are developing on track or ahead of the curve.</div>
-                </div>`;
-                html += `<div class="vj-text-xs vj-text-muted vj-mt-8 vj-mb-4">Squad is on the larger side (${youth.length}). If you want to trim, these rank lowest relatively \u2014 not a development problem, just the weakest of a strong group. Below 12 the game auto-drafts replacement recruits with poor skills (official manual), so don't cut past that.</div>`;
-                soft.forEach((r, i) => {
-                    let statLine = `age ${formatAgeDisplay(r.player.age)} \u00B7 ${skillLabel(r.player.batting)}/${skillLabel(r.player.bowling)} \u00B7 rank ${calculateRank(r.player, squadStats)}/10`;
-                    // Shown for information only, not scored into
-                    // sellScore \u2014 youth wages are naturally low across the
-                    // board (community data: 16yo ~$500-2000/wk), so this
-                    // metric barely discriminates between them the way it
-                    // does for senior wages and would just add noise if
-                    // it affected ranking here.
-                    const valuePerK = computePlayerValuePerK(r.player);
-                    if (valuePerK != null) statLine += ` \u00B7 ${valuePerK.toFixed(1)} skill/$K`;
-                    statLine += ` \u00B7 Dynasty ${r.ceilingResult.current.toFixed(1)}\u2192${r.ceilingResult.ceiling.toFixed(1)}`;
-                    html += renderSellCandidateCard(i + 1, r.player, 0, ['Relative depth only \u2014 no actual development concern'], statLine);
-                });
-                return html;
-            }
-            return `<div class="ftp-info-box success">
-                <div class="vj-fw-700">No youth sell candidates</div>
-                <div class="vj-text-xs vj-text-secondary vj-mt-4">All youth players are developing on track or ahead of the curve.</div>
-            </div>`;
-        }
-
-        let html = `<div class="vj-text-xs vj-text-muted vj-mb-4">Youth players behind the 16-20 development curve. ${flagged.length} of ${youth.length} flagged.</div>`;
-        flagged.forEach((r, i) => {
-            let statLine = `age ${Math.round(r.player.age)} \u00B7 ${skillLabel(r.player.batting)}/${skillLabel(r.player.bowling)}`;
-            // Display only here too \u2014 see the soft-fallback branch above
-            // for why it's not folded into youth sellScore.
-            const valuePerK = computePlayerValuePerK(r.player);
-            if (valuePerK != null) statLine += ` \u00B7 ${valuePerK.toFixed(1)} skill/$K`;
-            statLine += ` \u00B7 Dynasty ${r.ceilingResult.current.toFixed(1)}\u2192${r.ceilingResult.ceiling.toFixed(1)}`;
-            html += renderSellCandidateCard(i + 1, r.player, r.sellScore, r.reasons, statLine);
-        });
-
-        html += `<div class="vj-text-xs vj-text-muted vj-mt-4">Free roster spots for better youth recruits or transfer targets.</div>`;
-        html += `<div class="ftp-alert info" style="margin-top:6px;"><span>\u2139</span><div><strong>Transfer settlement:</strong> Listing fee $1,000. Youth recruits are exempt from the 7-day relist wait. Settlement same as seniors (50%+ for &lt;100 days in squad).</div></div>`;
-        return html;
-    }
-
-    // ============================================================
     // SQUAD PLAN — the coherent "who to sell, who to buy, and why"
     // ============================================================
     // This ties the two halves of roster management together into one
@@ -8881,8 +8293,8 @@ table.ftp-table {
             if (over.length > 0) seniorHtml += `<div class="vj-text-xs" style="color:var(--vj-red);margin-top:4px;">\u{1F4E4} Sell from: ${over.join(', ')} (these are the role groups with depth to spare)</div>`;
         }
 
-        // The actual prioritized SELL list, embedded directly — the exact
-        // same scoring generateSeniorSellList() uses, so the plan IS the
+        // The actual prioritized SELL list, embedded directly — using the
+        // same scoring as buildSeniorSellRanking(), so the plan IS the
         // answer to "who do I sell first", not a summary pointing at a
         // buried collapsible. Show the top surplus/urgency candidates (the
         // ones you'd cut to hit target), best-to-sell first.
@@ -8896,7 +8308,7 @@ table.ftp-table {
         youthHtml += `<div class="ftp-stat-row"><span class="ftp-stat-label">Behind curve</span><span class="ftp-stat-value" style="color:${youthBehind.length > 0 ? 'var(--vj-red)' : 'var(--vj-green)'};">${youthBehind.length} player${youthBehind.length === 1 ? '' : 's'}</span></div>`;
         youthHtml += `<div class="vj-text-xs vj-text-muted" style="margin-top:4px;line-height:1.5;">Youth must meet the age-based development-curve minimums (primary/technique/fielding against the 16-20 targets) to justify carrying to a senior spot. Behind on 2+ stats \u2014 especially at age 19-20 with no time left to catch up \u2014 is a strong sell/retire signal.</div>`;
         // Ranked youth sell list embedded too (same scoring as
-        // generateYouthSellList) — behind-curve prospects first.
+        // buildYouthSellRanking) — behind-curve prospects first.
         youthHtml += buildYouthSellRanking(youth, players, squadStats);
 
         return `<div class="ftp-info-box" style="border-left:3px solid var(--vj-gold);">
@@ -9479,13 +8891,7 @@ table.ftp-table {
             compareEl.innerHTML = '<div class="vj-text-xs vj-text-muted">No squad data cached yet — visit your Senior Squad page once to enable comparison.</div>';
         }
 
-        // Feeds the same evaluation into the AI-recommendations scaffold's
-        // context assembly (buildAIContextSnapshot) so that plumbing is
-        // exercised end-to-end even though no AI call is wired up yet —
-        // see AI_ENDPOINT_URL in the scaffold above.
-        window._ftpLastPlayerContext = buildAIContextSnapshot({
-            squadStats, ruleBasedRecommendation: { player: player.name, keepVerdict, verdict: evalResult.verdict, rank }
-        });
+
     }
 
     // ============================================================
@@ -9574,24 +8980,13 @@ table.ftp-table {
                 else if (pageType === 'youthrecruit') updateYouthRecruitAdvisor();
                 else if (pageType === 'club') updateClubStatusUI();
                 else if (pageType === 'squad') updateSquadAdvisor();
-                // REAL BUG (found via user report): transfer.htm and
-                // player.htm both DO trigger this same background
-                // fetchAllData() call (any pageType !== 'squad' does),
-                // but neither was in this re-render list — so
-                // updateTransferAdvisor()/updatePlayerAdvisor() only ever
-                // ran ONCE, synchronously, against whatever was already
-                // in the cache at page-load, before the fresh fetch below
-                // had a chance to complete. If your squad cache was even
-                // a little stale (e.g. a player's bat/bowl balance shifted
-                // from training since the last fetch), the transfer
-                // advisor's squad-peer comparison (comparePlayerToSquadPeers)
-                // and the Player Advisor's verdict would silently keep
-                // using the OLD numbers even after fresh data landed in
-                // the cache seconds later — this is what caused "you have
-                // no current batter" to persist even with real batters in
-                // the squad, independent of the getPrimarySkillInfo tie-
-                // break fix (v8.35), which only fixed a different, narrower
-                // case (skill data reading exactly 0/0).
+                // transfer.htm/player.htm trigger the same background
+                // fetchAllData() as every non-squad page, but were once
+                // missing from this re-render list — so their advisors ran
+                // once against the page-load cache and never re-ran after
+                // the fresh fetch landed minutes later, keeping a stale
+                // squad-peer comparison on screen regardless of how correct
+                // the classification logic was. Both must re-run here.
                 else if (pageType === 'transfer') updateTransferAdvisor();
                 else if (pageType === 'player') updatePlayerAdvisor();
             }).catch(e => console.warn('[FTP Advisor] Background refresh failed:', e));
