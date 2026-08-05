@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         FTP Advisor
 // @namespace    http://tampermonkey.net/
-// @version      8.49
-// @description  Comprehensive tactical advisor for From the Pavilion cricket game (v8.49: comprehensive Buy Rating - who to buy, what gap/which player to replace, senior vs youth logic; v8.48: wage-discount normalization, hidden-value gauge, price-history anchoring; v7.0: full UI redesign)
+// @version      8.50
+// @description  Comprehensive tactical advisor for From the Pavilion cricket game (v8.50: transfer results sorted by Buy Rating; v8.49: comprehensive Buy Rating; v8.48: wage-discount normalization, hidden-value gauge, price-history anchoring; v7.0: full UI redesign)
 // @author       You
 // @license      MIT
 // @match        https://www.fromthepavilion.org/*
@@ -7857,14 +7857,45 @@ table.ftp-table {
                 logSquadGapDiagnostic(seniorEval);
                 const priorityBuys = filtered;
 
+                // Academy/squad context for per-candidate Dynasty + Buy Rating
+                // projections. Computed once here and reused by every render
+                // pass (initial and after "Fetch Experience, Wages & Talents")
+                // so the expensive training simulation runs once per candidate
+                // per pass, not once per render.
+                const academyInfoForProjection = loadAcademyCache();
+                const squadContextForProjection = { size: seniorPlayers.length + youthPlayers.length, academyInfo: academyInfoForProjection, financeInfo: loadFinanceCache() };
+
+                // Precompute and cache each candidate's Dynasty (ceilingResult)
+                // and comprehensive Buy Rating on the player object, so both
+                // the sort below and renderTransferResults can read them back
+                // instead of recomputing. Stored as _ceilingResult/_buyRating.
+                function computeCandidateBuyData(p) {
+                    const ceilingResult = computePlayerCeiling(p, getAcademySpeedForPlayer(p, academyInfoForProjection), squadContextForProjection);
+                    p._ceilingResult = ceilingResult;
+                    p._buyRating = computeBuyRating(p, {
+                        squadStats, seniorPlayers, youthPlayers,
+                        academySpeed: getAcademySpeedForPlayer(p, academyInfoForProjection),
+                        squadContext: squadContextForProjection,
+                        ceilingResult
+                    });
+                    return p;
+                }
+                priorityBuys.forEach(computeCandidateBuyData);
+
                 // Record every candidate's price into the local price-history
                 // ledger so future searches can anchor asking prices against
                 // "similar listings this club has seen before."
                 evaluated.forEach(p => recordPlayerPrice(p));
 
-                // Sort: best buy to worst — ELITE first, then STRONG, then ADEQUATE; within verdict, highest rank first; cheapest first on ties
+                // Sort: best BUY RATING first (the comprehensive "should I buy"
+                // verdict), then verdict/rank/price as tiebreakers — the list
+                // now answers "what should I actually sign" rather than just
+                // "what's a high-skill player".
                 const verdictOrder = { elite: 0, strong: 1, adequate: 2 };
-                priorityBuys.sort((a, b) => (verdictOrder[a.eval.verdict] ?? 9) - (verdictOrder[b.eval.verdict] ?? 9) || b.eval.rank - a.eval.rank || (a.price || 0) - (b.price || 0));
+                priorityBuys.sort((a, b) =>
+                    (b._buyRating && b._buyRating.score || 0) - (a._buyRating && a._buyRating.score || 0) ||
+                    (verdictOrder[a.eval.verdict] ?? 9) - (verdictOrder[b.eval.verdict] ?? 9) ||
+                    (a.price || 0) - (b.price || 0));
                 function renderTransferResults(players, totalScanned, ageFilteredCount, verdictFilteredCount, detailsFetched) {
                     // peerCompare was already computed per-candidate up in
                     // the `evaluated` map (it now gates which seniors even
@@ -7892,50 +7923,19 @@ table.ftp-table {
                     if (players.length === 0) {
                         html += '<div class="vj-text-sm vj-text-muted">No targets found. Try adjusting search filters (age, bowling type, skill ranges).</div>';
                     } else {
-                        // Academy info for the per-candidate youth
-                        // projections below. Deliberately NOT collapsed to
-                        // one shared academySpeed number: these rows are
-                        // all 16-20yos, and trainingEfficiency is the mean
-                        // of senior+youth efficiency, which understates (or
-                        // overstates) youth training whenever the two
-                        // differ. getAcademySpeedForPlayer() picks the
-                        // age-appropriate figure per player instead — it's
-                        // the canonical helper used by the training page
-                        // and Player Advisor, so all three now agree.
-                        const academyInfoForProjection = loadAcademyCache();
-                        // Squad size for the training-speed squad-penalty
-                        // multiplier — same shape squadContext takes
-                        // everywhere else (Player Advisor, Training page).
-                        const squadContextForProjection = { size: seniorPlayers.length + youthPlayers.length, academyInfo: academyInfoForProjection, financeInfo: loadFinanceCache() };
-
                         players.forEach((p, i) => {
                             const ev = p.eval;
                             const badgeClass = ev.verdict === 'elite' ? 'green' : ev.verdict === 'strong' ? 'green' : 'warn';
                             const primaryInfo = getPrimarySkillInfo(p);
                             const primarySkill = primaryInfo.value;
                             const primaryName = primaryInfo.name === 'keeping' ? 'Keep' : primaryInfo.name === 'bowling' ? 'Bowl' : 'Bat';
-                            // Dynasty Score — current vs age/academy/training
-                            // -aware ceiling, same computePlayerCeiling() used
-                            // on the Player Advisor and sell lists, so a
-                            // market candidate and a squad player are always
-                            // comparable in the same units. Computed once per
-                            // candidate here and reused below for the youth
-                            // "Projected at 20" detail line instead of a
-                            // second simulateAdaptiveTrainingPlan() call.
-                            const ceilingResult = computePlayerCeiling(p, getAcademySpeedForPlayer(p, academyInfoForProjection), squadContextForProjection);
-
-                            // Comprehensive Buy Rating — the single verdict for
-                            // "should I buy this player", folding in stat
-                            // distribution, role fit, age trajectory, wage value,
-                            // cost anchor and squad fit (gap vs who they
-                            // replace). See computeBuyRating(). Precomputed here
-                            // once per candidate.
-                            const buyRating = computeBuyRating(p, {
-                                squadStats, seniorPlayers, youthPlayers,
-                                academySpeed: getAcademySpeedForPlayer(p, academyInfoForProjection),
-                                squadContext: squadContextForProjection,
-                                ceilingResult
-                            });
+                            // Dynasty + Buy Rating were precomputed once per
+                            // candidate in updateTransferAdvisor() (so they
+                            // could drive the sort) and stored on the player
+                            // object — read them back rather than re-running
+                            // the expensive training simulation here.
+                            const ceilingResult = p._ceilingResult;
+                            const buyRating = p._buyRating;
 
                             // Build detail line — show experience/wage only if fetched
                             const detailParts = [
@@ -8064,6 +8064,15 @@ table.ftp-table {
                             // with the same isWorthShowing gate used above.
                             p.peerCompare = (Math.round(p.age) >= 21) ? comparePlayerToSquadPeers(p, seniorPlayers) : null;
                         });
+                        // Recompute Dynasty + Buy Rating now that wage/talent
+                        // are known (they feed the buy rating's value/cost and
+                        // talent terms), then re-sort the same way as the first
+                        // pass so the list stays ordered by best-buy.
+                        priorityBuys.forEach(computeCandidateBuyData);
+                        priorityBuys.sort((a, b) =>
+                            (b._buyRating && b._buyRating.score || 0) - (a._buyRating && a._buyRating.score || 0) ||
+                            (verdictOrder[a.eval.verdict] ?? 9) - (verdictOrder[b.eval.verdict] ?? 9) ||
+                            (a.price || 0) - (b.price || 0));
                         logSquadGapDiagnostic(priorityBuys.filter(p => Math.round(p.age) >= 21));
                         // Re-filter with the exact same rule as the initial
                         // pass (elite + genuine squad upgrade for seniors).
