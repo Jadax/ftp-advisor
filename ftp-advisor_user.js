@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         FTP Advisor
 // @namespace    http://tampermonkey.net/
-// @version      8.54
-// @description  Comprehensive tactical advisor for From the Pavilion cricket game (v8.54: release hardening — removed dead Pro/AI scaffolds + unused sell-list code, trimmed narrative comments, author metadata).
+// @version      8.55
+// @description  Comprehensive tactical advisor for From the Pavilion cricket game (v8.55: buy rating now weighs transfer price/affordability so a cheap buy clearly beats a 9x-pricier one; v8.54: release hardening).
 // @author       Tushant Sharma
 // @license      MIT
 // @match        https://www.fromthepavilion.org/*
@@ -651,15 +651,34 @@
             valueScore = 6; // wage unknown — neutral, don't punish
         }
 
-        // 6) Cost anchor vs typical listing (0-10). If this candidate's
-        //    asking price is far above what similar archetypes have sold
-        //    for locally (price-history ledger), it's a worse buy.
-        let costScore = 5;
+        // 6) Cost (0-15). Price is what you ACTUALLY pay to acquire the
+        //    player (a one-time transfer fee on top of ongoing wages), so it
+        //    must differentiate a real buy from a luxury — an $8k and a
+        //    $75k senior of near-equal quality are NOT equally good buys,
+        //    and the wage-only valueScore can't see that (it only uses
+        //    wage). Score high when the price is cheap relative to both the
+        //    local market anchor (price-history ledger, when available) and
+        //    an absolute affordability ceiling; score low when expensive.
+        let costScore = 6; // neutral when price unknown
         const anchor = anchorPriceForPlayer(player);
-        if (anchor && player.price > 0) {
-            if (player.price <= anchor.med) costScore = 10;
-            else if (player.price <= anchor.hi) costScore = 6;
-            else costScore = 3;
+        if (player.price > 0) {
+            // Absolute affordability ceiling (best-effort, community-sourced:
+            // most good senior signings are <$20k; $50k+ is a premium outlay).
+            // Cheap is always good value; expensive is a large risk.
+            if (player.price <= 8000) costScore = 15;
+            else if (player.price <= 15000) costScore = 12;
+            else if (player.price <= 30000) costScore = 9;
+            else if (player.price <= 60000) costScore = 6;
+            else costScore = 3; // $60k+ — premium, only justified by exceptional quality
+            // Refine with the local market anchor when we have real
+            // comparable-history: a price below what this archetype usually
+            // sells for is a better buy than one far above it.
+            if (anchor && anchor.med > 0) {
+                if (player.price <= anchor.med * 0.8) costScore = Math.max(costScore, 15);
+                else if (player.price <= anchor.med * 1.2) costScore = Math.min(costScore, 13);
+                else if (player.price <= anchor.hi) costScore = Math.min(costScore, 10);
+                else costScore = Math.min(costScore, 5); // above the whole range = overpriced
+            }
         }
 
         // 7) Talent bonus (0-5) — role-aligned talents add real upside
@@ -673,7 +692,7 @@
         if (isYouth) {
             const sc = qualityScore * 0.55;                    // ceiling at 20 dominates
             const fitc = (fit === 'gap' ? 0 : fit === 'upgrade' ? 0 : fit === 'depth' ? 0 : -15) ; // youth fit handled below
-            score = sc + ageScore * 1.2 + distScore * 0.6 + valueScore * 0.5 + costScore * 0.4 + talentScore * 0.8;
+            score = sc + ageScore * 1.2 + distScore * 0.6 + valueScore * 0.5 + costScore * 0.6 + talentScore * 0.8;
             // Add squad-fit term for youth on top (future need in the role)
             if (fit === 'gap') score += 10;
             else if (fit === 'upgrade') score += 6;
@@ -681,7 +700,7 @@
             score = Math.max(0, Math.min(100, score));
             label = score >= 75 ? 'elite-signing' : score >= 55 ? 'strong-signing' : score >= 35 ? 'reasonable' : 'pass';
         } else {
-            score = qualityScore * 1.0 + ageScore + distScore * 0.8 + valueScore * 0.9 + costScore * 0.6 + talentScore;
+            score = qualityScore * 1.0 + ageScore + distScore * 0.8 + valueScore * 0.9 + costScore * 0.9 + talentScore;
             if (fit === 'gap') score += 10;
             else if (fit === 'upgrade') score += 8;
             else if (fit === 'depth') score -= 6; // can't justify a signing that isn't a clear upgrade
