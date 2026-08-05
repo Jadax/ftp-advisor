@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         FTP Advisor
 // @namespace    http://tampermonkey.net/
-// @version      8.52
-// @description  Comprehensive tactical advisor for From the Pavilion cricket game (v8.52: Squad Plan now embeds prioritized sell lists direct + uses full cached squad both pages; v8.51: Squad Plan; v8.50: transfer sorted by Buy Rating; v7.0: full UI redesign)
+// @version      8.53
+// @description  Comprehensive tactical advisor for From the Pavilion cricket game (v8.53: bowling spells now enforce rest across the drinks break; Squad Plan sections consolidated; v8.52: Squad Plan embeds ranked sells; v7.0: full UI redesign)
 // @author       You
 // @license      MIT
 // @match        https://www.fromthepavilion.org/*
@@ -4622,6 +4622,103 @@
             }
         });
 
+        // ---- Rest across the drinks break (OD/YOD only) ----
+        // Manual-confirmed mechanic: "Energy is partially replenished
+        // during drinks breaks and during the change of innings"
+        // (rulespage=matchengine). Giving a bowler some overs before the
+        // halfway break and some after is a real rest window, instead of
+        // bowling their whole allocation in one continuous block. This
+        // post-pass splits any spell >=4 overs that would otherwise sit
+        // ENTIRELY before OR entirely after the break into two parts, then
+        // re-numbers each end cleanly and re-fixes adjacency. The bowler's
+        // total overs is unchanged, so per-bowler over limits are never
+        // violated. T20 spells are short (max 4) and the manual treats the
+        // break as a minor factor there, so it's left alone.
+        if (!isT20 && plan.length > 0) {
+            const breakOver = totalOvers / 2;
+
+            // Rest across the drinks break (OD/YOD only). The main allocator
+            // above already assigns valid startOver positions (correct per-end
+            // over numbers, per-bowler caps, adjacency) — those are kept as-is.
+            // This pass only splits a spell that is ENTIRELY on one side of the
+            // break AND long enough (>=4 overs) into two parts, so its bowler
+            // gets a real rest window at the break instead of one continuous
+            // block. A spell that already STRADDLES the break is left alone —
+            // it bowls some overs each side and already gets the window.
+            // The inserted part is placed just across the break on the same end
+            // at the first genuinely-free over number of that parity (checked
+            // against every other spell on that end), and skipped if no free
+            // slot exists (so we never create a collision or exceed overs). The
+            // bowler's total overs is unchanged, so per-bowler caps hold. T20
+            // spells are short and the break is a minor factor there.
+            const occupancy = { Gibson: new Set(), Southern: new Set() };
+            plan.forEach(sp => {
+                for (let o = sp.startOver; o <= sp.startOver + (sp.overs - 1) * 2; o += 2) {
+                    occupancy[sp.end].add(o);
+                }
+            });
+            const firstFree = (end, parity, lo) => {
+                for (let o = Math.max(lo, parity ? 1 : 2); ; o += 2) {
+                    if (!occupancy[end].has(o)) return o;
+                }
+            };
+
+            const splitSpells = [];
+            for (const sp of plan) {
+                const lastOver = sp.startOver + (sp.overs - 1) * 2;
+                const entirelyBefore = lastOver <= breakOver;
+                const entirelyAfter = sp.startOver > breakOver;
+                if (sp.overs >= 4 && (entirelyBefore || entirelyAfter)) {
+                    const parity = (sp.startOver % 2) !== 0;
+                    const pre = Math.floor(sp.overs / 2);
+                    const post = sp.overs - pre;
+                    // find a free slot just across the break, same end+parity
+                    const cross = entirelyBefore
+                        ? firstFree(sp.end, parity, breakOver + 1)
+                        : firstFree(sp.end, parity, 1);
+                    if (cross > 0 && cross <= (entirelyBefore ? totalOvers : breakOver)) {
+                        if (entirelyBefore) {
+                            splitSpells.push({ ...sp, overs: pre, startOver: sp.startOver });
+                            const p = { ...sp, overs: post, startOver: cross, phase: sp.phase === 'New ball' ? 'Middle overs' : sp.phase };
+                            for (let o = cross; o <= cross + (post - 1) * 2; o += 2) occupancy[sp.end].add(o);
+                            splitSpells.push(p);
+                        } else {
+                            const p = { ...sp, overs: pre, startOver: cross, phase: sp.phase === 'Death overs' ? 'Middle overs' : sp.phase };
+                            for (let o = cross; o <= cross + (pre - 1) * 2; o += 2) occupancy[sp.end].add(o);
+                            splitSpells.push(p);
+                            splitSpells.push({ ...sp, overs: post, startOver: sp.startOver });
+                        }
+                    } else {
+                        splitSpells.push(sp);
+                    }
+                } else {
+                    splitSpells.push(sp);
+                }
+            }
+
+            // Re-fix adjacency across the (possibly split) interleaved list.
+            // Totals per bowler unchanged, so caps hold.
+            const rePlan = splitSpells;
+            for (let pass = 0; pass < 3; pass++) {
+                let fixed = false;
+                for (let i = 1; i < rePlan.length; i++) {
+                    if (rePlan[i].player.id === rePlan[i - 1].player.id) {
+                        for (let j = i + 1; j < rePlan.length; j++) {
+                            const prevId = i >= 2 ? rePlan[i - 2].player.id : null;
+                            const nextId = j + 1 < rePlan.length ? rePlan[j + 1].player.id : null;
+                            if (rePlan[j].player.id !== rePlan[i - 1].player.id && rePlan[j].player.id !== prevId && rePlan[i - 1].player.id !== nextId) {
+                                [rePlan[i], rePlan[j]] = [rePlan[j], rePlan[i]];
+                                fixed = true;
+                                break;
+                            }
+                        }
+                    }
+                }
+                if (!fixed) break;
+            }
+            return rePlan;
+        }
+
         return plan;
     }
 
@@ -4910,15 +5007,13 @@
         // drinks breaks and during the change of innings" (rulespage=
         // matchengine). Splitting a bowler's overs into a spell before
         // the halfway-point break and another after gives them an actual
-        // rest window, instead of one continuous block. NOT enforced
-        // inside allocateBowlingSpells() itself — that allocator is
-        // already an intricate multi-strategy algorithm (see the v8.31
-        // over-limit bug found in it), and restructuring it to force a
-        // split per bowler isn't safe to do without live-game
-        // verification. Surfaced here as a direct, visible check instead,
-        // computed from the real spell.startOver values already on each
-        // spell, so it's honest about what's actually been scheduled.
-        if (totalOvers) {
+        // rest window, instead of one continuous block. Since v8.53 the
+        // allocator ITSELF does this split (see allocateBowlingSpells()'s
+        // "Rest across the drinks break" pass), so this warning only fires
+        // when the split genuinely couldn't help — e.g. T20 (short spells,
+        // left alone on purpose) or a bowler who couldn't be split without
+        // breaking the over limits.
+        if (totalOvers && totalOvers < 40) {
             const breakOver = totalOvers / 2;
             const perBowler = {};
             bowlingSpells.forEach(s => {
@@ -4926,16 +5021,37 @@
                 if (!perBowler[s.player.id]) perBowler[s.player.id] = { name: s.player.name, before: 0, after: 0, total: 0 };
                 const b = perBowler[s.player.id];
                 const spellEndOver = s.startOver + (s.overs - 1) * 2;
-                if (spellEndOver <= breakOver) b.before += s.overs;
-                else if (s.startOver > breakOver) b.after += s.overs;
-                else b.before += s.overs; // straddles the break — already gets a natural gap either way
+                if (spellEndOver <= breakOver) {
+                    b.before += s.overs;                    // entirely before
+                } else if (s.startOver > breakOver) {
+                    b.after += s.overs;                     // entirely after
+                } else {
+                    // STRADDLES the break: this spell already bowls some
+                    // overs before AND some after the break, so this bowler
+                    // genuinely gets a rest window mid-innings (the delivery
+                    // over numbers on an end step by 2, so the spell lands
+                    // on both sides of the halfway point). Split its overs
+                    // across before/after so it's NOT mislabeled "all
+                    // before, no rest" by the check below.
+                    const perOverStep = 2;
+                    const oversBefore = Math.ceil((breakOver - s.startOver + 1) / perOverStep);
+                    const oversAfter = s.overs - oversBefore;
+                    b.before += oversBefore;
+                    b.after += oversAfter;
+                }
                 b.total += s.overs;
             });
-            const noRest = Object.values(perBowler).filter(b => b.total >= 4 && (b.before === 0 || b.after === 0));
+            // The allocator now splits long all-before spells so the bowler
+            // also bowls after the break (real rest window). So a bowler
+            // still flagged here is a genuinely unavoidable edge case.
+            // "all AFTER" bowlers are NOT worth flagging — they're fresh
+            // death-overs bowlers who rested before bowling, which is the
+            // whole point. Only warn when a bowler's block is entirely
+            // BEFORE the break with no break-window recovery afterwards.
+            const noRest = Object.values(perBowler).filter(b => b.total >= 4 && b.before > 0 && b.after === 0 && b.before === b.total);
             if (noRest.length > 0) {
-                html += `<div class="ftp-alert warning" style="margin-bottom:6px;"><span>⚠</span><div><strong>No rest across the drinks break:</strong> ${noRest.map(b => `${b.name} (${b.total} overs, all ${b.before === 0 ? 'after' : 'before'})`).join(', ')} — consider a shorter spell either side of the break instead of one long block, so they get a real rest window.</div></div>`;
-            }
-        }
+                html += `<div class="ftp-alert warning" style="margin-bottom:6px;"><span>⚠</span><div><strong>No rest across the drinks break:</strong> ${noRest.map(b => `${b.name} (${b.total} overs, all ${b.before === 0 ? 'after' : 'before'})`).join(', ')} — these couldn't be split without breaking the over limits; if a break happens, they'll still get whatever recovery the game grants between their spells in other overs.</div></div>`;
+            }        }
 
         // Endurance/freshness for the death overs (v8.41) — see
         // rankForDeathOvers() in allocateBowlingSpells(): the plan above
@@ -5821,10 +5937,8 @@ table.ftp-table {
                 { id: 'ftp-refresh', label: '\u21BB', title: 'Refresh' }
             ],
             sections: [
-                { id: 'ftp-squad-plan', label: 'Squad Plan', icon: '\u{1F4E9}', iconColor: 'amber' },
-                { id: 'ftp-squad-stats', label: 'Squad Overview', icon: '\u{1F4CA}', iconColor: 'green' },
-                { id: 'ftp-squad-sell-seniors', label: 'Sell Candidates (Seniors)', icon: '\u{1F4B0}', iconColor: 'red', collapsible: true, collapsed: true },
-                { id: 'ftp-squad-sell-youth', label: 'Sell Candidates (Youth)', icon: '\u{1F331}', iconColor: 'amber', collapsible: true, collapsed: true }
+                { id: 'ftp-squad-plan', label: 'Squad Plan \u2014 who to sell vs who to buy', icon: '\u{1F4E9}', iconColor: 'amber' },
+                { id: 'ftp-squad-stats', label: 'Squad Overview', icon: '\u{1F4CA}', iconColor: 'green' }
             ]
         });
         document.getElementById('ftp-refresh').addEventListener('click', updateSquadAdvisor);
@@ -5882,14 +5996,16 @@ table.ftp-table {
 
         document.getElementById('ftp-squad-stats').innerHTML = html;
 
-        // Keep/sell recommendations for own team
+        // Keep/sell recommendations for own team — all shown inside the
+        // Squad Plan now (which embeds the ranked sell lists), so there are
+        // no separate sell collapsibles to maintain.
         if (isMyTeam && !isLimitedView) {
             // Use the full cached squad (seniors + youth) for the Squad Plan
-            // and sell lists, so you see youth sell candidates even while on
-            // the senior squad page (and vice versa). The current page scrape
-            // is the freshest single half; merge it over what the cache has
-            // for every player, keeping any cached players the page doesn't
-            // show. Falls back to just the page scrape if nothing's cached.
+            // so you see youth sell candidates even while on the senior squad
+            // page (and vice versa). The current page scrape is the freshest
+            // single half; merge it over what the cache has for every player,
+            // keeping any cached players the page doesn't show. Falls back to
+            // just the page scrape if nothing's cached.
             const cache = loadPlayerCache();
             let roster = players;
             if (cache && cache.players && cache.players.length > 0) {
@@ -5908,10 +6024,6 @@ table.ftp-table {
             }
             const planEl = document.getElementById('ftp-squad-plan');
             if (planEl) planEl.innerHTML = buildSquadPlan(roster);
-            const seniorSellEl = document.getElementById('ftp-squad-sell-seniors');
-            const youthSellEl = document.getElementById('ftp-squad-sell-youth');
-            if (seniorSellEl) seniorSellEl.innerHTML = generateSeniorSellList(roster);
-            if (youthSellEl) youthSellEl.innerHTML = generateYouthSellList(roster);
         }
     }
 
