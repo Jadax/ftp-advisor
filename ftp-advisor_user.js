@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         FTP Advisor
 // @namespace    http://tampermonkey.net/
-// @version      8.51
-// @description  Comprehensive tactical advisor for From the Pavilion cricket game (v8.51: Squad Plan - coherent sell-vs-buy roster advisor on squad page; v8.50: transfer results sorted by Buy Rating; v8.49: comprehensive Buy Rating; v7.0: full UI redesign)
+// @version      8.52
+// @description  Comprehensive tactical advisor for From the Pavilion cricket game (v8.52: Squad Plan now embeds prioritized sell lists direct + uses full cached squad both pages; v8.51: Squad Plan; v8.50: transfer sorted by Buy Rating; v7.0: full UI redesign)
 // @author       You
 // @license      MIT
 // @match        https://www.fromthepavilion.org/*
@@ -5884,12 +5884,34 @@ table.ftp-table {
 
         // Keep/sell recommendations for own team
         if (isMyTeam && !isLimitedView) {
+            // Use the full cached squad (seniors + youth) for the Squad Plan
+            // and sell lists, so you see youth sell candidates even while on
+            // the senior squad page (and vice versa). The current page scrape
+            // is the freshest single half; merge it over what the cache has
+            // for every player, keeping any cached players the page doesn't
+            // show. Falls back to just the page scrape if nothing's cached.
+            const cache = loadPlayerCache();
+            let roster = players;
+            if (cache && cache.players && cache.players.length > 0) {
+                const byId = new Map();
+                players.forEach(p => byId.set(p.id, p));
+                cache.players.forEach(cp => {
+                    if (byId.has(cp.id)) {
+                        // Page data wins for overlapping players (fresher);
+                        // keep the page object but fill missing detail from cache.
+                        byId.get(cp.id).talents = byId.get(cp.id).talents || cp.talents || [];
+                    } else {
+                        byId.set(cp.id, cp);
+                    }
+                });
+                roster = Array.from(byId.values());
+            }
             const planEl = document.getElementById('ftp-squad-plan');
-            if (planEl) planEl.innerHTML = buildSquadPlan(players);
+            if (planEl) planEl.innerHTML = buildSquadPlan(roster);
             const seniorSellEl = document.getElementById('ftp-squad-sell-seniors');
             const youthSellEl = document.getElementById('ftp-squad-sell-youth');
-            if (seniorSellEl) seniorSellEl.innerHTML = generateSeniorSellList(players);
-            if (youthSellEl) youthSellEl.innerHTML = generateYouthSellList(players);
+            if (seniorSellEl) seniorSellEl.innerHTML = generateSeniorSellList(roster);
+            if (youthSellEl) youthSellEl.innerHTML = generateYouthSellList(roster);
         }
     }
 
@@ -8235,6 +8257,96 @@ table.ftp-table {
             </div>`;
     }
 
+    // Ranked SENIOR sell list for the Squad Plan — compact version of
+    // generateSeniorSellList()'s scoring, so the plan ITSELF shows who to
+    // sell first (priority down) rather than pointing at a buried
+    // collapsible. Returns HTML list; empty HTML when nobody's flagged.
+    function buildSeniorSellRanking(seniors, squadStats, seniorOver) {
+        if (!seniors || seniors.length === 0) return '';
+        const avg = (arr, key) => arr.length ? arr.reduce((s, p) => s + (p[key] || 0), 0) / arr.length : 0;
+        const avgRating = avg(seniors, 'rating');
+        const surplusMap = squadStats ? computeRoleSurplus(seniors, squadStats) : new Map();
+        const dynastyAcademyInfo = loadAcademyCache();
+        const dynastySquadContext = { size: seniors.length, academyInfo: dynastyAcademyInfo, financeInfo: loadFinanceCache() };
+
+        const scored = seniors.map(p => {
+            let s = 0;
+            const reasons = [];
+            const primary = getPrimarySkillInfo(p).value;
+            if (p.age >= 30) s += 10; else if (p.age >= 28) s += 5;
+            if (primary < 5) { s += 15; reasons.push(`Primary ${skillLabel(primary)} — too weak for senior cricket`); }
+            else if (primary < 7) { s += 10; reasons.push(`Primary ${skillLabel(primary)} — below standard`); }
+            if ((p.technique || 0) < 5) s += 10;
+            if (avgRating > 0 && (p.rating || 0) < avgRating * 0.5) s += 15;
+            const surplus = surplusMap.get(p.id);
+            if (surplus && surplus.isSurplus) {
+                const overBy = surplus.positionInRole - surplus.roleTarget;
+                s += overBy === 1 ? 12 : overBy === 2 ? 9 : 6;
+                const roleLabel = surplus.role === 'keeping' ? 'keeper' : surplus.role === 'bowling' ? 'bowler' : 'batter';
+                reasons.push(`Depth: #${surplus.positionInRole} of ${surplus.roleCount} ${roleLabel}s (target ~${surplus.roleTarget})`);
+            }
+            s -= seniorTalentProtection(p);
+            if (p.isCaptain) s -= 5;
+            if (p.role === 'WK' || (p.keeping || 0) >= 6) s -= 5;
+            if (['rf','lf'].includes(p.bowlerType)) s -= 8;
+            else if (['rfm','lfm','rws','lws'].includes(p.bowlerType)) s -= 5;
+            return { player: p, s, reasons };
+        }).filter(r => r.s > 0).sort((a, b) => b.s - a.s);
+
+        if (scored.length === 0) return '';
+        const showCount = Math.min(scored.length, Math.max(1, seniorOver || 3));
+        const shown = scored.slice(0, showCount);
+        let html = `<div class="vj-text-xs vj-text-muted" style="margin-top:6px;">\u{1F4E4} <strong>Sell first (by urgency):</strong></div>`;
+        shown.forEach((r, i) => {
+            const sev = r.s >= 20 ? 'critical' : r.s >= 10 ? 'high' : 'medium';
+            const cause = r.reasons.length ? r.reasons.join(' · ') : `sellScore ${r.s}`;
+            html += `<div class="vj-text-xs" style="color:var(--vj-${sev === 'critical' ? 'red' : sev === 'high' ? 'amber' : 'muted'});margin-top:2px;">${i + 1}. <strong>${r.player.name}</strong> (${formatAgeDisplay(r.player.age)}, ${skillLabel(getPrimarySkillInfo(r.player).value)}) — ${cause}</div>`;
+        });
+        if (scored.length > showCount) html += `<div class="vj-text-xs vj-text-muted" style="margin-top:2px;">+ ${scored.length - showCount} more (expand Sell Candidates below)</div>`;
+        return html;
+    }
+
+    // Ranked YOUTH sell list for the Squad Plan — compact version of
+    // generateYouthSellList()'s scoring. Behind-curve prospects (the ones
+    // failing YOUTH_DEV_CURVE minimums) ranked first, priority down.
+    function buildYouthSellRanking(youth, allPlayers, squadStats) {
+        if (!youth || youth.length === 0) return '<div class="vj-text-xs vj-text-muted" style="margin-top:4px;">No youth in cached squad \u2014 the youth squad is on a separate page.</div>';
+        const dynastyAcademyInfo = loadAcademyCache();
+        const dynastySquadContext = { size: (allPlayers || []).length, academyInfo: dynastyAcademyInfo, financeInfo: loadFinanceCache() };
+
+        const scored = youth.map(p => {
+            let s = 0;
+            const reasons = [];
+            const ydEval = evaluateYouthDevelopment(p);
+            const behindStats = ydEval ? ydEval.rows.filter(r => r.status === 'behind') : [];
+            if (behindStats.length >= 2) { s += 15; reasons.push(`Behind on ${behindStats.length} stats (${behindStats.map(r => r.label).join(', ')})`); }
+            else if (behindStats.length === 1) { s += 8; reasons.push(`Behind on ${behindStats[0].label}`); }
+            if (p.age >= 20 && behindStats.length >= 1) { s += 20; reasons.push('Age 20 — final youth year, behind curve'); }
+            if (p.age >= 19 && ydEval && ydEval.rows[0] && ydEval.rows[0].status === 'behind' && (ydEval.rows[0].min - ydEval.rows[0].value) >= 2) { s += 15; reasons.push('Primary well behind target — unlikely to catch up'); }
+            const overallSkill = ((p.batting||0) + (p.bowling||0) + (p.technique||0) + (p.fielding||0)) / 4;
+            if (overallSkill < 4) { s += 10; reasons.push('Very low overall skill'); }
+            if (ydEval && behindStats.length === 0 && ydEval.rows.some(r => r.status === 'ahead')) s -= 10;
+            s -= youthTalentProtection(p);
+            // Ceiling still can't clear the current weakest same-role senior
+            const rolePeers = (allPlayers || []).filter(sp => sp.age >= 21 && getPrimarySkillInfo(sp).name === getPrimarySkillInfo(p).name);
+            const ceilingResult = computePlayerCeiling(p, getAcademySpeedForPlayer(p, dynastyAcademyInfo), dynastySquadContext);
+            if (rolePeers.length > 0) {
+                const peerFloor = Math.min(...rolePeers.map(computePlayerValueSkillSum));
+                if (ceilingResult.ceiling < peerFloor) { s += 12; reasons.push(`Ceiling (${ceilingResult.ceiling.toFixed(1)}) below weakest senior ${getPrimarySkillInfo(p).name === 'keeping' ? 'keeper' : getPrimarySkillInfo(p).name === 'bowling' ? 'bowler' : 'batter'}`); }
+            }
+            return { player: p, s, reasons };
+        }).filter(r => r.s > 0).sort((a, b) => b.s - a.s);
+
+        if (scored.length === 0) return '<div class="vj-text-xs vj-text-muted" style="margin-top:4px;">All youth on track or ahead of the curve \u2014 no urgent sells.</div>';
+        let html = `<div class="vj-text-xs vj-text-muted" style="margin-top:6px;">\u{1F331} <strong>Sell/retire first (behind the curve):</strong></div>`;
+        scored.forEach((r, i) => {
+            const sev = r.s >= 20 ? 'critical' : r.s >= 10 ? 'high' : 'medium';
+            const cause = r.reasons.length ? r.reasons.join(' · ') : `score ${r.s}`;
+            html += `<div class="vj-text-xs" style="color:var(--vj-${sev === 'critical' ? 'red' : sev === 'high' ? 'amber' : 'muted'});margin-top:2px;">${i + 1}. <strong>${r.player.name}</strong> (age ${Math.round(r.player.age)}, ${skillLabel(getPrimarySkillInfo(r.player).value)}) — ${cause}</div>`;
+        });
+        return html;
+    }
+
     // Recommended senior squad shape for a competitive matchday XI plus
     // realistic rotation/injury cover — NOT a game-enforced rule (the
     // only real squad-size rule is the 25-player training-efficiency
@@ -8657,16 +8769,23 @@ table.ftp-table {
             if (over.length > 0) seniorHtml += `<div class="vj-text-xs" style="color:var(--vj-red);margin-top:4px;">\u{1F4E4} Sell from: ${over.join(', ')} (these are the role groups with depth to spare)</div>`;
         }
 
+        // The actual prioritized SELL list, embedded directly — the exact
+        // same scoring generateSeniorSellList() uses, so the plan IS the
+        // answer to "who do I sell first", not a summary pointing at a
+        // buried collapsible. Show the top surplus/urgency candidates (the
+        // ones you'd cut to hit target), best-to-sell first.
+        seniorHtml += buildSeniorSellRanking(seniors, squadStats, seniorOver);
+
         // ── YOUTH half ──────────────────────────────────────────
         let youthHtml = '';
         const youthYd = youth.map(p => ({ p, yd: evaluateYouthDevelopment(p) }));
         const youthBehind = youthYd.filter(x => x.yd && x.yd.overallStatus === 'behind');
         youthHtml += `<div class="ftp-stat-row"><span class="ftp-stat-label">Youth count</span><span class="ftp-stat-value">${youth.length} <span class="vj-text-xs vj-text-muted">(keep ≥12 to avoid auto-draft)</span></span></div>`;
         youthHtml += `<div class="ftp-stat-row"><span class="ftp-stat-label">Behind curve</span><span class="ftp-stat-value" style="color:${youthBehind.length > 0 ? 'var(--vj-red)' : 'var(--vj-green)'};">${youthBehind.length} player${youthBehind.length === 1 ? '' : 's'}</span></div>`;
-        youthHtml += `<div class="vj-text-xs vj-text-muted" style="margin-top:4px;line-height:1.5;">Youth must meet the age-based development-curve minimums (primary/technique/fielding against the 16-20 targets) to justify carrying to a senior spot. Behind on 2+ stats \u2014 especially at age 19-20 with no time left to catch up \u2014 is a strong sell/retire signal; see the Youth sell list below for the exact candidates.</div>`;
-        if (youthBehind.length === 0 && youth.length > 14) {
-            youthHtml += `<div class="vj-text-xs vj-text-muted" style="margin-top:4px;">All youth are on track or ahead \u2014 only trim the weakest if you want extra room, and never below 12.</div>`;
-        }
+        youthHtml += `<div class="vj-text-xs vj-text-muted" style="margin-top:4px;line-height:1.5;">Youth must meet the age-based development-curve minimums (primary/technique/fielding against the 16-20 targets) to justify carrying to a senior spot. Behind on 2+ stats \u2014 especially at age 19-20 with no time left to catch up \u2014 is a strong sell/retire signal.</div>`;
+        // Ranked youth sell list embedded too (same scoring as
+        // generateYouthSellList) — behind-curve prospects first.
+        youthHtml += buildYouthSellRanking(youth, players, squadStats);
 
         return `<div class="ftp-info-box" style="border-left:3px solid var(--vj-gold);">
             <div class="vj-fw-700 vj-mb-4">Squad Plan \u2014 who to sell vs who to buy</div>
