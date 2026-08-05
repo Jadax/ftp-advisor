@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         FTP Advisor
 // @namespace    http://tampermonkey.net/
-// @version      8.55
+// @version      8.56
 // @description  Comprehensive tactical advisor for From the Pavilion cricket game (v8.55: buy rating now weighs transfer price/affordability so a cheap buy clearly beats a 9x-pricier one; v8.54: release hardening).
 // @author       Tushant Sharma
 // @license      MIT
@@ -470,6 +470,16 @@
         return Math.ceil((20 - (age || 16)) * 14);
     }
 
+    // Weeks from the player's current age to a target age (14 weeks per
+    // age-year — see parseGameAge()/the 14-not-52 rule). Generalizes
+    // weeksToAge20() so a youth's ceiling can be projected to a senor-
+    // comparable age (e.g. 22) rather than being truncated at the age-20
+    // promotion boundary, which understated what they'll contribute once
+    // they become seniors.
+    function weeksToAge(age, targetAge) {
+        return Math.max(0, Math.ceil((targetAge - (age || 16)) * 14));
+    }
+
     // Community-consensus assessment thresholds for a projected primary
     // skill at age 20 — Expert(9)+ = excellent, Accomplished(8) = strong,
     // Reliable(7) = adequate, below = likely won't contribute. Shared by
@@ -515,11 +525,23 @@
      * timeline (the Player Advisor's training grid) can reuse it instead
      * of re-simulating.
      */
-    function computePlayerCeiling(player, academySpeed, squadContext) {
+    function computePlayerCeiling(player, academySpeed, squadContext, projectToAge) {
         const age = player.age || 0;
         const isYouth = age < 20;
-        const weeks = isYouth ? weeksToAge20(age) : (age >= 30 ? 14 : 28);
-        const label = isYouth ? 'to age 20' : (age >= 30 ? '1 age-year outlook' : '2 age-year outlook');
+        // `projectToAge` (used by the Buy Rating for youth) overrides the
+        // default horizon so a youth is projected to a SENIOR-COMPARABLE
+        // age (e.g. 22 — a few years into their senior career) rather than
+        // being truncated at 20. Without it, a 16yo is judged on only 4
+        // years of development and their ceiling reads far lower than a
+        // senior's current value even though they'll keep training past 20
+        // and become that senior. The "ceiling" is then comparable to a
+        // senior's current in the same units.
+        const weeks = projectToAge != null
+            ? weeksToAge(age, projectToAge)
+            : (isYouth ? weeksToAge20(age) : (age >= 30 ? 14 : 28));
+        const label = projectToAge != null
+            ? `to age ${projectToAge}`
+            : (isYouth ? 'to age 20' : (age >= 30 ? '1 age-year outlook' : '2 age-year outlook'));
         const plan = simulateAdaptiveTrainingPlan(player, weeks, academySpeed, squadContext);
         const projectedSkills = Object.assign({}, player, plan.finalSkills);
         return {
@@ -568,9 +590,51 @@
         const role = primaryInfo.name;
         const roleLabel = role === 'keeping' ? 'wicketkeeper' : role === 'bowling' ? 'bowler' : 'batter';
 
-        // 1) Squad fit — the most important "buy OR not" driver.
+        // 1) Core quality distilled to a 0-~40 contribution — computed
+        //    first because the squad-fit comparison below uses it.
+        //    SENIOR: use current quality (first-team now). Youth: use the
+        //    projected ceiling at a SENIOR-COMPARABLE age (22 — a few years
+        //    into their senior career), because the whole point of a youth
+        //    buy is what they'll contribute as a SENIOR, and they keep
+        //    training past 20. Truncating at the age-20 promotion boundary
+        //    (the old "ceilingResult.ceiling") made every 16yo look far
+        //    worse than any senior, since a 16yo was graded on only ~4
+        //    years of development while a 21yo senior is graded on their
+        //    current value — apples-to-oranges, and wrong for a player who
+        //    becomes a senior. Projecting to ~22 makes the youth ceiling
+        //    comparable in the same units as a senior's current. The "at 20"
+        //    projection is still shown on the card as the promo boundary.
+        let qualityRef;
+        if (isYouth) {
+            // Prefer the caller-precomputed senior-comparable projection
+            // (age 22) so the expensive simulation isn't re-run here. The
+            // fallback self-computes for direct callers that only pass
+            // ceilingResult (e.g. test harnesses). This horizon is
+            // deliberately different from ceilingResult (to-20, shown on
+            // the card as the promo boundary): the buy rating is about
+            // what they'll contribute as a SENIOR.
+            qualityRef = (opts.seniorCeiling && opts.seniorCeiling.ceiling != null)
+                ? opts.seniorCeiling.ceiling
+                : computePlayerCeiling(player, opts.academySpeed, opts.squadContext, 22).ceiling;
+        } else {
+            qualityRef = ceilingResult.current;
+        }
+        // Compress the quality value into its 0-~40 (senior) / 0-50 (youth)
+        // contribution. The senior cap matches the real range of CURRENT
+        // skill-sums (a 40+ senior is already exceptional). A youth's
+        // PROJECTED ceiling can legitimately exceed that — elite prospects
+        // project to 50+ by age 22 — and the whole point of a youth buy is
+        // the future senior they become, so youth cap higher (50): a
+        // prospect who projects to a better senior than anything currently
+        // on the squad should be able to outrank those seniors, not just
+        // tie them. The bound keeps the max youth total under the
+        // theoretical senior max (~100).
+        const qualityCap = isYouth ? 50 : 40;
+        const qualityScore = Math.max(0, Math.min(qualityCap, qualityRef));
+
+        // 2) Squad fit — the most important "buy OR not" driver.
         //    A gap-fill (no senior player in this role) or a clear upgrade
-        //    over the current worst-in-role is worth far more than a
+        //    over the current best-in-role is worth far more than a
         //    same-calibre depth signing.
         let fit = 'none', replace = null;
         let myBestRole = null;
@@ -580,37 +644,39 @@
             breakdown.push(`Fills a squad gap — you have NO senior ${roleLabel} in this role`);
         } else {
             // Compare candidate vs each squad peer in the same role by
-            // the SAME quality metric (Dynasty current), so "better"
-            // means better at the thing that counts for first-team.
-            const myRoleAverages = computeSquadStats(rolePeers);
+            // the SAME quality metric (skill-sum), so "better" means
+            // better at the thing that counts for first-team. Youth
+            // compare their PROJECTED ceiling at 22, not their current
+            // value — a 16yo's current sum will almost never beat a
+            // senior's, which silently demoted every youth to "depth".
+            // Projection-vs-current answers the real question: "will this
+            // kid eventually take a current senior's spot?"
             myBestRole = rolePeers.slice().sort((a, b) => computePlayerValueSkillSum(b) - computePlayerValueSkillSum(a))[0];
             const myBestSkill = computePlayerValueSkillSum(myBestRole);
-            const candidateQuality = ceilingResult.current;
+            const candidateQuality = qualityRef;
             // Whip the lowest-ranked same-role player if we're clearly better
             const myWorstSkill = rolePeers.reduce((min, p) => Math.min(min, computePlayerValueSkillSum(p)), Infinity);
             if (candidateQuality > myBestSkill * 1.05) {
                 fit = 'upgrade';
                 replace = myBestRole;
-                breakdown.push(`Clear upgrade — outranks your best current ${roleLabel} (${myBestRole.name})`);
+                breakdown.push(isYouth
+                    ? `Projects to outrank your best current ${roleLabel} (${myBestRole.name}) by ~22`
+                    : `Clear upgrade — outranks your best current ${roleLabel} (${myBestRole.name})`);
             } else if (candidateQuality > myWorstSkill) {
                 // Better than the weakest same-role player → replaces them
                 const worst = rolePeers.reduce((w, p) => computePlayerValueSkillSum(p) < computePlayerValueSkillSum(w) ? p : w, rolePeers[0]);
                 fit = 'upgrade';
                 replace = worst;
-                breakdown.push(`Improves your weakest ${roleLabel} (${worst.name}) — replace them`);
+                breakdown.push(isYouth
+                    ? `Projects to beat your weakest ${roleLabel} (${worst.name}) by ~22 — grows into the spot`
+                    : `Improves your weakest ${roleLabel} (${worst.name}) — replace them`);
             } else {
                 fit = 'depth';
-                breakdown.push(`Depth only — not clearly better than your current ${roleLabel}s`);
+                breakdown.push(isYouth
+                    ? `Depth only — even projected to ~22, not clearly better than your current ${roleLabel}s`
+                    : `Depth only — not clearly better than your current ${roleLabel}s`);
             }
         }
-
-        // 2) Core quality distilled to a 0-~40 contribution.
-        //    SENIOR: use current quality (first-team now). Youth: use the
-        //    projected ceiling at 20 (future first-team), since today's
-        //    numbers barely matter for a 16yo development buy.
-        const qualityRef = isYouth ? ceilingResult.ceiling : ceilingResult.current;
-        // computePlayerValueSkillSum spans roughly 0-40; compress to /40.
-        const qualityScore = Math.max(0, Math.min(40, qualityRef));
 
         // 3) Age/trajectory factor (0-10).
         //    Senior: reward youth-in-senior (long runway), penalise 30+
@@ -690,8 +756,16 @@
         // ceiling irrelevant. Youth: ceiling/fit/age heavy, wage light.
         let score, label;
         if (isYouth) {
-            const sc = qualityScore * 0.55;                    // ceiling at 20 dominates
-            const fitc = (fit === 'gap' ? 0 : fit === 'upgrade' ? 0 : fit === 'depth' ? 0 : -15) ; // youth fit handled below
+            // Youth quality is their projected SENIOR ceiling (age 22) —
+            // already senior-comparable units, so it's weighted at parity
+            // (1.0), not discounted. The old 0.55 discount on top of the
+            // projection structurally capped every youth below seniors:
+            // even an elite curve-meeting 16yo stalled at ~70 ("strong-
+            // signing") while a comparable senior buy hit 80+ — backwards
+            // for a player who projects to a BETTER senior than the 25yo.
+            // Parity lets a curve-meeting youth legitimately outrank an
+            // 80+ senior buy, which is the whole point of the projection.
+            const sc = qualityScore * 1.0;
             score = sc + ageScore * 1.2 + distScore * 0.6 + valueScore * 0.5 + costScore * 0.6 + talentScore * 0.8;
             // Add squad-fit term for youth on top (future need in the role)
             if (fit === 'gap') score += 10;
@@ -7758,13 +7832,25 @@ table.ftp-table {
                 // the sort below and renderTransferResults can read them back
                 // instead of recomputing. Stored as _ceilingResult/_buyRating.
                 function computeCandidateBuyData(p) {
-                    const ceilingResult = computePlayerCeiling(p, getAcademySpeedForPlayer(p, academyInfoForProjection), squadContextForProjection);
+                    const academySpeed = getAcademySpeedForPlayer(p, academyInfoForProjection);
+                    const ceilingResult = computePlayerCeiling(p, academySpeed, squadContextForProjection);
                     p._ceilingResult = ceilingResult;
+                    // Youth are scored on their SENIOR-COMPARABLE ceiling
+                    // (projected to age 22, a few years into their senior
+                    // career) — a deliberately different horizon from the
+                    // age-20 promo-boundary projection in ceilingResult,
+                    // which stays on the card as the "Projected at 20" line.
+                    // Precomputed HERE rather than inside computeBuyRating so
+                    // the expensive training simulation still runs once per
+                    // candidate (see the v8.49 design note).
+                    const seniorCeiling = (Math.round(p.age) < 21)
+                        ? computePlayerCeiling(p, academySpeed, squadContextForProjection, 22)
+                        : null;
                     p._buyRating = computeBuyRating(p, {
                         squadStats, seniorPlayers, youthPlayers,
-                        academySpeed: getAcademySpeedForPlayer(p, academyInfoForProjection),
+                        academySpeed,
                         squadContext: squadContextForProjection,
-                        ceilingResult
+                        ceilingResult, seniorCeiling
                     });
                     return p;
                 }
