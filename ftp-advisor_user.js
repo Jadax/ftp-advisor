@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         FTP Advisor
 // @namespace    http://tampermonkey.net/
-// @version      8.59
-// @description  Comprehensive tactical advisor for From the Pavilion cricket game (v8.59: EVERY player's Overall Rating projects to age 25, and projections assume the academy upgrades toward Deluxe over time; v8.58: youth Overall Rating horizon moved to age 25; v8.57: price-independent Overall Rating for every player + ledger-driven fair-price advice).
+// @version      8.60
+// @description  Comprehensive tactical advisor for From the Pavilion cricket game (v8.60: Dynasty Score / potential-future comparison now projected to age 25 for EVERY player on one scale, and the academy level is always re-scraped from the Academy page DOM so an upgrade propagates to all squad and market projections; v8.59: EVERY player's Overall Rating projects to age 25, and projections assume the academy upgrades toward Deluxe over time).
 // @author       Tushant Sharma
 // @license      MIT
 // @match        https://www.fromthepavilion.org/*
@@ -101,7 +101,7 @@
     // Staleness thresholds (hours)
     const STALE_SQUAD_HOURS = 24;
     const STALE_OPPONENT_HOURS = 24;
-    const STALE_ACADEMY_HOURS = 168; // 7 days (academy changes rarely)
+    const STALE_ACADEMY_HOURS = 24; // was 7 days — academy changes are rare, but the user explicitly wants an upgrade to propagate to every squad/market projection within a day even without re-visiting the Academy page (the Academy page itself always re-scrapes on visit regardless)
     const STALE_FINANCE_HOURS = 24;
     const STALE_GROUND_HOURS = 24;
     const STALE_TEAM_INFO_HOURS = 24;
@@ -547,15 +547,25 @@
      * outputs (same units, safely comparable) — current is "what you get
      * today", ceiling is "what they could realistically become".
      *
-     * Horizon depends on age, since there's no fixed development window
-     * once senior: youth (<20) project to the real age-20 promotion
-     * boundary via projectYouthToAge20()'s own math (weeksToAge20());
-     * 20-29 get a real 2 age-year outlook; 30+ get 1 age-year — training
-     * still works past 30 (the age multiplier curve already accounts for
-     * slower gains), it's ACTIVE SKILL DECLINE from 30+ that isn't
-     * modeled (no confirmed rate — see the age-30 gotcha), so a short
-     * forward projection there is still meaningful, just not a substitute
-     * for judging an aging player mainly on current output.
+     * Two horizons, set by the caller:
+     *   * DEFAULT (projectToAge omitted) — the NEAR-TERM plan horizon used
+     *     by the Training Potential panel and the transfer card's "Projected
+     *     at 20" promo line: youth (<20) project to the real age-20
+     *     promotion boundary via weeksToAge20(); 20-29 get a real 2 age-year
+     *     outlook; 30+ get 1 age-year — training still works past 30 (the
+     *     age multiplier curve already accounts for slower gains), it's
+     *     ACTIVE SKILL DECLINE from 30+ that isn't modeled (no confirmed
+     *     rate — see the age-30 gotcha), so a short forward projection there
+     *     is still meaningful, just not a substitute for judging an aging
+     *     player mainly on current output.
+     *   * projectToAge=25 — the SENIOR-COMPARABLE comparison horizon (v8.60,
+     *     per the user) powering the Dynasty Score line/chip and the Overall
+     *     Rating: EVERY age is projected to 25 (a 16yo and a 21yo are
+     *     measured on the same "what they'll be at 25" scale), so a youth's
+     *     potential future is directly comparable to the current 21/22/23-
+     *     year-old squad players. Players already ≥25 get 0 weeks
+     *     (weeksToAge → 0 → ceiling == current, label "no development
+     *     runway").
      *
      * Unlike projectYouthToAge20() (which discards the plan and only
      * returns final skills + a verdict label), this returns the full
@@ -582,7 +592,7 @@
             ? weeksToAge(age, projectToAge)
             : (isYouth ? weeksToAge20(age) : (age >= 30 ? 14 : 28));
         const label = projectToAge != null
-            ? `to age ${projectToAge}`
+            ? (weeks === 0 ? `no development runway — already past age ${projectToAge}` : `to age ${projectToAge}`)
             : (isYouth ? 'to age 20' : (age >= 30 ? '1 age-year outlook' : '2 age-year outlook'));
         const plan = simulateAdaptiveTrainingPlan(player, weeks, academySpeed, squadContext);
         const projectedSkills = Object.assign({}, player, plan.finalSkills);
@@ -669,9 +679,11 @@
         //    so the expensive training simulation isn't re-run here. The
         //    fallback self-computes for direct callers that don't pass it
         //    (e.g. test harnesses). This horizon is deliberately different
-        //    from ceilingResult (to-20 for youth / 2-age-year for seniors,
-        //    still shown on the card as the Dynasty line): the rating is
-        //    about the senior they'll BECOME, not the near-term outlook.
+        //    from the near-term plan ceilingResult (to-20 for youth /
+        //    2-age-year for seniors, which feeds the Training Potential
+        //    panel and the transfer card's "Projected at 20" promo line):
+        //    the rating (and the Dynasty Score) are about the senior they'll
+        //    BECOME, not the near-term outlook.
         let qualityRef;
         qualityRef = (opts.seniorCeiling && opts.seniorCeiling.ceiling != null)
             ? opts.seniorCeiling.ceiling
@@ -7827,30 +7839,33 @@ table.ftp-table {
                 const academyInfoForProjection = loadAcademyCache();
                 const squadContextForProjection = { size: seniorPlayers.length + youthPlayers.length, academyInfo: academyInfoForProjection, financeInfo: loadFinanceCache() };
 
-                // Precompute and cache each candidate's Dynasty (ceilingResult)
-                // and price-independent Overall Rating on the player object, so
-                // both the sort below and renderTransferResults can read them
-                // back instead of recomputing. Stored as _ceilingResult/
-                // _overallRating.
+                // Precompute and cache each candidate's near-term projection
+                // (_ceilingResult, feeds the "Projected at 20" promo line),
+                // the to-25 Dynasty comparison (_dynastyCeiling — the SAME
+                // senior-comparable horizon the rating uses, so the card's
+                // Dynasty chip reads on the same scale as a squad player's
+                // Player Advisor Dynasty line), and the price-independent
+                // Overall Rating, on the player object so both the sort below
+                // and renderTransferResults can read them back instead of
+                // recomputing.
                 function computeCandidateRating(p) {
                     const academySpeed = getAcademySpeedForPlayer(p, academyInfoForProjection);
                     const ceilingResult = computePlayerCeiling(p, academySpeed, squadContextForProjection);
                     p._ceilingResult = ceilingResult;
-                    // Everyone — youth AND senior — is scored on the SAME
-                    // to-25 projection (v8.59 standardization), a
-                    // deliberately different horizon from ceilingResult
-                    // (the Dynasty line: to-20 for youth / 2-age-year for
-                    // seniors), which stays on the card as the near-term
-                    // outlook. Candidates already ≥25 make this trivial
-                    // (weeksToAge → 0 → ceiling == current). Precomputed
-                    // HERE rather than inside computeOverallRating so the
-                    // expensive training simulation still runs once per
+                    // to-25 for EVERY age (v8.60, per the user: "I want till
+                    // 25 so I can compare his potential future to my current
+                    // 21/22/23 year olds") — the Dynasty chip AND the rating
+                    // share this one projection. Candidates already ≥25 make
+                    // it trivial (weeksToAge → 0 → ceiling == current).
+                    // Precomputed HERE rather than inside computeOverallRating
+                    // so the expensive training simulation still runs once per
                     // candidate (see the v8.49 design note).
-                    const seniorCeiling = computePlayerCeiling(p, academySpeed, squadContextForProjection, 25);
+                    const dynastyCeiling = computePlayerCeiling(p, academySpeed, squadContextForProjection, 25);
+                    p._dynastyCeiling = dynastyCeiling;
                     p._overallRating = computeOverallRating(p, {
                         academySpeed,
                         squadContext: squadContextForProjection,
-                        seniorCeiling
+                        seniorCeiling: dynastyCeiling
                     });
                     return p;
                 }
@@ -7883,6 +7898,17 @@ table.ftp-table {
                         ${verdictFilteredCount > 0 ? `<span class="vj-text-xs vj-text-muted" style="align-self:center;">${verdictFilteredCount} below threshold or not a squad upgrade</span>` : ''}
                         ${!detailsFetched ? `<button id="ftp-fetch-details-btn" class="vj-btn vj-btn-sm" style="font-size:11px;padding:2px 8px;cursor:pointer;">\u21BB Fetch Experience, Wages & Talents</button>` : `<span class="ftp-stat-badge neutral">\u2713 Details fetched</span>`}
                     </div>`;
+                    // Which academy level the Dynasty/rating projections below
+                    // were computed with — the level/efficiency are re-scraped
+                    // from the Academy page DOM on every visit (and refreshed
+                    // by the background fetch daily), so after an in-game
+                    // upgrade the next visit to the Academy page updates every
+                    // projection on this page and on all squad pages. This
+                    // line exists so the user can SEE that rather than trust it.
+                    const academyContext = (academyInfoForProjection && academyInfoForProjection.level && academyInfoForProjection.level !== 'unknown')
+                        ? `Projections use your <span class="vj-fw-700">${academyInfoForProjection.level}</span> academy (${academyInfoForProjection.seniorEfficiency}% senior / ${academyInfoForProjection.youthEfficiency}% youth efficiency)`
+                        : `Academy level not cached yet — visit the <span class="vj-fw-700">Academy</span> page so market projections use your real training speed`;
+                    html += `<div class="vj-text-xs vj-text-muted vj-mb-8">${academyContext}</div>`;
                     if (!detailsFetched) {
                         // Talents aren't shown on the transfer search table
                         // at all (game limitation \u2014 only on the player's
@@ -7910,6 +7936,7 @@ table.ftp-table {
                             // object — read them back rather than re-running
                             // the expensive training simulation here.
                             const ceilingResult = p._ceilingResult;
+                            const dynastyCeiling = p._dynastyCeiling;
                             const overallRating = p._overallRating;
 
                             // Build detail line — show experience/wage only if fetched
@@ -7918,7 +7945,7 @@ table.ftp-table {
                                 `Tech ${skillLabel(p.technique)}`,
                                 `Field ${skillLabel(p.fielding)}`,
                                 `End ${skillLabel(p.endurance)}`,
-                                `<span style="color:var(--vj-gold);">Dynasty ${ceilingResult.current.toFixed(1)}→${ceilingResult.ceiling.toFixed(1)}</span>`
+                                `<span style="color:var(--vj-gold);">Dynasty ${dynastyCeiling.current.toFixed(1)}→${dynastyCeiling.ceiling.toFixed(1)} (${dynastyCeiling.weeks === 0 ? 'fully developed' : 'to 25'})</span>`
                             ];
                             // Keeping isn't always primary but is always worth
                             // showing for any plausible keeper (Capable+) so
@@ -8874,26 +8901,34 @@ table.ftp-table {
         const keepVerdict = evalResult.verdict === 'poor' || evalResult.verdict === 'weak' ? 'RELEASE' : 'KEEP';
         const badgeClass = keepVerdict === 'KEEP' ? 'green' : 'red';
 
-        // Computed once, up front, and reused by both the Dynasty Score
-        // line below AND the Training Potential panel further down — one
-        // simulateAdaptiveTrainingPlan() call per render, not two. See
-        // computePlayerCeiling()'s own doc comment for why current/ceiling
-        // (not value/$K) is the number that's actually safe to compare
-        // between a squad player and a market candidate of a different age.
+        // Two projections per render, deliberately different horizons:
+        //   * ceilingResult — the NEAR-TERM plan horizon (to-20 for youth /
+        //     2-age-year for 20-29 / 1-age-year for 30+), reused by the
+        //     Training Potential panel below ("Development plan to age 20").
+        //   * dynastyCeiling — the to-25 SENIOR-COMPARABLE horizon (v8.60,
+        //     per the user: compare a youth's potential future against the
+        //     current 21/22/23yo squad players), which powers the Dynasty
+        //     Score line AND the price-independent Overall Rating below.
+        //     Both consume the same academy speed + ramp, so they can't
+        //     disagree on the data.
+        // See computePlayerCeiling()'s own doc comment for why current/
+        // ceiling (not value/$K) is the number that's actually safe to
+        // compare between a squad player and a market candidate of a
+        // different age.
         const academyInfo = loadAcademyCache();
         const academySpeed = getAcademySpeedForPlayer(player, academyInfo);
         const squadContext = { size: squadPlayers.length, academyInfo, financeInfo: loadFinanceCache() };
         const ceilingResult = computePlayerCeiling(player, academySpeed, squadContext);
+        const dynastyCeiling = computePlayerCeiling(player, academySpeed, squadContext, 25);
         // Overall Rating — the price-independent quality number, shown the
-        // SAME way on an owned player's page as on a transfer card. Uses the
-        // canonical to-25 senior-comparable projection for EVERYONE (v8.59
-        // standardization — seniors included; a 21yo is judged on the player
-        // he'll be at 25, not his current numbers), so the same player can't
-        // be rated higher/lower depending on which page you look at them on.
-        // The to-25 projection is precomputed here (not inside the rating)
-        // so the training simulation still runs once per render.
-        const overallSeniorCeiling = computePlayerCeiling(player, academySpeed, squadContext, 25);
-        const overallRating = computeOverallRating(player, { academySpeed, squadContext, seniorCeiling: overallSeniorCeiling });
+        // SAME way on an owned player's page as on a transfer card, scored
+        // on the to-25 projection for EVERYONE (seniors included; a 21yo is
+        // judged on the player he'll be at 25, not his current numbers), so
+        // the same player can't be rated higher/lower depending on which
+        // page you look at them on. The projection is precomputed here (not
+        // inside the rating) so the training simulation still runs once per
+        // render.
+        const overallRating = computeOverallRating(player, { academySpeed, squadContext, seniorCeiling: dynastyCeiling });
 
         let html = `<div class="vj-flex-between vj-mb-4">
                 <span class="vj-fw-700" style="font-size:14px;">${player.name} <span class="vj-text-xs vj-text-muted">(${Math.round(player.age)}yo)</span></span>
@@ -8906,7 +8941,7 @@ table.ftp-table {
                 const vpk = computePlayerValuePerK(player);
                 return vpk != null ? ` · ${vpk.toFixed(1)} skill/$K` : '';
             })()} ${spareRatingBadge(computeSpareRating(player))}</div>
-            <div class="vj-text-xs vj-mb-4"><span class="vj-fw-700">Dynasty Score:</span> ${ceilingResult.current.toFixed(1)} now → <span class="vj-fw-700" style="color:var(--vj-gold);">${ceilingResult.ceiling.toFixed(1)} ceiling</span> (${ceilingResult.label}, age/academy/training-aware — same units as the sell lists and transfer market, safe to compare across ages)</div>`;
+            <div class="vj-text-xs vj-mb-4"><span class="vj-fw-700">Dynasty Score:</span> ${dynastyCeiling.current.toFixed(1)} now → <span class="vj-fw-700" style="color:var(--vj-gold);">${dynastyCeiling.ceiling.toFixed(1)} ceiling</span> (${dynastyCeiling.label}, age/academy/training-aware — same units as the sell lists and transfer market, safe to compare across ages)</div>`;
 
         if (evalResult.strengths.length > 0) {
             html += `<div class="vj-text-xs vj-mt-4" style="color:var(--vj-green);">✓ ${evalResult.strengths.join(' · ')}</div>`;
