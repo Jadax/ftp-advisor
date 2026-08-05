@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         FTP Advisor
 // @namespace    http://tampermonkey.net/
-// @version      8.58
-// @description  Comprehensive tactical advisor for From the Pavilion cricket game (v8.58: youth Overall Rating horizon moved to age 25; v8.57: price-independent Overall Rating for every player + ledger-driven fair-price advice).
+// @version      8.59
+// @description  Comprehensive tactical advisor for From the Pavilion cricket game (v8.59: EVERY player's Overall Rating projects to age 25, and projections assume the academy upgrades toward Deluxe over time; v8.58: youth Overall Rating horizon moved to age 25; v8.57: price-independent Overall Rating for every player + ledger-driven fair-price advice).
 // @author       Tushant Sharma
 // @license      MIT
 // @match        https://www.fromthepavilion.org/*
@@ -566,14 +566,18 @@
     function computePlayerCeiling(player, academySpeed, squadContext, projectToAge) {
         const age = player.age || 0;
         const isYouth = age < 20;
-        // `projectToAge` (used by the Overall Rating for youth) overrides the
-        // default horizon so a youth is projected to a SENIOR-COMPARABLE
-        // age (e.g. 25 — near the typical FTP peak) rather than being
-        // truncated at 20. Without it, a 16yo is judged on only 4 years of
-        // development and their ceiling reads far lower than a senior's
-        // current value even though they'll keep training past 20 and become
-        // that senior. The "ceiling" is then comparable to a senior's
-        // current in the same units.
+        // `projectToAge` overrides the default horizon so ANY player (youth
+        // AND senior, v8.59 — the standardization) is projected to a
+        // SENIOR-COMPARABLE age (25 — near the typical FTP peak) rather
+        // than being truncated at 20 (youth) or judged on current value
+        // alone (senior). A 21yo senior and a 16yo youth are therefore
+        // measured on the same "what they'll be at 25" scale. Players
+        // already ≥25 fall out naturally (weeksToAge → 0 → ceiling equals
+        // current). Every projection also assumes the academy improves
+        // toward Deluxe over the horizon (academySpeedAtWeek/ACADEMY_RAMP_
+        // YEARS), so a better academy tomorrow correctly raises the
+        // projected ceiling. The "ceiling" is always comparable in the
+        // same computePlayerValueSkillSum() units.
         const weeks = projectToAge != null
             ? weeksToAge(age, projectToAge)
             : (isYouth ? weeksToAge20(age) : (age >= 30 ? 14 : 28));
@@ -612,28 +616,31 @@
     //     computeFairPrice() (see the price-ledger block above) = "what
     //     should I actually pay" for a market player.
     //
-    // Age logic is deliberately different for senior vs youth, because
-    // "current quality" means different things:
-    //   * SENIOR (21+): current quality (first-team now).
-    //   * YOUTH (<21): the projected ceiling at a SENIOR-COMPARABLE age (25 —
-    //     near the typical FTP peak, several years into their senior career),
-    //     because the whole point of a youth is the senior they'll become,
-    //     and they keep training well past 20. Truncating at the age-20
-    //     promotion boundary made every 16yo look worse than any senior
-    //     (apples-to-oranges); even projecting only to 22 understated a youth
-    //     who's still climbing through their mid-20s (v8.58: horizon moved 22
-    //     → 25 after a user report that a curve-meeting 16yo read too low —
-    //     his projected bowling keeps rising 8→9 between 22 and 25). This is
-    //     the ONE youth horizon used everywhere a youth's quality is compared
-    //     to a senior's — the transfer overall rating, the Player Advisor,
-    //     and the Squad Plan's youth sell ranking all project to 25.
+    // One horizon for EVERY age (v8.59 standardization, per the user):
+    // quality is the projected skill-sum at age 25 — a 21yo senior is
+    // judged on the player he'll be at 25, exactly like a 16yo, so owned
+    // players and market candidates of every age sit on the same scale.
+    // Players already ≥25 fall out naturally (weeksToAge → 0 → ceiling ==
+    // current) — the "first-team now" reading for fully-developed players
+    // is preserved. The projection also assumes the academy keeps
+    // upgrading toward Deluxe over the horizon (ACADEMY_RAMP_YEARS), so
+    // a better academy tomorrow correctly raises the ceiling. Prior to
+    // this: seniors were judged on current quality only, youth on their
+    // to-25 ceiling — two different scales that made the same player read
+    // differently by age. The youth history: truncating at age 20 made
+    // every 16yo look worse than any senior; projecting to 22 still
+    // understated a youth still climbing through the mid-20s (v8.58: 22 →
+    // 25 after a curve-meeting 16yo read too low — his bowling keeps
+    // rising 8→9 between 22 and 25). This is the ONE horizon used
+    // everywhere a player's quality is compared — the transfer overall
+    // rating, the Player Advisor, and the Squad Plan's sell rankings.
     //
     // Score 0-100. Returns { score, label, parts, breakdown[] }. Every
     // component is a named, weighted term so the number is explainable rather
     // than a black box.
     // Requires opts: { academySpeed, squadContext, seniorCeiling } — the
-    // senior-comparable (to-25) projection is precomputed by the caller so the
-    // expensive training simulation runs once per candidate; computeOverallRating
+    // to-25 projection is precomputed by the caller so the expensive
+    // training simulation runs once per candidate; computeOverallRating
     // falls back to self-computing it only for direct callers that don't pass
     // it (e.g. test harnesses).
     function computeOverallRating(player, opts) {
@@ -645,34 +652,30 @@
         const roleLabel = role === 'keeping' ? 'wicketkeeper' : role === 'bowling' ? 'bowler' : 'batter';
 
         // 1) Core quality distilled to a 0-55 contribution — the dominant
-        //    term. SENIOR: current skill-sum (first-team now). Youth: the
-        //    projected ceiling at a SENIOR-COMPARABLE age (25 — near the
-        //    typical FTP peak), because the whole point of a youth is the
-        //    senior they'll become, and they keep training past 20.
-        //    Truncating at the age-20 promotion boundary (the old
-        //    "ceilingResult.ceiling") made every 16yo look far worse than any
-        //    senior. Projecting to ~25 makes the youth ceiling comparable in
-        //    the same units as a senior's current (and captures the continued
-        //    climb past 22 that made a curve-meeting 16yo read too low).
-        //    Cap 55 keeps headroom on the 0-100 scale while matching the real
-        //    observed range of skill-sums (a ~50+ senior is already
-        //    exceptional — a Spectacular primary plus strong supporting
-        //    skills).
+        //    term. ONE horizon for EVERYONE (v8.59 standardization): the
+        //    projected skill-sum at age 25 — a 21yo senior is judged on the
+        //    player he'll be at 25, exactly like a 16yo, so owned players
+        //    and market candidates of every age sit on the same scale.
+        //    Players already ≥25 fall out naturally (weeksToAge → 0 →
+        //    ceiling == current), preserving the "first-team now" reading
+        //    for fully-developed players. The to-25 projection assumes the
+        //    academy keeps improving toward Deluxe (academySpeedAtWeek), so
+        //    a better academy tomorrow correctly raises every projected
+        //    ceiling. Cap 55 keeps headroom on the 0-100 scale while
+        //    matching the real observed range of skill-sums (a ~50+ senior
+        //    is already exceptional — a Spectacular primary plus strong
+        //    supporting skills).
+        //    Prefer the caller-precomputed to-25 projection (seniorCeiling)
+        //    so the expensive training simulation isn't re-run here. The
+        //    fallback self-computes for direct callers that don't pass it
+        //    (e.g. test harnesses). This horizon is deliberately different
+        //    from ceilingResult (to-20 for youth / 2-age-year for seniors,
+        //    still shown on the card as the Dynasty line): the rating is
+        //    about the senior they'll BECOME, not the near-term outlook.
         let qualityRef;
-        if (isYouth) {
-            // Prefer the caller-precomputed senior-comparable projection
-            // (age 25) so the expensive simulation isn't re-run here. The
-            // fallback self-computes for direct callers that don't pass it
-            // (e.g. test harnesses). This horizon is deliberately different
-            // from ceilingResult (to-20, still shown on the card as the
-            // promo boundary): the rating is about what they'll contribute
-            // as a SENIOR.
-            qualityRef = (opts.seniorCeiling && opts.seniorCeiling.ceiling != null)
-                ? opts.seniorCeiling.ceiling
-                : computePlayerCeiling(player, opts.academySpeed, opts.squadContext, 25).ceiling;
-        } else {
-            qualityRef = computePlayerValueSkillSum(player);
-        }
+        qualityRef = (opts.seniorCeiling && opts.seniorCeiling.ceiling != null)
+            ? opts.seniorCeiling.ceiling
+            : computePlayerCeiling(player, opts.academySpeed, opts.squadContext, 25).ceiling;
         const qualityScore = Math.max(0, Math.min(55, qualityRef));
 
         // 2) Age/trajectory factor (0-10).
@@ -727,10 +730,10 @@
         // those are market decisions (computeFairPrice / comparePlayerToSquadPeers),
         // not player-quality, and leaving them out is what lets this one
         // number be shown identically for an owned player and a market
-        // candidate. Youth quality is their projected SENIOR ceiling (age
-        // 25) — already senior-comparable units, so it's weighted at parity
-        // (1.0), not discounted. The old 0.55 discount on top of the
-        // projection (and the v8.55 cost term) structurally capped every
+        // candidate. Quality is the projected-to-25 skill-sum for EVERY age
+        // (v8.59 standardization) — already senior-comparable units, so it's
+        // weighted at parity (1.0), not discounted. The old 0.55 discount on
+        // top of the projection (and the v8.55 cost term) structurally capped every
         // youth below seniors and made scores swing on asking price; a
         // curve-meeting youth can now legitimately outrank an older senior,
         // which is the whole point of the projection.
@@ -1772,6 +1775,18 @@
     // minimal = 1.0x baseline, deluxe = 1.3x. Index 0 = minimal,
     // index 10 = deluxe, matching ACADEMY_LEVELS' `num` field.
     const ACADEMY_SPEED = [1.00, 1.03, 1.06, 1.09, 1.12, 1.15, 1.18, 1.21, 1.24, 1.27, 1.30];
+
+    // Multi-week training projections assume the academy improves over
+    // the horizon (the user WILL keep upgrading it — the live-scraped
+    // "Training Efficiency %" rises as the level does, which is why a
+    // better academy tomorrow must make a player's projected rating
+    // higher). The sim ramps each week's academy speed linearly from
+    // today's scraped value toward Deluxe (ACADEMY_SPEED[10] = max)
+    // over this many REAL years from the plan's start. Set to 0 to
+    // freeze the academy at its current level. The game exposes no
+    // upgrade schedule or pace, so 5 years is a tunable assumption,
+    // not a sourced number.
+    const ACADEMY_RAMP_YEARS = 5;
 
     /**
      * Real, age-appropriate training speed for a specific player.
@@ -6202,6 +6217,24 @@ table.ftp-table {
      * (weeklyPrograms[1] = week 1's program) for a genuine week-by-week
      * breakdown, e.g. the Player Advisor's training table.
      */
+    // Academy speed at a given simulated week of a multi-week projection.
+    // The current scraped efficiency is TODAY's value; a long plan (e.g.
+    // a 16yo projected to 25) spans several real years in which the
+    // academy gets upgraded, so the player trains faster in later weeks
+    // than earlier ones — that's what makes a better academy tomorrow
+    // raise a player's projected rating. Linear ramp from the current
+    // speed toward the max academy speed (Deluxe, level 10) over
+    // ACADEMY_RAMP_YEARS real years (14-week years — the 14-not-52 rule)
+    // from the plan's start. weeksElapsed = 0 ⇒ exactly today's speed:
+    // the plan never invents a retroactive upgrade. ACADEMY_RAMP_YEARS
+    // = 0 (or an unknown speed) disables the ramp entirely.
+    function academySpeedAtWeek(academySpeed, weeksElapsed) {
+        if (!(ACADEMY_RAMP_YEARS > 0) || !isFinite(academySpeed) || academySpeed <= 0) return academySpeed;
+        const maxSpeed = ACADEMY_SPEED[ACADEMY_SPEED.length - 1];
+        const t = Math.min(1, weeksElapsed / (ACADEMY_RAMP_YEARS * 14));
+        return academySpeed + (maxSpeed - academySpeed) * t;
+    }
+
     function simulateAdaptiveTrainingPlan(player, weeks, academySpeed, squadContext) {
         const state = {};
         ADAPTIVE_PLAN_SKILLS.forEach(skill => {
@@ -6240,7 +6273,9 @@ table.ftp-table {
 
             if (program === 'rest') continue; // no skill gain this week
             const gainOpts = squadMult < 1 ? { squadSizePenalty: squadMult } : undefined;
-            const gains = estimateWeeklyTrainingGain(program, simPlayer, academySpeed, gainOpts);
+            // Academy improves over the horizon — later weeks train at a
+            // higher speed than earlier ones (see academySpeedAtWeek).
+            const gains = estimateWeeklyTrainingGain(program, simPlayer, academySpeedAtWeek(academySpeed, week - 1), gainOpts);
             if (!gains) continue;
             Object.keys(gains).forEach(skill => {
                 if (!state[skill] || state[skill].level >= 15) return;
@@ -7801,17 +7836,17 @@ table.ftp-table {
                     const academySpeed = getAcademySpeedForPlayer(p, academyInfoForProjection);
                     const ceilingResult = computePlayerCeiling(p, academySpeed, squadContextForProjection);
                     p._ceilingResult = ceilingResult;
-                    // Youth are scored on their SENIOR-COMPARABLE ceiling
-                    // (projected to age 25, near the typical FTP peak) — a
-                    // deliberately different horizon from the age-20
-                    // promo-boundary projection in ceilingResult, which
-                    // stays on the card as the "Projected at 20" line.
-                    // Precomputed HERE rather than inside computeOverallRating
-                    // so the expensive training simulation still runs once per
+                    // Everyone — youth AND senior — is scored on the SAME
+                    // to-25 projection (v8.59 standardization), a
+                    // deliberately different horizon from ceilingResult
+                    // (the Dynasty line: to-20 for youth / 2-age-year for
+                    // seniors), which stays on the card as the near-term
+                    // outlook. Candidates already ≥25 make this trivial
+                    // (weeksToAge → 0 → ceiling == current). Precomputed
+                    // HERE rather than inside computeOverallRating so the
+                    // expensive training simulation still runs once per
                     // candidate (see the v8.49 design note).
-                    const seniorCeiling = (Math.round(p.age) < 21)
-                        ? computePlayerCeiling(p, academySpeed, squadContextForProjection, 25)
-                        : null;
+                    const seniorCeiling = computePlayerCeiling(p, academySpeed, squadContextForProjection, 25);
                     p._overallRating = computeOverallRating(p, {
                         academySpeed,
                         squadContext: squadContextForProjection,
@@ -8851,15 +8886,13 @@ table.ftp-table {
         const ceilingResult = computePlayerCeiling(player, academySpeed, squadContext);
         // Overall Rating — the price-independent quality number, shown the
         // SAME way on an owned player's page as on a transfer card. Uses the
-        // canonical youth horizon everywhere else uses it (the to-25 senior-
-        // comparable projection for youth; current quality for seniors), so a
-        // youth can't be rated higher/lower depending on which page you look
-        // at them on. The to-25 projection is precomputed here (not inside
-        // the rating) so the training simulation still runs once per render —
-        // an extra one-time call for youth only.
-        const overallSeniorCeiling = isYouth
-            ? computePlayerCeiling(player, academySpeed, squadContext, 25)
-            : null;
+        // canonical to-25 senior-comparable projection for EVERYONE (v8.59
+        // standardization — seniors included; a 21yo is judged on the player
+        // he'll be at 25, not his current numbers), so the same player can't
+        // be rated higher/lower depending on which page you look at them on.
+        // The to-25 projection is precomputed here (not inside the rating)
+        // so the training simulation still runs once per render.
+        const overallSeniorCeiling = computePlayerCeiling(player, academySpeed, squadContext, 25);
         const overallRating = computeOverallRating(player, { academySpeed, squadContext, seniorCeiling: overallSeniorCeiling });
 
         let html = `<div class="vj-flex-between vj-mb-4">
