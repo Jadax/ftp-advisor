@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         FTP Advisor
 // @namespace    http://tampermonkey.net/
-// @version      8.63
-// @description  Comprehensive tactical advisor for From the Pavilion cricket game (v8.63: the Dynasty Score is now an audited, tamper-proof differentiator - experience is folded into the weighted value sum per your weight list (primary/technique/fielding/endurance/experience) and projected honestly toward the scout-benchmark per-age expectation scaled by remaining runway (a 21.5yo exp 4 projects to ~6, never reduces, weeks=0 keeps ceiling==current), while power stays out since it's a batting-only stroke skill that would bias bowler/keeper scores - verified with a new 31-assertion dynastyaudit harness (academy/runway/talent/wage-price sensitivity all confirmed) plus a full regression; v8.62: age is now WEEK-aware everywhere — per-year tables like the scout base / youth dev curve read the displayed year (16y13w = 16, no more half-year 16y5w-vs-16y6w flip), training multipliers and rating/rank age scores interpolate continuously across the year, and 20y13w is unambiguously still youth; weeksToAge's float guard stops a boundary player gaining a phantom 51st week; added a FILE MAP at the top of the script so any concern maps to a grep-able function name; v8.61: experienced-player feedback — senior training schedule now goes Fielding to Exceptional (batsmen / medium or finger spinners) or Spectacular (pace bowlers) then Strength/Endurance to Exceptional from ~25, finishers placed at 5-7 with the keeper at 6, and the drinks-break rest plan was rebuilt to RE-ALLOCATE over numbers side-aware since the old free-slot patch silently collided with the other end's overs in a fully-packed innings; v8.60: Dynasty Score / potential-future comparison now projected to age 25 for EVERY player on one scale, and the academy level is always re-scraped from the Academy page DOM so an upgrade propagates to all squad and market projections; v8.59: EVERY player's Overall Rating projects to age 25, and projections assume the academy upgrades toward Deluxe over time).
+// @version      8.64
+// @description  Comprehensive tactical advisor for From the Pavilion cricket game (v8.64: the age WEEK is now 1-BASED within the age-year (per the user) - "21y14w" is the 14th/final week of being 21, NOT 22, so parseGameAge yields 21.93 and floor(age)==the year the game displays for EVERY display; this fixes every boundary-week player being treated as a year older a full week early - a 20.14 youth was pushed onto the senior scout base / senior training / senior sell analysis, a 29.14 player got the 30+ aging-training path, and 19.14 read as already-20; the parser now matches the training sim's own (week-1)/14 advancement (they were two different conventions for the same week); formatAgeDisplay round-trips the new parse (21.93 -> "21y14w", first week of any age is "Xy1w" not "Xy0w"); two inline duplicate age parsers routed through parseGameAge so nothing can drift; v8.63: the Dynasty Score is now an audited, tamper-proof differentiator - experience is folded into the weighted value sum per your weight list (primary/technique/fielding/endurance/experience) and projected honestly toward the scout-benchmark per-age expectation scaled by remaining runway (a 21.5yo exp 4 projects to ~6, never reduces, weeks=0 keeps ceiling==current), while power stays out since it's a batting-only stroke skill that would bias bowler/keeper scores - verified with a new 31-assertion dynastyaudit harness (academy/runway/talent/wage-price sensitivity all confirmed) plus a full regression; v8.62: age is now WEEK-aware everywhere — per-year tables like the scout base / youth dev curve read the displayed year (16y13w = 16, no more half-year 16y5w-vs-16y6w flip), training multipliers and rating/rank age scores interpolate continuously across the year, and 20y13w is unambiguously still youth; weeksToAge's float guard stops a boundary player gaining a phantom extra week; added a FILE MAP at the top of the script so any concern maps to a grep-able function name; v8.61: experienced-player feedback — senior training schedule now goes Fielding to Exceptional (batsmen / medium or finger spinners) or Spectacular (pace bowlers) then Strength/Endurance to Exceptional from ~25, finishers placed at 5-7 with the keeper at 6, and the drinks-break rest plan was rebuilt to RE-ALLOCATE over numbers side-aware since the old free-slot patch silently collided with the other end's overs in a fully-packed innings; v8.60: Dynasty Score / potential-future comparison now projected to age 25 for EVERY player on one scale, and the academy level is always re-scraped from the Academy page DOM so an upgrade propagates to all squad and market projections; v8.59: EVERY player's Overall Rating projects to age 25, and projections assume the academy upgrades toward Deluxe over time).
 // @author       Tushant Sharma
 // @license      MIT
 // @match        https://www.fromthepavilion.org/*
@@ -201,57 +201,66 @@
 
     // ============================================================
     // AGE PARSING — "YY.WW" table cells and "YYyWWw" panel text
-    // The game shows age as years + a week count (0-14, 14 weeks/age-year
-    // per the official manual — see simulateAdaptiveTrainingPlan's own
-    // comment for the source), NOT a base-10 decimal fraction. Naively
-    // parseFloat()'ing a table cell like "20.14" reads it as 20.14 years
-    // (14% into the year) when it's actually 14/14 = 21.0 — a player who
-    // has, for every practical scouting/training purpose, already turned
-    // 21. This under/over-shoots age-bracket filters (AGE_SCOUT_THRESHOLDS,
-    // youth 16-20 curve, senior/aging training paths) right at the
-    // boundary where they matter most. parseGameAge() is the single
-    // correct parser for both formats; every age scrape in the file should
-    // go through it instead of parseFloat/parseInt on raw cell text.
+    // The game shows age as years + a week count (14 weeks/age-year per
+    // the official manual — see simulateAdaptiveTrainingPlan's own comment
+    // for the source), NOT a base-10 decimal fraction. CRITICAL: the week
+    // is 1-based WITHIN the age-year (v8.64, per the user) — "21y14w" is
+    // the 14th (final) week of being 21, and the player only becomes 22
+    // when the display rolls past it to "22y1w". So the week contributes
+    // (week-1)/14, never 14/14 = 1.0: a "20.14" player reads 20.93 (still
+    // 20, still a youth — they have NOT turned 21), and floor(parsed) ==
+    // the displayed year for EVERY display. The old weeks/14 formula made
+    // every boundary-week display read as the NEXT year (20.14 -> 21.0),
+    // which pushed youth onto the senior scout base / senior training /
+    // senior sell analysis a full week early and DISAGREED with the
+    // training sim (simulateTrainingPlan has always advanced age by
+    // (week-1)/14 per simulated week, so the parser and the sim were
+    // two different conventions for the same week). parseGameAge() is the
+    // single correct parser for both formats; every age scrape in the file
+    // should go through it instead of parseFloat/parseInt on raw cell text.
     function parseGameAge(text) {
         if (!text) return 0;
         let m = text.match(/(\d{1,2})\s*y(?:ears?)?\s*(\d{1,2})\s*w(?:eeks?)?/i);
-        if (m) return parseInt(m[1], 10) + parseInt(m[2], 10) / 14;
+        if (m) return parseInt(m[1], 10) + (Math.max(1, Math.min(14, parseInt(m[2], 10))) - 1) / 14;
         m = text.match(/^\s*(\d{1,2})\.(\d{1,2})\s*$/);
-        if (m) return parseInt(m[1], 10) + parseInt(m[2], 10) / 14;
+        if (m) return parseInt(m[1], 10) + (Math.max(1, Math.min(14, parseInt(m[2], 10))) - 1) / 14;
         m = text.match(/(\d{1,2})/);
         return m ? parseInt(m[1], 10) : 0;
     }
 
     // Inverse of parseGameAge's decimal, for display — raw decimal ages
-    // (e.g. 16.428571428571427) were leaking straight into the UI as
-    // "16.428571428571427yo" wherever a template literal interpolated
+    // (e.g. 16.357142857142858) were leaking straight into the UI as
+    // "16.357142857142858yo" wherever a template literal interpolated
     // player.age directly. Reconstructs the game's own "Yy Ww" format
-    // instead of an ugly float.
+    // instead of an ugly float. The +1 week reverses the (week-1)/14 in
+    // parseGameAge so a boundary player round-trips exactly: parseGameAge
+    // ("21y14w") = 21.93 -> "21y14w" (not "21y13w"), and the first week of
+    // any age is "Xy1w" (there is no "Xy0w" in the game's display).
     function formatAgeDisplay(age) {
         if (age == null || isNaN(age)) return '';
         const years = Math.floor(age);
-        const weeks = Math.round((age - years) * 14);
+        const weeks = Math.min(14, Math.round((age - years) * 14) + 1);
         return weeks > 0 ? `${years}y${weeks}w` : `${years}`;
     }
 
     // ============================================================
     // AGE MODEL — how "years + weeks" is read everywhere.
     // The game tracks age as years + a week out of 14 (parseGameAge
-    // above). There are two genuinely different ways to read that one
-    // float, and picking the wrong one is exactly how the half-year
-    // "16y5w = 16, 16y6w = 17" cliffs and the 20y13w boundary bugs
-    // creeped in. The decision now lives here ONCE (v8.62) so callers
-    // stop re-deriving Math.round/Math.floor and drifting apart:
+    // above — 1-based since v8.64, so floor(age) ALWAYS equals the year
+    // the game displays; there is no "20.14 reads 21.0" boundary artifact
+    // anymore). The decision now lives here ONCE (v8.62) so callers stop
+    // re-deriving Math.round/Math.floor and drifting apart:
     //   * ageYears(age)      — the year the player is CURRENTLY in
     //     (floor). For per-year TABLE lookups and "age N" labels:
-    //     AGE_SCOUT_THRESHOLDS, YOUTH_DEV_CURVE, SENIOR_MINS_*. A
-    //     player does not become 17 at 16y7w — they are still 16 until
-    //     17.0, exactly as the game displays them.
-    //   * ageFraction(age)   — 0..<1 progress through that year
-    //     (weeks/14), for CONTINUOUS values that should ramp smoothly
-    //     (training speed, rating/rank age scores) rather than step.
+    //     AGE_SCOUT_THRESHOLDS, YOUTH_DEV_CURVE, SENIOR_MINS_*. A player
+    //     does not become 17 at 16y14w — they are still 16 until the
+    //     display rolls to 17y1w, exactly as the game shows them.
+    //   * ageFraction(age)   — 0..13/14 progress through that year
+    //     (completed weeks/14 = age-floor(age)), for CONTINUOUS values
+    //     that should ramp smoothly (training speed, rating/rank age
+    //     scores) rather than step. Week 1 = 0, the final week = 13/14.
     //   * isYouthAge(age)    — the 20/21 senior-squad boundary, read
-    //     continuously (a 20y13w player has not turned 21).
+    //     continuously (a 20y14w player is 20.93 and has not turned 21).
     // ============================================================
     function ageYears(age) { return Math.floor(age || 0); }
     function ageFraction(age) { const a = age || 0; return a - Math.floor(a); }
@@ -625,10 +634,11 @@
     // promotion boundary, which understated what they'll contribute once
     // they become seniors.
     function weeksToAge(age, targetAge) {
-        // -1e-9 guards float drift at exact week boundaries: (20 - 16.42857)*14
-        // can evaluate to 50.00000000000002, which Math.ceil would wrongly
-        // round up to a 51st week for a player exactly 6 weeks into their
-        // 16th year (they need exactly 50 weeks to turn 20).
+        // -1e-9 guards float drift at exact week boundaries: (20 - 16.35714)*14
+        // can evaluate to 50.99999999999998, which Math.ceil would wrongly
+        // round DOWN to 50 for a player 5 weeks into their 16th year (display
+        // "16y6w") — with the 1-based parse they need exactly 51 weeks to turn
+        // 20 (the current week counts; 16y14w has 43 = (20-16.92857)*14).
         return Math.max(0, Math.ceil((targetAge - (age || 16)) * 14 - 1e-9));
     }
 
@@ -1180,7 +1190,8 @@
     // half-year for a decay that actually happens continuously. Training
     // speed is a continuous quantity, so it now lerps between the current
     // year's row and the next year's using the player's actual weeks
-    // (e.g. 16y6w primary = 1.20 - (6/14)*(1.20-1.15) ≈ 1.178). Age 33+
+    // (e.g. 16y6w primary = 1.20 - (5/14)*(1.20-1.15) ≈ 1.182 — weeks are
+    // 1-based since v8.64, so 16y6w is 5 completed weeks). Age 33+
     // is not modelled in the source sheet and is clamped to the age-32
     // rate (the interpolation's top-year clamp does this automatically).
     function getAgeTrainingMultiplier(age) {
@@ -1590,7 +1601,8 @@
         let age = 99;
         for (const cell of cells) {
             const text = cell.textContent.trim();
-            // "YY.WW" — weeks (0-14 of 14/age-year), not a decimal fraction.
+            // "YY.WW" — weeks (1-14 of 14/age-year, 1-based since v8.64: the
+            // 14th week is the last week of that age, not the next year).
             // parseGameAge() converts correctly; the bare-integer regex
             // still gates which cell is actually the age column.
             const m = text.match(/^(\d{1,2})(?:\.\d{1,2})?$/);
@@ -1765,8 +1777,10 @@
         const statsText = ps[1] ? ps[1].textContent : '';
 
         const ageMatch = infoText.match(/(\d+)\s*years?\s*(\d+)\s*weeks?\s*old/i);
-        // 14 weeks/age-year — see simulateTrainingPlan's own comment for the source.
-        const age = ageMatch ? parseInt(ageMatch[1], 10) + parseInt(ageMatch[2], 10) / 14 : 0;
+        // Routed through the shared parser so it stays on the same 1-based
+        // (week-1)/14 convention as every other age scrape (v8.64) — an
+        // inline duplicate here previously drifted to weeks/14.
+        const age = ageMatch ? parseGameAge(ageMatch[0]) : 0;
         const ratingMatch = infoText.match(/([\d,]+)\s*rating/i);
         const rating = ratingMatch ? parseInt(ratingMatch[1].replace(/,/g, ''), 10) : 0;
         const wageMatch = infoText.match(/\$([\d,]+)\s*wage/i);
@@ -4962,11 +4976,13 @@
         // player still sitting in the youth squad has by definition NOT
         // turned 21, so the game's own squad classification is proof of
         // eligibility — and it's more trustworthy than our derived
-        // decimal age at the exact year boundary. A player displayed as
-        // "20.14" parses to 20 + 14/14 = exactly 21.0, so the old
-        // `age < maxAge + 1` test dropped them as 21 even though the game
-        // still lists them as a 20-year-old youth player. That silently
-        // removed a legal player from the recommended XI.
+        // decimal age at the exact year boundary. (Originally a player
+        // displayed as "20.14" parsed to 20 + 14/14 = exactly 21.0, so
+        // the old `age < maxAge + 1` test dropped them as 21 even though
+        // the game still listed them as a 20-year-old youth player.
+        // Since v8.64 the parser is 1-based — 20.14 reads 20.93, so the
+        // pure age test agrees with the game and this flag is now a
+        // belt-and-suspenders guard rather than the only correct path.)
         // Squad membership is only used to INCLUDE, never to exclude:
         // a 20yo already promoted/held in the senior squad is still
         // eligible on age, so those fall through to the age test.
@@ -9063,12 +9079,15 @@ table.ftp-table {
         const paddedPs = doc.querySelectorAll('.panel .padded p');
         if (paddedPs.length > 0) {
             const infoText = paddedPs[0].textContent;
-            // /14, not /52 — 14 weeks per age-year (see parseGameAge()).
-            // This was the actual bug behind a 20y14w player (=21.0, i.e.
-            // effectively already 21) reading as ~20.27 and getting
-            // evaluated against 20yo thresholds instead of 21+ ones.
+            // Routed through the shared parser (v8.64) — the same 1-based
+            // (week-1)/14 convention as every other age scrape. NOTE: this
+            // inline duplicate used to claim a "20y14w" player (=21.0, i.e.
+            // already 21) must be judged against 21+ thresholds — that was
+            // wrong per the user: 20y14w is the FINAL week of being 20
+            // (20.93), still a youth who has not turned 21, so the 20yo
+            // thresholds are correct.
             const ageMatch = infoText.match(/(\d{1,2})y(\d{1,2})w/);
-            if (ageMatch) age = parseInt(ageMatch[1], 10) + parseInt(ageMatch[2], 10) / 14;
+            if (ageMatch) age = parseGameAge(ageMatch[0]);
             const ratingMatch = infoText.match(/([\d,]+)\s*rating/i);
             if (ratingMatch) rating = parseInt(ratingMatch[1].replace(/,/g, ''), 10) || 0;
             const wageMatch = infoText.match(/\$([\d,]+)\s*wage/i);
