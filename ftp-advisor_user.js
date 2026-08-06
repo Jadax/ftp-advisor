@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         FTP Advisor
 // @namespace    http://tampermonkey.net/
-// @version      8.65
-// @description  Comprehensive tactical advisor for From the Pavilion cricket game (v8.65: the Overall Rating is now age-independent, per the user's report that a 57-ceiling 20yo (Prescott) rated BELOW a 51-ceiling 21yo (Awad) purely from the 20/21 age boundary - the old rating used TWO age curves (youth declining 16->20, senior peaking 21-24) stitched at the seam, so the identical player scored age 4 at 20y14w and jumped to 10 at 21y1w, a one-week 6-point cliff, and the youth weights discounted dist/value/talent terms (0.6/0.4/0.8 vs senior 0.8/0.8/1.0), stacking into systematic youth under-rating. Now ONE continuous lifecycle curve (flat 10 across 16-24 prime/runway, then the same smooth 25-30 decline) and ONE weight set for every age (1.0/1.2/0.8/0.8/1.0) - the age cliff is gone (20y14w and 21y1w now score identically) and the 57-ceiling youth now correctly outranks the 51-ceiling senior (80.7 vs 76.5). Verified: inversion repro + boundary-week equality + full regression green (182 assertions incl. new 20/21-equality case); v8.64: the age WEEK is now 1-BASED within the age-year (per the user) - "21y14w" is the 14th/final week of being 21, NOT 22, so parseGameAge yields 21.93 and floor(age)==the year the game displays for EVERY display; this fixes every boundary-week player being treated as a year older a full week early - a 20.14 youth was pushed onto the senior scout base / senior training / senior sell analysis, a 29.14 player got the 30+ aging-training path, and 19.14 read as already-20; the parser now matches the training sim's own (week-1)/14 advancement (they were two different conventions for the same week); formatAgeDisplay round-trips the new parse (21.93 -> "21y14w", first week of any age is "Xy1w" not "Xy0w"); two inline duplicate age parsers routed through parseGameAge so nothing can drift; v8.63: the Dynasty Score is now an audited, tamper-proof differentiator - experience is folded into the weighted value sum per your weight list (primary/technique/fielding/endurance/experience) and projected honestly toward the scout-benchmark per-age expectation scaled by remaining runway (a 21.5yo exp 4 projects to ~6, never reduces, weeks=0 keeps ceiling==current), while power stays out since it's a batting-only stroke skill that would bias bowler/keeper scores - verified with a new 31-assertion dynastyaudit harness (academy/runway/talent/wage-price sensitivity all confirmed) plus a full regression; v8.62: age is now WEEK-aware everywhere — per-year tables like the scout base / youth dev curve read the displayed year (16y13w = 16, no more half-year 16y5w-vs-16y6w flip), training multipliers and rating/rank age scores interpolate continuously across the year, and 20y13w is unambiguously still youth; weeksToAge's float guard stops a boundary player gaining a phantom extra week; added a FILE MAP at the top of the script so any concern maps to a grep-able function name; v8.61: experienced-player feedback — senior training schedule now goes Fielding to Exceptional (batsmen / medium or finger spinners) or Spectacular (pace bowlers) then Strength/Endurance to Exceptional from ~25, finishers placed at 5-7 with the keeper at 6, and the drinks-break rest plan was rebuilt to RE-ALLOCATE over numbers side-aware since the old free-slot patch silently collided with the other end's overs in a fully-packed innings; v8.60: Dynasty Score / potential-future comparison now projected to age 25 for EVERY player on one scale, and the academy level is always re-scraped from the Academy page DOM so an upgrade propagates to all squad and market projections; v8.59: EVERY player's Overall Rating projects to age 25, and projections assume the academy upgrades toward Deluxe over time).
+// @version      8.66
+// @description  Comprehensive tactical advisor for From the Pavilion cricket game (v8.66: two fixes from the reported Nabeel card (20y12w, OVERALL 81.7/100 but labeled "ADEQUATE", and no "would replace anyone" line). (1) That verdict word was the legacy evaluateTransferTarget curve verdict sitting next to the v8.57 Overall Rating badge -- two different scales on one card, so an 81.7-ELITE youth read "ADEQUATE". The card's verdict word now derives from the Overall Rating itself (one judgment word, cannot contradict the star badge); the legacy verdict still drives the isWorthShowing show/hide filter and the sort. (2) The "Outranks N / would replace / fills a gap" peer comparison only ever ran for age>=21 (the v8.28 'youth are development bets' gate was meant to keep the FILTER from hiding them, but it also silently removed the compare line from every under-21 card). It's now computed and shown for EVERY age, comparing against senior-squad same-role peers (the players who'd actually compete for an XI spot), so a 20yo weeks from promotion gets the same answer as a 21yo. Applied to the Player Advisor's Squad Comparison section too. Verified: nabeel_repro (legacy verdict reproduced as 'adequate', rating elite, comparison now returns would-replace) + full regression still green; v8.65: the Overall Rating is now age-independent, per the user's report that a 57-ceiling 20yo (Prescott) rated BELOW a 51-ceiling 21yo (Awad) purely from the 20/21 age boundary - the old rating used TWO age curves (youth declining 16->20, senior peaking 21-24) stitched at the seam, so the identical player scored age 4 at 20y14w and jumped to 10 at 21y1w, a one-week 6-point cliff, and the youth weights discounted dist/value/talent terms (0.6/0.4/0.8 vs senior 0.8/0.8/1.0), stacking into systematic youth under-rating. Now ONE continuous lifecycle curve (flat 10 across 16-24 prime/runway, then the same smooth 25-30 decline) and ONE weight set for every age (1.0/1.2/0.8/0.8/1.0) - the age cliff is gone (20y14w and 21y1w now score identically) and the 57-ceiling youth now correctly outranks the 51-ceiling senior (80.7 vs 76.5). Verified: inversion repro + boundary-week equality + full regression green (182 assertions incl. new 20/21-equality case); v8.64: the age WEEK is now 1-BASED within the age-year (per the user) - "21y14w" is the 14th/final week of being 21, NOT 22, so parseGameAge yields 21.93 and floor(age)==the year the game displays for EVERY display; this fixes every boundary-week player being treated as a year older a full week early - a 20.14 youth was pushed onto the senior scout base / senior training / senior sell analysis, a 29.14 player got the 30+ aging-training path, and 19.14 read as already-20; the parser now matches the training sim's own (week-1)/14 advancement (they were two different conventions for the same week); formatAgeDisplay round-trips the new parse (21.93 -> "21y14w", first week of any age is "Xy1w" not "Xy0w"); two inline duplicate age parsers routed through parseGameAge so nothing can drift; v8.63: the Dynasty Score is now an audited, tamper-proof differentiator - experience is folded into the weighted value sum per your weight list (primary/technique/fielding/endurance/experience) and projected honestly toward the scout-benchmark per-age expectation scaled by remaining runway (a 21.5yo exp 4 projects to ~6, never reduces, weeks=0 keeps ceiling==current), while power stays out since it's a batting-only stroke skill that would bias bowler/keeper scores - verified with a new 31-assertion dynastyaudit harness (academy/runway/talent/wage-price sensitivity all confirmed) plus a full regression; v8.62: age is now WEEK-aware everywhere — per-year tables like the scout base / youth dev curve read the displayed year (16y13w = 16, no more half-year 16y5w-vs-16y6w flip), training multipliers and rating/rank age scores interpolate continuously across the year, and 20y13w is unambiguously still youth; weeksToAge's float guard stops a boundary player gaining a phantom extra week; added a FILE MAP at the top of the script so any concern maps to a grep-able function name; v8.61: experienced-player feedback — senior training schedule now goes Fielding to Exceptional (batsmen / medium or finger spinners) or Spectacular (pace bowlers) then Strength/Endurance to Exceptional from ~25, finishers placed at 5-7 with the keeper at 6, and the drinks-break rest plan was rebuilt to RE-ALLOCATE over numbers side-aware since the old free-slot patch silently collided with the other end's overs in a fully-packed innings; v8.60: Dynasty Score / potential-future comparison now projected to age 25 for EVERY player on one scale, and the academy level is always re-scraped from the Academy page DOM so an upgrade propagates to all squad and market projections; v8.59: EVERY player's Overall Rating projects to age 25, and projections assume the academy upgrades toward Deluxe over time).
 // @author       Tushant Sharma
 // @license      MIT
 // @match        https://www.fromthepavilion.org/*
@@ -8022,7 +8022,17 @@ table.ftp-table {
                     // Squad-peer comparison computed up front (not just at
                     // render time) so it can gate the senior filter below,
                     // not just annotate the card afterwards.
-                    const peerCompare = (ageYears(p.age) >= 21) ? comparePlayerToSquadPeers(p, seniorPlayers) : null;
+                    // v8.66: computed for EVERY age, not just 21+. The v8.28
+                    // "youth are development bets, not like-for-like swaps"
+                    // gate was meant to keep the FILTER from hiding them, but
+                    // it also silently removed the compare line from under-21
+                    // cards entirely — a 20y12w candidate the user is weighing
+                    // against a promotion slot got no "would replace anyone?"
+                    // answer at all. The comparison is against senior squad
+                    // peers either way (the only players who'd compete for an
+                    // XI spot), so it's exactly as meaningful for a player
+                    // weeks from promotion as it is for one already senior.
+                    const peerCompare = comparePlayerToSquadPeers(p, seniorPlayers);
                     return { ...p, eval: ev, peerCompare };
                 });
 
@@ -8239,7 +8249,21 @@ table.ftp-table {
                     } else {
                         players.forEach((p, i) => {
                             const ev = p.eval;
-                            const badgeClass = ev.verdict === 'elite' ? 'green' : ev.verdict === 'strong' ? 'green' : 'warn';
+                            // Verdict word shown on the card comes from the
+                            // Overall Rating (v8.66) — the legacy
+                            // evaluateTransferTarget verdict still drives the
+                            // isWorthShowing filter below, but showing BOTH on
+                            // the same card let them contradict each other
+                            // (e.g. an 81.7-elite youth read "ADEQUATE" because
+                            // the legacy curve verdict is a different scale that
+                            // doesn't credit the to-25 projection). One judgment
+                            // word now, derived from the SAME number as the
+                            // ★ OVERALL badge, so they can't disagree. Reads the
+                            // rating precomputed in computeCandidateRating (see
+                            // the read-back comment below).
+                            const overallRating = p._overallRating;
+                            const ratingLabel = overallRating && overallRating.label ? overallRating.label : (ev.verdict || 'pass');
+                            const ratingLabelClass = ratingLabel === 'elite' ? 'green' : ratingLabel === 'strong' ? 'teal' : ratingLabel === 'reasonable' ? 'amber' : 'red';
                             const primaryInfo = getPrimarySkillInfo(p);
                             const primarySkill = primaryInfo.value;
                             const primaryName = primaryInfo.name === 'keeping' ? 'Keep' : primaryInfo.name === 'bowling' ? 'Bowl' : 'Bat';
@@ -8250,7 +8274,6 @@ table.ftp-table {
                             // the expensive training simulation here.
                             const ceilingResult = p._ceilingResult;
                             const dynastyCeiling = p._dynastyCeiling;
-                            const overallRating = p._overallRating;
 
                             // Build detail line — show experience/wage only if fetched
                             const detailParts = [
@@ -8311,7 +8334,7 @@ table.ftp-table {
                                     <span class="vj-fw-700" style="font-size:12px;">#${i+1} ${p.name} <span class="vj-text-xs vj-text-muted">(${formatAgeDisplay(p.age)})</span></span>
                                     <div style="display:flex;gap:4px;align-items:center;">
                                         ${overallRatingBadge(overallRating)}
-                                        <span class="ftp-stat-badge ${badgeClass}">${ev.verdict.toUpperCase()}</span>
+                                        <span class="ftp-stat-badge ${ratingLabelClass}">${ratingLabel.toUpperCase()}</span>
                                     </div>
                                 </div>
                                 <div class="vj-text-xs vj-text-muted" style="line-height:1.4;margin-top:2px;">
@@ -8361,7 +8384,7 @@ table.ftp-table {
                             // candidateRank can shift slightly with real
                             // experience now known — recompute for consistency
                             // with the same isWorthShowing gate used above.
-                            p.peerCompare = (ageYears(p.age) >= 21) ? comparePlayerToSquadPeers(p, seniorPlayers) : null;
+                            p.peerCompare = comparePlayerToSquadPeers(p, seniorPlayers);
                         });
                         // Recompute Dynasty + Overall Rating now that wage/
                         // talent are known (they feed the rating's value and
@@ -9329,11 +9352,15 @@ table.ftp-table {
         }
 
         // Squad comparison — who this player would realistically replace.
-        // Most useful for 21+ (peer-age comparison against your senior
-        // squad); youth are development bets, not direct swaps, so this
-        // section is skipped for them rather than forcing a comparison
-        // that doesn't mean much yet.
-        if (!isYouth && squadPlayers.length > 0) {
+        // v8.66: shown for EVERY age, matching the transfer cards. The old
+        // "youth are development bets, not direct swaps" note sounded like a
+        // design decision but in practice just removed the answer to "would he
+        // replace anyone?" from under-21 player pages entirely. Peers are
+        // senior-squad players of the same role regardless of the player's
+        // age — a 20y12w weeks from promotion competes for an XI spot exactly
+        // like a 21yo, and a 16yo's future value is gauged against the seniors
+        // he'd eventually have to displace.
+        if (squadPlayers.length > 0) {
             const cmp = comparePlayerToSquadPeers(player, squadPlayers);
             let cHtml = cmp.isGap
                 ? `<div class="vj-text-xs vj-text-muted vj-mb-4">You have no current SENIOR ${cmp.role === 'keeping' ? 'wicketkeepers' : cmp.role === 'bowling' ? 'bowlers' : 'batters'} to compare against (youth in that role aren't counted here) — this player would fill a genuine squad gap. This player ranks ${cmp.candidateRank}/10.</div>`
@@ -9347,8 +9374,6 @@ table.ftp-table {
                 cHtml += `<div class="vj-text-sm vj-text-muted">Doesn't clearly outrank anyone in this group — not an obvious replacement for your current squad.</div>`;
             }
             compareEl.innerHTML = cHtml;
-        } else if (isYouth) {
-            compareEl.innerHTML = '<div class="vj-text-xs vj-text-muted">Squad comparison is shown for senior (21+) players only — a 16-20yo is a development bet, not a like-for-like swap yet.</div>';
         } else {
             compareEl.innerHTML = '<div class="vj-text-xs vj-text-muted">No squad data cached yet — visit your Senior Squad page once to enable comparison.</div>';
         }
