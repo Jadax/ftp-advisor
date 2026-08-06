@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         FTP Advisor
 // @namespace    http://tampermonkey.net/
-// @version      8.60
-// @description  Comprehensive tactical advisor for From the Pavilion cricket game (v8.60: Dynasty Score / potential-future comparison now projected to age 25 for EVERY player on one scale, and the academy level is always re-scraped from the Academy page DOM so an upgrade propagates to all squad and market projections; v8.59: EVERY player's Overall Rating projects to age 25, and projections assume the academy upgrades toward Deluxe over time).
+// @version      8.61
+// @description  Comprehensive tactical advisor for From the Pavilion cricket game (v8.61: experienced-player feedback — senior training schedule now goes Fielding to Exceptional (batsmen / medium or finger spinners) or Spectacular (pace bowlers) then Strength/Endurance to Exceptional from ~25, finishers placed at 5-7 with the keeper at 6, and the drinks-break rest plan was rebuilt to RE-ALLOCATE over numbers side-aware since the old free-slot patch silently collided with the other end's overs in a fully-packed innings; v8.60: Dynasty Score / potential-future comparison now projected to age 25 for EVERY player on one scale, and the academy level is always re-scraped from the Academy page DOM so an upgrade propagates to all squad and market projections; v8.59: EVERY player's Overall Rating projects to age 25, and projections assume the academy upgrades toward Deluxe over time).
 // @author       Tushant Sharma
 // @license      MIT
 // @match        https://www.fromthepavilion.org/*
@@ -3249,6 +3249,15 @@
             }
         }
 
+        // Experienced-player guidance: Superior is the realistic target to
+        // aim for — from there you can train quality players without going
+        // bankrupt. Lavish+ is a longer-term goal: gate takings scale with
+        // club supporters (top clubs run ~2500), so the academy upgrade
+        // cycle is expected to take a while.
+        if (level < 7) {
+            rec.benefits.push('Community guidance: aim for Superior — from there you can train quality players without going bankrupt. Lavish+ is a long-term goal (top clubs run ~2500 supporters driving gate takings).');
+        }
+
         // Sponsorship revenue context (from wiki tables)
         // Div 1 SOD=$120k, T20=$90k, YOD=$48k, YT20=$24k = $282k total
         // Div 4 SOD=$60k, T20=$45k, YOD=$24k, YT20=$12k = $141k total
@@ -3955,46 +3964,50 @@
             used.add(anchor.id);
         }
 
-        // Position 4-5: Next best, alternate LH/RH
+        // Position 4: Next best, alternate LH/RH
         // OD: Normal — rotate strike, build partnerships
         // T20: Aggressive — attack from ball 1 in the middle overs
-        while (ordered.length < 5) {
+        {
             const nextRH = sorted.find(p => !p.isLeftHanded && !used.has(p.id));
             const nextLH = sorted.find(p => p.isLeftHanded && !used.has(p.id));
             const pick = (ordered.length % 2 === 0 ? nextRH : nextLH) || nextRH || nextLH;
-            if (!pick) break;
-            ordered.push({ ...pick, position: ordered.length + 1, battingTactic: isT20 ? 5 : 2 });
-            used.add(pick.id);
+            if (pick) {
+                ordered.push({ ...pick, position: 4, battingTactic: isT20 ? 5 : 2 });
+                used.add(pick.id);
+            }
         }
 
-        // Position 6: Keeper + next best
-        // T20: Aggressive (keeper bats in the power-hitting zone)
-        // OD: Normal (keep wickets in hand for the middle overs)
-        const keeper = lineup.find(p => p.role === 'WK' && !used.has(p.id));
-        if (keeper && ordered.length < 7) {
-            ordered.push({ ...keeper, position: ordered.length + 1, battingTactic: isT20 ? 5 : 2 });
-            used.add(keeper.id);
-        }
-
-        // Position 7-8: Prefer Finisher talent here
+        // Position 5-8: Finisher preference zone — experienced-player
+        // feedback puts Finisher talent at 5-7 (lower middle order: arrives
+        // late enough to face the death overs but not buried in the tail),
+        // so the finisher-preference window starts at position 5 instead of
+        // the old 7. Keeper is slotted at #6 (still top 7, per the existing
+        // keeper-in-top-7 convention).
+        // OD: bowlers Aggressive (slog), batters Normal — late-order hitting
         // T20: Aggressive — death overs hitting (Finisher talent shines here)
-        // OD: Aggressive for bowlers, Normal for batters — late-order hitting
+        const keeper = lineup.find(p => p.role === 'WK' && !used.has(p.id));
         let remaining2 = sorted.filter(p => !used.has(p.id));
         while (ordered.length < 8 && remaining2.length > 0) {
-            const finisher = remaining2.find(p => finisherIds.has(p.id));
+            const pos = ordered.length + 1;
             let pick;
-            if (finisher) {
-                pick = finisher;
-                remaining2 = remaining2.filter(p => p.id !== finisher.id);
+            if (keeper && pos === 6) {
+                pick = keeper;
+                remaining2 = remaining2.filter(p => p.id !== keeper.id);
             } else {
-                pick = remaining2.shift(); // only one shift
+                const finisher = remaining2.find(p => finisherIds.has(p.id));
+                if (finisher) {
+                    pick = finisher;
+                    remaining2 = remaining2.filter(p => p.id !== finisher.id);
+                } else {
+                    pick = remaining2.shift(); // only one shift
+                }
             }
             if (!pick) break;
             const isBowler = pick.bowlerCategory !== 'none' || pick.bowling >= MIN_BOWLING_FOR_BOWLERS;
             // T20: everyone aggressive in death overs
             // OD: bowlers Aggressive (slog), batters Normal (support the hitter)
             const tactic = isT20 ? 5 : (isBowler ? 5 : 2);
-            ordered.push({ ...pick, position: ordered.length + 1, battingTactic: tactic });
+            ordered.push({ ...pick, position: pos, battingTactic: tactic });
             used.add(pick.id);
         }
 
@@ -4034,6 +4047,12 @@
         const maxPerSpell = isT20 ? maxPerBowler : Math.max(2, maxPerBowler - 2);
         const minPerSpell = isT20 ? 1 : 2;
         const perEnd = totalOvers / 2;
+
+        // Low-endurance classification for the rest-across-break pass below
+        // (experienced-player feedback: "Average or worse is low for youths,
+        // Accomplished or worse is low for seniors"). Endurance 4 = Average,
+        // 8 = Accomplished.
+        const lowEndurance = (p) => (p.endurance || 0) <= ((p.isYouth === true || (p.age || 0) < 21) ? 4 : 8);
 
         const pitchEffect = PITCH_EFFECTS[context.pitch] || PITCH_EFFECTS.Sporting;
         const weatherEffect = WEATHER_EFFECTS[context.weather] || WEATHER_EFFECTS.Sunny;
@@ -4380,7 +4399,7 @@
 
         // ---- Interleave into flat plan ----
         // Alternate Gibson/Southern, but check for adjacency (same bowler in consecutive slots)
-        const plan = [];
+        let plan = [];
         let gi = 0, si = 0;
         while (gi < gSpells.length || si < sSpells.length) {
             if (gi < gSpells.length) {
@@ -4393,170 +4412,249 @@
             }
         }
 
-        // Fix adjacency violations: no bowler may bowl consecutive overs.
-        // Run multiple passes since a swap can introduce new violations.
-        // Manual-confirmed per-bowler max overs (rules.htm?rulespage=
-        // competitions): Senior OD 10, Senior T20 4, Youth OD 8, Youth T20
-        // 4 — see MAX_OVERS_PER_BOWLER above. No consecutive overs is also
-        // manual-confirmed (rulespage=matchorders).
-        for (let pass = 0; pass < 3; pass++) {
-            let fixed = false;
-            for (let i = 1; i < plan.length; i++) {
-                if (plan[i].player.id === plan[i - 1].player.id) {
-                    let swapped = false;
-                    for (let j = i + 1; j < plan.length; j++) {
-                        const prevId = i >= 2 ? plan[i - 2].player.id : null;
-                        if (plan[j].player.id !== plan[i - 1].player.id && plan[j].player.id !== prevId) {
-                            const nextId = j + 1 < plan.length ? plan[j + 1].player.id : null;
-                            if (plan[i - 1].player.id !== nextId) {
-                                [plan[i], plan[j]] = [plan[j], plan[i]];
-                                swapped = true;
-                                fixed = true;
-                                break;
+        // Shared by the initial build and the drinks-break rebuild (which only
+        // has to produce a valid spell LIST — numbering/adjacency stay here so
+        // the rebuild can't accidentally introduce collisions or end/parity
+        // mismatches).
+        function fixAdjacency(list) {
+            // Fix adjacency violations: no bowler may bowl consecutive overs.
+            // Run multiple passes since a swap can introduce new violations.
+            // Manual-confirmed per-bowler max overs (rules.htm?rulespage=
+            // competitions): Senior OD 10, Senior T20 4, Youth OD 8, Youth T20
+            // 4 — see MAX_OVERS_PER_BOWLER above. No consecutive overs is also
+            // manual-confirmed (rulespage=matchorders).
+            for (let pass = 0; pass < 3; pass++) {
+                let fixed = false;
+                for (let i = 1; i < list.length; i++) {
+                    if (list[i].player.id === list[i - 1].player.id) {
+                        let swapped = false;
+                        for (let j = i + 1; j < list.length; j++) {
+                            const prevId = i >= 2 ? list[i - 2].player.id : null;
+                            if (list[j].player.id !== list[i - 1].player.id && list[j].player.id !== prevId) {
+                                const nextId = j + 1 < list.length ? list[j + 1].player.id : null;
+                                if (list[i - 1].player.id !== nextId) {
+                                    [list[i], list[j]] = [list[j], list[i]];
+                                    swapped = true;
+                                    fixed = true;
+                                    break;
+                                }
                             }
                         }
-                    }
-                    if (!swapped) {
-                        console.warn(`[FTP Advisor] Adjacency violation: ${plan[i].player.name} bowls consecutive overs at slot ${i}`);
+                        if (!swapped) {
+                            console.warn(`[FTP Advisor] Adjacency violation: ${list[i].player.name} bowls consecutive overs at slot ${i}`);
+                        }
                     }
                 }
+                if (!fixed) break;
             }
-            if (!fixed) break;
         }
 
-        // ---- Assign startOver and tactics ----
-        const seamBoost = pitchEffect.seam > 1.1;
-        const spinBoost = pitchEffect.spin > 1.1;
-        const battingFriendly = pitchEffect.bat > 1.1;
-        const captain = lineup.find(p => p.isCaptain);
-        const captaincy = captain ? (captain.captaincy || 5) : 5;
-        const captainCanExec = captaincy >= 8;
-        const captainIsWeak = captaincy < 5;
+        function numberAndTactics(list, opts) {
+            // Assign startOver and tactics. Gibson spells get odd over numbers,
+            // Southern even ones — this end<->parity invariant is what the
+            // drinks-break rebuild's re-numbering relies on. When opts.breakOver
+            // is set (drinks-break rebuild), numbering is side-aware instead:
+            // each spell's side ('before'/'after', set by the rebuild) picks a
+            // per-end counter that only walks that side of the break, so a
+            // before-spell can never land after the break and vice versa, and
+            // collisions are impossible (each counter is strictly monotonic over
+            // that end's own parity).
+            const seamBoost = pitchEffect.seam > 1.1;
+            const spinBoost = pitchEffect.spin > 1.1;
+            const battingFriendly = pitchEffect.bat > 1.1;
+            const captain = lineup.find(p => p.isCaptain);
+            const captaincy = captain ? (captain.captaincy || 5) : 5;
+            const captainCanExec = captaincy >= 8;
+            const captainIsWeak = captaincy < 5;
+            const breakOver = opts && opts.breakOver;
 
-        let gibsonNext = 1;
-        let southernNext = 2;
+            let gibsonNext = 1;
+            let southernNext = 2;
+            const counters = {
+                Gibson: { before: 1, after: breakOver != null ? (breakOver % 2 === 0 ? breakOver + 1 : breakOver + 2) : null },
+                Southern: { before: 2, after: breakOver != null ? (breakOver % 2 === 0 ? breakOver + 2 : breakOver + 1) : null }
+            };
 
-        plan.forEach((spell) => {
-            const bowler = spell.player;
-            const isSeamer = bowler.bowlerCategory === 'seam';
-            const isSpinner = bowler.bowlerCategory === 'spin';
+            list.forEach((spell) => {
+                const bowler = spell.player;
+                const isSeamer = bowler.bowlerCategory === 'seam';
+                const isSpinner = bowler.bowlerCategory === 'spin';
 
-            let tactic = 2;
-            if (spell.phase === 'New ball') {
-                tactic = 1;
-            } else if (spell.phase === 'Death overs') {
-                tactic = battingFriendly ? (captainIsWeak ? 2 : 1) : 1;
-            } else if (spell.phase === 'Middle overs') {
-                if (seamBoost && isSeamer && captainCanExec) tactic = 1;
-                else if (spinBoost && isSpinner && captainCanExec) tactic = 1;
-                else if (battingFriendly) tactic = captainIsWeak ? 2 : 3;
-            }
-            spell.tactic = tactic;
+                let tactic = 2;
+                if (spell.phase === 'New ball') {
+                    tactic = 1;
+                } else if (spell.phase === 'Death overs') {
+                    tactic = battingFriendly ? (captainIsWeak ? 2 : 1) : 1;
+                } else if (spell.phase === 'Middle overs') {
+                    if (seamBoost && isSeamer && captainCanExec) tactic = 1;
+                    else if (spinBoost && isSpinner && captainCanExec) tactic = 1;
+                    else if (battingFriendly) tactic = captainIsWeak ? 2 : 3;
+                }
+                spell.tactic = tactic;
 
-            if (spell.end === 'Gibson') {
-                spell.startOver = gibsonNext;
-                gibsonNext += spell.overs * 2;
-            } else {
-                spell.startOver = southernNext;
-                southernNext += spell.overs * 2;
-            }
-        });
+                if (breakOver != null) {
+                    const side = spell.side === 'after' ? 'after' : 'before';
+                    spell.startOver = counters[spell.end][side];
+                    counters[spell.end][side] += spell.overs * 2;
+                } else if (spell.end === 'Gibson') {
+                    spell.startOver = gibsonNext;
+                    gibsonNext += spell.overs * 2;
+                } else {
+                    spell.startOver = southernNext;
+                    southernNext += spell.overs * 2;
+                }
+            });
+        }
+
+        fixAdjacency(plan);
+        numberAndTactics(plan);
 
         // ---- Rest across the drinks break (OD/YOD only) ----
         // Manual-confirmed mechanic: "Energy is partially replenished
         // during drinks breaks and during the change of innings"
         // (rulespage=matchengine). Giving a bowler some overs before the
         // halfway break and some after is a real rest window, instead of
-        // bowling their whole allocation in one continuous block. This
-        // post-pass splits any spell >=4 overs that would otherwise sit
-        // ENTIRELY before OR entirely after the break into two parts, then
-        // re-numbers each end cleanly and re-fixes adjacency. The bowler's
-        // total overs is unchanged, so per-bowler over limits are never
-        // violated. T20 spells are short (max 4) and the manual treats the
-        // break as a minor factor there, so it's left alone.
+        // bowling their whole allocation in one continuous block. Per
+        // experienced-player feedback, LOW-endurance bowlers (youth
+        // Average-or-worse = <=4, senior Accomplished-or-worse = <=8) get
+        // the same treatment from just 2 overs up ("it's fine to bowl
+        // everyone 50/50"). T20 spells are short (max 4) and the manual
+        // treats the break as a minor factor there, so this pass is
+        // OD/YOD-only.
+        //
+        // v8.61: this is a REBUILD, not a patch. The pre-v8.61 approach
+        // tried to insert a split spell's far-side part at a "free" over
+        // number of the same end on the other side of the break. That
+        // cannot work in a full innings: every odd over belongs to Gibson
+        // and every even one to Southern, so on the far side of the break
+        // every over number of that end's parity is already taken — the
+        // search either returned a slot of the WRONG parity (silently
+        // colliding with the other end's overs) or none at all (a valid
+        // rest plan not applied). A real split has to RE-ALLOCATE over
+        // numbers, not find a free one. So this pass partitions each end's
+        // spell list into a before-break group and an after-break group
+        // whose overs sums exactly match how many over-numbers of that
+        // end's parity exist on each side of the break (50-over: Gibson 13
+        // before + 12 after, Southern 12 before + 13 after), splits every
+        // >=4-over spell (>=2 for low-endurance) across the boundary so its
+        // bowler bowls both sides, then reuses the same adjacency/numbering
+        // helpers as the main allocator — numbering side-aware so a
+        // before-spell can never land after the break and vice versa. The
+        // bowler's total overs never changes, so per-bowler over limits
+        // hold. If the budget can't be balanced exactly, the un-split plan
+        // is kept (the display's no-rest warning covers the residual).
         if (!isT20 && plan.length > 0) {
             const breakOver = totalOvers / 2;
 
-            // Rest across the drinks break (OD/YOD only). The main allocator
-            // above already assigns valid startOver positions (correct per-end
-            // over numbers, per-bowler caps, adjacency) — those are kept as-is.
-            // This pass only splits a spell that is ENTIRELY on one side of the
-            // break AND long enough (>=4 overs) into two parts, so its bowler
-            // gets a real rest window at the break instead of one continuous
-            // block. A spell that already STRADDLES the break is left alone —
-            // it bowls some overs each side and already gets the window.
-            // The inserted part is placed just across the break on the same end
-            // at the first genuinely-free over number of that parity (checked
-            // against every other spell on that end), and skipped if no free
-            // slot exists (so we never create a collision or exceed overs). The
-            // bowler's total overs is unchanged, so per-bowler caps hold. T20
-            // spells are short and the break is a minor factor there.
-            const occupancy = { Gibson: new Set(), Southern: new Set() };
-            plan.forEach(sp => {
-                for (let o = sp.startOver; o <= sp.startOver + (sp.overs - 1) * 2; o += 2) {
-                    occupancy[sp.end].add(o);
+            // Partition one end's spell list into before/after parts whose
+            // before-side total is exactly beforeTarget overs.
+            const partitionSideSpells = (endSpells, beforeTarget) => {
+                const candidate = (sp) => sp.overs >= 4 || (lowEndurance(sp.player) && sp.overs >= 2);
+                const parts = endSpells.map(sp => {
+                    if (candidate(sp)) {
+                        const pre = Math.max(1, Math.floor(sp.overs / 2));
+                        return { sp, before: pre, after: sp.overs - pre, candidate: true };
+                    }
+                    return { sp, before: sp.overs, after: 0, candidate: false };
+                });
+
+                let delta = parts.reduce((s, p) => s + p.before, 0) - beforeTarget;
+                if (delta > 0) {
+                    // Too much before: move overs to the after side, working
+                    // from the END of the list in; candidates keep >=1 before
+                    // over so they still bowl on both sides.
+                    for (let i = parts.length - 1; i >= 0 && delta > 0; i--) {
+                        const p = parts[i];
+                        const available = p.before - (p.candidate ? 1 : 0);
+                        if (available > 0) {
+                            const move = Math.min(available, delta);
+                            p.before -= move;
+                            p.after += move;
+                            delta -= move;
+                        }
+                    }
+                } else if (delta < 0) {
+                    // Too little before: move overs from after to before.
+                    for (let i = 0; i < parts.length && delta < 0; i++) {
+                        const p = parts[i];
+                        const available = p.after - (p.candidate ? 1 : 0);
+                        if (available > 0) {
+                            const move = Math.min(available, -delta);
+                            p.after -= move;
+                            p.before += move;
+                            delta += move;
+                        }
+                    }
                 }
-            });
-            const firstFree = (end, parity, lo) => {
-                for (let o = Math.max(lo, parity ? 1 : 2); ; o += 2) {
-                    if (!occupancy[end].has(o)) return o;
+                if (delta !== 0) return null;
+
+                const out = [];
+                for (const p of parts) {
+                    if (p.before > 0) out.push({ ...p.sp, overs: p.before, side: 'before' });
+                    if (p.after > 0) out.push({ ...p.sp, overs: p.after, side: 'after' });
                 }
+                return out;
             };
 
-            const splitSpells = [];
-            for (const sp of plan) {
-                const lastOver = sp.startOver + (sp.overs - 1) * 2;
-                const entirelyBefore = lastOver <= breakOver;
-                const entirelyAfter = sp.startOver > breakOver;
-                if (sp.overs >= 4 && (entirelyBefore || entirelyAfter)) {
-                    const parity = (sp.startOver % 2) !== 0;
-                    const pre = Math.floor(sp.overs / 2);
-                    const post = sp.overs - pre;
-                    // find a free slot just across the break, same end+parity
-                    const cross = entirelyBefore
-                        ? firstFree(sp.end, parity, breakOver + 1)
-                        : firstFree(sp.end, parity, 1);
-                    if (cross > 0 && cross <= (entirelyBefore ? totalOvers : breakOver)) {
-                        if (entirelyBefore) {
-                            splitSpells.push({ ...sp, overs: pre, startOver: sp.startOver });
-                            const p = { ...sp, overs: post, startOver: cross, phase: sp.phase === 'New ball' ? 'Middle overs' : sp.phase };
-                            for (let o = cross; o <= cross + (post - 1) * 2; o += 2) occupancy[sp.end].add(o);
-                            splitSpells.push(p);
-                        } else {
-                            const p = { ...sp, overs: pre, startOver: cross, phase: sp.phase === 'Death overs' ? 'Middle overs' : sp.phase };
-                            for (let o = cross; o <= cross + (pre - 1) * 2; o += 2) occupancy[sp.end].add(o);
-                            splitSpells.push(p);
-                            splitSpells.push({ ...sp, overs: post, startOver: sp.startOver });
-                        }
-                    } else {
-                        splitSpells.push(sp);
-                    }
-                } else {
-                    splitSpells.push(sp);
-                }
-            }
+            const gibsonSpells = plan.filter(sp => sp.end === 'Gibson');
+            const southernSpells = plan.filter(sp => sp.end !== 'Gibson');
+            const beforeGibsonMax = Math.ceil(breakOver / 2);      // odd numbers <= breakOver
+            const beforeSouthernMax = Math.floor(breakOver / 2);   // even numbers <= breakOver
 
-            // Re-fix adjacency across the (possibly split) interleaved list.
-            // Totals per bowler unchanged, so caps hold.
-            const rePlan = splitSpells;
-            for (let pass = 0; pass < 3; pass++) {
-                let fixed = false;
-                for (let i = 1; i < rePlan.length; i++) {
-                    if (rePlan[i].player.id === rePlan[i - 1].player.id) {
-                        for (let j = i + 1; j < rePlan.length; j++) {
-                            const prevId = i >= 2 ? rePlan[i - 2].player.id : null;
-                            const nextId = j + 1 < rePlan.length ? rePlan[j + 1].player.id : null;
-                            if (rePlan[j].player.id !== rePlan[i - 1].player.id && rePlan[j].player.id !== prevId && rePlan[i - 1].player.id !== nextId) {
-                                [rePlan[i], rePlan[j]] = [rePlan[j], rePlan[i]];
-                                fixed = true;
-                                break;
-                            }
-                        }
+            const gParts = partitionSideSpells(gibsonSpells, beforeGibsonMax);
+            const sParts = partitionSideSpells(southernSpells, beforeSouthernMax);
+
+            if (gParts && sParts) {
+                const gBefore = gParts.filter(p => p.side === 'before');
+                const gAfter = gParts.filter(p => p.side === 'after');
+                const sBefore = sParts.filter(p => p.side === 'before');
+                const sAfter = sParts.filter(p => p.side === 'after');
+
+                // Before-break spells first (alternating ends, preserving per-end
+                // order), then after-break spells — numbering is side-aware, so
+                // list order only affects which spell gets the lower over numbers
+                // on its own side, never which side.
+                const rebuilt = [];
+                for (let i = 0; i < Math.max(gBefore.length, sBefore.length); i++) {
+                    if (i < gBefore.length) rebuilt.push(gBefore[i]);
+                    if (i < sBefore.length) rebuilt.push(sBefore[i]);
+                }
+                for (let i = 0; i < Math.max(gAfter.length, sAfter.length); i++) {
+                    if (i < gAfter.length) rebuilt.push(gAfter[i]);
+                    if (i < sAfter.length) rebuilt.push(sAfter[i]);
+                }
+
+                const originalPlan = plan;
+                plan = rebuilt;
+                fixAdjacency(plan);
+                numberAndTactics(plan, { breakOver });
+                fixAdjacency(plan);
+                numberAndTactics(plan, { breakOver });
+
+                // Safety net: verify the rebuilt plan is well-formed before
+                // trusting it — no collisions, nothing out of range, no bowler
+                // bowling consecutive over numbers. Fall back to the valid
+                // un-split plan if anything is off.
+                const overMap = new Map();
+                let collides = false;
+                for (const sp of plan) {
+                    for (let o = sp.startOver; o <= sp.startOver + (sp.overs - 1) * 2; o += 2) {
+                        if (overMap.has(o)) collides = true;
+                        overMap.set(o, sp.player.id);
                     }
                 }
-                if (!fixed) break;
+                const outOfRange = plan.some(sp => sp.startOver < 1 || sp.startOver + (sp.overs - 1) * 2 > totalOvers);
+                let adjacent = false;
+                for (let o = 1; o < totalOvers; o++) {
+                    if (overMap.get(o) && overMap.get(o) === overMap.get(o + 1)) adjacent = true;
+                }
+                if (collides || outOfRange || adjacent) {
+                    console.warn('[FTP Advisor] Drinks-break rebuild failed verification — keeping the un-split allocation.');
+                    plan = originalPlan;
+                }
+            } else {
+                console.warn('[FTP Advisor] Drinks-break rest plan could not be balanced — keeping the un-split allocation.');
             }
-            return rePlan;
         }
 
         return plan;
@@ -4811,10 +4909,23 @@
             </tr>`;
         });
         html += '</tbody></table>';
-        const tacticNote = isT20
+        const pitchSlow = context && ['Sticky', 'Crumbling', 'Slow'].includes(context.pitch);
+        let tacticNote = isT20
             ? 'N=Normal D=Defensive A=Aggressive \u00B7 T20: aggressive middle/death to maximise scoring rate'
             : 'C = Captain \u00B7 WK = Wicketkeeper \u00B7 N=Normal D=Defensive A=Aggressive \u00B7 OD: anchor at #3, aggressive tail';
+        // Experienced-player guidance: Normal aggression is perfectly fine —
+        // aim for ~60%+ of the overs on Normal (e.g. 30 of 50) rather than
+        // over-aggressing; the top order already does exactly that here.
+        tacticNote += ' \u00B7 Guidance: keep ~60%+ of overs on Normal (30 of 50) — over-aggression rarely pays';
         html += `<div class="vj-text-xs vj-text-muted vj-mt-4" style="text-align:center;">${tacticNote}</div>`;
+
+        // Slow pitches generate more dot balls, and Accumulator / Boundary
+        // Hitter trigger on what would otherwise be dot balls (experienced-
+        // player feedback) — so those players are worth more here and are
+        // best used on Defensive as the innings anchor.
+        if (pitchSlow) {
+            html += `<div class="ftp-alert info" style="margin:6px 0 0 0;"><span>\u{1F3AF}</span><div>${context.pitch} pitch → more dot balls. Accumulator / Boundary Hitter players trigger on dot balls — best used on <strong>Defensive</strong> as the #3 innings anchor.</div></div>`;
+        }
 
         // Batting-strength by phase — mirrors the game's own Match Ratings
         // split (Top Order 1-4 / Middle 5-8 / Tail 9-11) so you can see at a
@@ -4858,7 +4969,7 @@
             const perBowler = {};
             bowlingSpells.forEach(s => {
                 if (!s || !s.player) return;
-                if (!perBowler[s.player.id]) perBowler[s.player.id] = { name: s.player.name, before: 0, after: 0, total: 0 };
+                if (!perBowler[s.player.id]) perBowler[s.player.id] = { name: s.player.name, before: 0, after: 0, total: 0, endurance: s.player.endurance || 0, isYouth: s.player.isYouth === true || (s.player.age || 0) < 21 };
                 const b = perBowler[s.player.id];
                 const spellEndOver = s.startOver + (s.overs - 1) * 2;
                 if (spellEndOver <= breakOver) {
@@ -4882,16 +4993,25 @@
                 b.total += s.overs;
             });
             // The allocator now splits long all-before spells so the bowler
-            // also bowls after the break (real rest window). So a bowler
-            // still flagged here is a genuinely unavoidable edge case.
+            // also bowls after the break (real rest window), and applies the
+            // same treatment to low-endurance bowlers from 2 overs up. So a
+            // bowler still flagged here is a genuinely unavoidable edge case.
             // "all AFTER" bowlers are NOT worth flagging — they're fresh
             // death-overs bowlers who rested before bowling, which is the
             // whole point. Only warn when a bowler's block is entirely
             // BEFORE the break with no break-window recovery afterwards.
-            const noRest = Object.values(perBowler).filter(b => b.total >= 4 && b.before > 0 && b.after === 0 && b.before === b.total);
+            const noRest = Object.values(perBowler).filter(b => {
+                const lowEnd = b.endurance <= (b.isYouth ? 4 : 8);
+                return (b.total >= 4 || (lowEnd && b.total >= 2)) && b.before > 0 && b.after === 0 && b.before === b.total;
+            });
             if (noRest.length > 0) {
                 html += `<div class="ftp-alert warning" style="margin-bottom:6px;"><span>⚠</span><div><strong>No rest across the drinks break:</strong> ${noRest.map(b => `${b.name} (${b.total} overs, all ${b.before === 0 ? 'after' : 'before'})`).join(', ')} — these couldn't be split without breaking the over limits; if a break happens, they'll still get whatever recovery the game grants between their spells in other overs.</div></div>`;
             }        }
+            // v8.61 explainer — the allocator bakes the low-endurance split in
+            // (see allocateBowlingSpells()'s lowEndurance() threshold), shown
+            // here as a one-line note so the resulting plan reads as intended
+            // rather than looking like arbitrary spell placement.
+            html += `<div class="vj-text-xs vj-text-muted vj-mb-4" style="text-align:center;">\u{1F6C0} Rest across the drinks break: low-endurance bowlers (youth Average or worse, senior Accomplished or worse) get their overs split ~50/50 around the halfway point — community guidance; longer spells are split for everyone.</div>`;
 
         // Endurance/freshness for the death overs (v8.41) — see
         // rankForDeathOvers() in allocateBowlingSpells(): the plan above
@@ -6421,30 +6541,47 @@ table.ftp-table {
     function _recommendSeniorTraining(rec, player, ctx) {
         const { age, setProgram } = ctx;
         const { isBowler, isKeeper, isAllrounder } = ctx;
+        const primarySkill = isBowler ? player.bowling : isKeeper ? player.keeping : player.batting;
 
         if (player.fielding < 7) {
             setProgram('fielding', `Senior: Fielding is ${skillLabel(player.fielding)}. Push to Reliable before age slows training. Wiki: fielding to Reliable/Capable first is best ROI.`, 'medium');
             return;
         }
 
-        // Community-sourced staging order (real experienced-user input,
-        // not workbook-verified): fielding trains fastest so most players
-        // get it to their target level as early as possible (the youth
-        // fielding-to-Reliable staging already does this — see
-        // _recommendYouthTraining), then primary skill/technique is the
-        // focus through the mid-20s, THEN power/fitness starting around
-        // 25 — that timing still leaves enough runway to reach a decent
-        // level by 30 (when the aging path below switches to maintenance-
-        // only, no longer actively growing skills). Actual runway depends
-        // heavily on academy training speed, which this doesn't otherwise
-        // adjust for — a slow academy may need to start earlier.
-        if (age >= 25 && age <= 29 && player.power < 8) {
-            setProgram('strength', `Age ${age}: Power training window (community guidance: start ~25, focus primary/technique before that). Currently ${skillLabel(player.power)}. Strength trains power and endurance — actual pace depends on your academy speed.`, 'medium');
+        // Experienced-player training schedule (real community input, same
+        // source as the v8.7 youth staging order): 1) fielding to Reliable
+        // in youth (done above), 2) primary/tech to ~21, 3) a SECOND
+        // fielding stage to Spectacular (11) or Exceptional (12) — the
+        // higher tier for batsmen, medium bowlers and finger spinners (they
+        // field most, so run-saving pops count for more), pace/wrist bowlers
+        // get 11, 4) primary/tech to ~25, 5) Strength and Endurance each to
+        // Exceptional by ~29, then free choice. Gated on the primary skill
+        // being at least Reliable so a late-blooming weak primary isn't
+        // starved while fielding climbs.
+        const isPaceOrWrist = ['rf', 'lf', 'rfm', 'lfm', 'rws', 'lws'].includes(player.bowlerType || '');
+        const fieldingTier = isPaceOrWrist ? 11 : 12;
+        if (player.fielding < fieldingTier && primarySkill >= 7) {
+            setProgram('fielding', `Age ${age}: Fielding second stage — ${skillLabel(player.fielding)} → ${skillLabel(fieldingTier)}. ${isPaceOrWrist ? 'Spectacular is the target for pace/wrist bowlers.' : 'Exceptional — batsmen, medium bowlers and finger spinners field most.'} Community schedule: primary to ~21, fielding to ${skillLabel(fieldingTier)}, primary to ~25, then strength/endurance.`, 'medium');
             return;
         }
 
-        if (age >= 25 && player.power < player.batting - 2) {
-            setProgram('strength', `Age ${age}: Power (${skillLabel(player.power)}) is weak relative to batting (${skillLabel(player.batting)}). Strength catches up power.`, 'low');
+        // Community-sourced staging order (real experienced-user input,
+        // not workbook-verified): fielding trains fastest so most players
+        // get it to their target level as early as possible (the youth
+        // fielding-to-Reliable staging and the second fielding stage above
+        // already handle that), then primary skill/technique is the focus
+        // through the mid-20s, THEN Strength and Fitness starting around 25
+        // running until power AND endurance each hit Exceptional (12) — the
+        // community schedule expects that to land around 28-29, just before
+        // the aging path below switches to maintenance-only at 30. Actual
+        // pace depends heavily on academy training speed, which this doesn't
+        // otherwise adjust for — a slow academy may need to start earlier.
+        if (age >= 25 && age <= 29 && (player.power < 12 || player.endurance < 12)) {
+            if (player.power >= 12) {
+                setProgram('fitness', `Age ${age}: Endurance phase — power is done (${skillLabel(player.power)}), endurance is ${skillLabel(player.endurance)}. Community schedule: Strength and Endurance each to Exceptional by ~29. Fitness trains endurance (and power as secondary).`, 'medium');
+            } else {
+                setProgram('strength', `Age ${age}: Strength/Endurance phase — community schedule: both to Exceptional by ~29. Strength trains power (${skillLabel(player.power)}) and endurance (${skillLabel(player.endurance)}) together. Actual pace depends on your academy speed.`, 'medium');
+            }
             return;
         }
 
@@ -6458,7 +6595,6 @@ table.ftp-table {
             setProgram('batting', `Senior batsman: Batting (${skillLabel(player.batting)}) is primary. Continue developing batting skill and technique.`, 'medium');
         }
 
-        const primarySkill = isBowler ? player.bowling : isKeeper ? player.keeping : player.batting;
         if (player.technique < primarySkill - 2) {
             rec.warnings.push(`Technique (${skillLabel(player.technique)}) is significantly behind primary skill (${skillLabel(primarySkill)}). Consider Bat/Bowl technique training.`);
         }
