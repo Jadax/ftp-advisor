@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         FTP Advisor
 // @namespace    http://tampermonkey.net/
-// @version      8.68
+// @version      8.69
 // @description  Tactical/scouting advisor for fromthepavilion.org (cricket sim): team, tactics, pitch, training, transfer market, youth and squad plan advice with projections. Full changelog: github.com/Jadax/ftp-advisor
 // @author       Tushant Sharma
 // @license      MIT
@@ -1069,18 +1069,25 @@
         // the old Poor floor. Matches the looser of the user's two
         // saved 16yo searches ("dread exp" vs "poor exp") — this was
         // the correct one, not a screenshot transcription error.
-        16: { rating: 20000, primary: 4, technique: 2, experience: 1, fielding: 2 },
-        17: { rating: 23000, primary: 5, technique: 4, experience: 2, fielding: 2 },
-        18: { rating: 24500, primary: 6, technique: 6, experience: 2, fielding: 3 },
-        19: { primary: 8, technique: 7, experience: 3, fielding: 4 },
-        20: { primary: 9, technique: 7, experience: 3, fielding: 3 },
-        21: { primary: 9, technique: 7, experience: 4, fielding: 5 },
-        22: { primary: 9, technique: 8, experience: 5, fielding: 6 },
-        23: { primary: 10, technique: 10, experience: 6, fielding: 6 },
-        24: { primary: 11, technique: 11, experience: 8, fielding: 7 },
-        25: { primary: 11, technique: 11, experience: 8, fielding: 8 },
-        26: { primary: 11, technique: 11, experience: 8, fielding: 8 },
-        27: { primary: 11, technique: 11, fielding: 9 },
+        // Rating is a UNIVERSAL floor for every age (v8.69, per user): 25k
+        // minimum for everyone — a 16yo recruit must be 25k+, and since no
+        // player is ever below that, every age row enforces the same 25k
+        // floor (the old age-graded 20k/23k/24.5k for 16/17/18 were replaced
+        // by one flat number, and 19+ gained a gate they previously lacked).
+        // Rating is only checked once a per-player fetch fills it in (the
+        // "known" gate below), so a first-load results list is unaffected.
+        16: { rating: 25000, primary: 4, technique: 2, experience: 1, fielding: 2 },
+        17: { rating: 25000, primary: 5, technique: 4, experience: 2, fielding: 2 },
+        18: { rating: 25000, primary: 6, technique: 6, experience: 2, fielding: 3 },
+        19: { rating: 25000, primary: 8, technique: 7, experience: 3, fielding: 4 },
+        20: { rating: 25000, primary: 9, technique: 7, experience: 3, fielding: 3 },
+        21: { rating: 25000, primary: 9, technique: 7, experience: 4, fielding: 5 },
+        22: { rating: 25000, primary: 9, technique: 8, experience: 5, fielding: 6 },
+        23: { rating: 25000, primary: 10, technique: 10, experience: 6, fielding: 6 },
+        24: { rating: 25000, primary: 11, technique: 11, experience: 8, fielding: 7 },
+        25: { rating: 25000, primary: 11, technique: 11, experience: 8, fielding: 8 },
+        26: { rating: 25000, primary: 11, technique: 11, experience: 8, fielding: 8 },
+        27: { rating: 25000, primary: 11, technique: 11, fielding: 9 },
     };
 
     /**
