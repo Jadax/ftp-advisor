@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         FTP Advisor
 // @namespace    http://tampermonkey.net/
-// @version      8.64
-// @description  Comprehensive tactical advisor for From the Pavilion cricket game (v8.64: the age WEEK is now 1-BASED within the age-year (per the user) - "21y14w" is the 14th/final week of being 21, NOT 22, so parseGameAge yields 21.93 and floor(age)==the year the game displays for EVERY display; this fixes every boundary-week player being treated as a year older a full week early - a 20.14 youth was pushed onto the senior scout base / senior training / senior sell analysis, a 29.14 player got the 30+ aging-training path, and 19.14 read as already-20; the parser now matches the training sim's own (week-1)/14 advancement (they were two different conventions for the same week); formatAgeDisplay round-trips the new parse (21.93 -> "21y14w", first week of any age is "Xy1w" not "Xy0w"); two inline duplicate age parsers routed through parseGameAge so nothing can drift; v8.63: the Dynasty Score is now an audited, tamper-proof differentiator - experience is folded into the weighted value sum per your weight list (primary/technique/fielding/endurance/experience) and projected honestly toward the scout-benchmark per-age expectation scaled by remaining runway (a 21.5yo exp 4 projects to ~6, never reduces, weeks=0 keeps ceiling==current), while power stays out since it's a batting-only stroke skill that would bias bowler/keeper scores - verified with a new 31-assertion dynastyaudit harness (academy/runway/talent/wage-price sensitivity all confirmed) plus a full regression; v8.62: age is now WEEK-aware everywhere — per-year tables like the scout base / youth dev curve read the displayed year (16y13w = 16, no more half-year 16y5w-vs-16y6w flip), training multipliers and rating/rank age scores interpolate continuously across the year, and 20y13w is unambiguously still youth; weeksToAge's float guard stops a boundary player gaining a phantom extra week; added a FILE MAP at the top of the script so any concern maps to a grep-able function name; v8.61: experienced-player feedback — senior training schedule now goes Fielding to Exceptional (batsmen / medium or finger spinners) or Spectacular (pace bowlers) then Strength/Endurance to Exceptional from ~25, finishers placed at 5-7 with the keeper at 6, and the drinks-break rest plan was rebuilt to RE-ALLOCATE over numbers side-aware since the old free-slot patch silently collided with the other end's overs in a fully-packed innings; v8.60: Dynasty Score / potential-future comparison now projected to age 25 for EVERY player on one scale, and the academy level is always re-scraped from the Academy page DOM so an upgrade propagates to all squad and market projections; v8.59: EVERY player's Overall Rating projects to age 25, and projections assume the academy upgrades toward Deluxe over time).
+// @version      8.65
+// @description  Comprehensive tactical advisor for From the Pavilion cricket game (v8.65: the Overall Rating is now age-independent, per the user's report that a 57-ceiling 20yo (Prescott) rated BELOW a 51-ceiling 21yo (Awad) purely from the 20/21 age boundary - the old rating used TWO age curves (youth declining 16->20, senior peaking 21-24) stitched at the seam, so the identical player scored age 4 at 20y14w and jumped to 10 at 21y1w, a one-week 6-point cliff, and the youth weights discounted dist/value/talent terms (0.6/0.4/0.8 vs senior 0.8/0.8/1.0), stacking into systematic youth under-rating. Now ONE continuous lifecycle curve (flat 10 across 16-24 prime/runway, then the same smooth 25-30 decline) and ONE weight set for every age (1.0/1.2/0.8/0.8/1.0) - the age cliff is gone (20y14w and 21y1w now score identically) and the 57-ceiling youth now correctly outranks the 51-ceiling senior (80.7 vs 76.5). Verified: inversion repro + boundary-week equality + full regression green (182 assertions incl. new 20/21-equality case); v8.64: the age WEEK is now 1-BASED within the age-year (per the user) - "21y14w" is the 14th/final week of being 21, NOT 22, so parseGameAge yields 21.93 and floor(age)==the year the game displays for EVERY display; this fixes every boundary-week player being treated as a year older a full week early - a 20.14 youth was pushed onto the senior scout base / senior training / senior sell analysis, a 29.14 player got the 30+ aging-training path, and 19.14 read as already-20; the parser now matches the training sim's own (week-1)/14 advancement (they were two different conventions for the same week); formatAgeDisplay round-trips the new parse (21.93 -> "21y14w", first week of any age is "Xy1w" not "Xy0w"); two inline duplicate age parsers routed through parseGameAge so nothing can drift; v8.63: the Dynasty Score is now an audited, tamper-proof differentiator - experience is folded into the weighted value sum per your weight list (primary/technique/fielding/endurance/experience) and projected honestly toward the scout-benchmark per-age expectation scaled by remaining runway (a 21.5yo exp 4 projects to ~6, never reduces, weeks=0 keeps ceiling==current), while power stays out since it's a batting-only stroke skill that would bias bowler/keeper scores - verified with a new 31-assertion dynastyaudit harness (academy/runway/talent/wage-price sensitivity all confirmed) plus a full regression; v8.62: age is now WEEK-aware everywhere — per-year tables like the scout base / youth dev curve read the displayed year (16y13w = 16, no more half-year 16y5w-vs-16y6w flip), training multipliers and rating/rank age scores interpolate continuously across the year, and 20y13w is unambiguously still youth; weeksToAge's float guard stops a boundary player gaining a phantom extra week; added a FILE MAP at the top of the script so any concern maps to a grep-able function name; v8.61: experienced-player feedback — senior training schedule now goes Fielding to Exceptional (batsmen / medium or finger spinners) or Spectacular (pace bowlers) then Strength/Endurance to Exceptional from ~25, finishers placed at 5-7 with the keeper at 6, and the drinks-break rest plan was rebuilt to RE-ALLOCATE over numbers side-aware since the old free-slot patch silently collided with the other end's overs in a fully-packed innings; v8.60: Dynasty Score / potential-future comparison now projected to age 25 for EVERY player on one scale, and the academy level is always re-scraped from the Academy page DOM so an upgrade propagates to all squad and market projections; v8.59: EVERY player's Overall Rating projects to age 25, and projections assume the academy upgrades toward Deluxe over time).
 // @author       Tushant Sharma
 // @license      MIT
 // @match        https://www.fromthepavilion.org/*
@@ -801,7 +801,6 @@
     function computeOverallRating(player, opts) {
         if (!opts) return { score: 0, label: 'no-context', parts: {}, breakdown: [] };
         const breakdown = [];
-        const isYouth = isYouthAge(player.age);
         const primaryInfo = getPrimarySkillInfo(player);
         const role = primaryInfo.name;
         const roleLabel = role === 'keeping' ? 'wicketkeeper' : role === 'bowling' ? 'bowler' : 'batter';
@@ -835,20 +834,23 @@
             : computePlayerCeiling(player, opts.academySpeed, opts.squadContext, 25).ceiling;
         const qualityScore = Math.max(0, Math.min(55, qualityRef));
 
-        // 2) Age/trajectory factor (0-10).
-        //    Senior: reward youth-in-senior (long runway), penalise 30+
-        //    (declining). Youth: younger = more development runway.
-        //    Both ramp SMOOTHLY across the year (interpAgeSteps) rather
-        //    than stepping at the half-year — a 24y6w senior is 85% of
-        //    the way to the 25yo tier, so they score between the two,
-        //    not a flat 10. The breakpoint values are the old per-integer-
-        //    year scores, unchanged.
-        let ageScore;
-        if (isYouth) {
-            ageScore = interpAgeSteps(player.age, [[16, 10], [17, 9], [18, 8], [19, 6], [20, 4]]);
-        } else {
-            ageScore = interpAgeSteps(player.age, [[21, 10], [22, 10], [23, 10], [24, 10], [25, 7], [26, 7], [27, 7], [28, 4], [29, 4], [30, 1]]);
-        }
+        // 2) Age/trajectory factor (0-10) — ONE continuous lifecycle curve
+        //    for EVERY age (v8.65). The old two-curve split (youth declining
+        //    16->20, senior peaking 21-24) measured two different things —
+        //    "youth development runway remaining" vs "career prime" — and
+        //    the stitched seam produced a real cliff: the identical player
+        //    scored 4 at 20y14w (final youth week) and 10 at 21y1w, a
+        //    one-week 6-point swing that let a 20yo with a HIGHER to-25
+        //    ceiling rate BELOW a 21yo with a lower one, purely from the
+        //    boundary. Since the quality term already projects EVERYONE to
+        //    age 25, a 16yo's potential is already counted — there is no
+        //    separate "youth runway" left for this term to measure. So it
+        //    measures prime/decline only: flat at 10 across 16-24 (in prime,
+        //    or with a clear path into it — a 20y14w player is a week from
+        //    being a 21yo prime senior, not 60% of one), then the same
+        //    smooth decline 25+ (interpAgeSteps ramps within each year, so
+        //    a 24y6w player is 85% of the way to the 25yo tier).
+        const ageScore = interpAgeSteps(player.age, [[16, 10], [24, 10], [25, 7], [26, 7], [27, 7], [28, 4], [29, 4], [30, 1]]);
 
         // 3) Stat distribution (0-10) — a specialist's value comes from a
         //    deep primary + supporting skills, not a flat all-rounder sum.
@@ -886,27 +888,24 @@
         //    set explicitly here.
         const talentScore = Math.min(5, countAlignedTalents(player) * 1.5);
 
-        // Weight by senior/youth emphasis. No price, no squad-fit terms —
-        // those are market decisions (computeFairPrice / comparePlayerToSquadPeers),
+        // ONE weight set for EVERY age (v8.65). The old youth weights
+        // (1.0/1.2/0.6/0.4/0.8) discounted a youth's dist/value/talent
+        // terms relative to seniors (1.0/1.0/0.8/0.8/1.0), which stacked
+        // with the age cliff to systematically under-rate youth — a
+        // 57-ceiling 20yo could rate below a 51-ceiling 21yo. There is
+        // nothing age-specific left to weight differently: quality is the
+        // to-25 projection for every age, age comes from one shared curve,
+        // and value/dist/talent are player facts that don't change which
+        // squad a player is in. No price, no squad-fit terms — those are
+        // market decisions (computeFairPrice / comparePlayerToSquadPeers),
         // not player-quality, and leaving them out is what lets this one
         // number be shown identically for an owned player and a market
-        // candidate. Quality is the projected-to-25 skill-sum for EVERY age
-        // (v8.59 standardization) — already senior-comparable units, so it's
-        // weighted at parity (1.0), not discounted. The old 0.55 discount on
-        // top of the projection (and the v8.55 cost term) structurally capped every
-        // youth below seniors and made scores swing on asking price; a
-        // curve-meeting youth can now legitimately outrank an older senior,
-        // which is the whole point of the projection.
+        // candidate. A curve-meeting youth can now legitimately outrank an
+        // older senior, which is the whole point of the projection.
         let score, label;
-        if (isYouth) {
-            score = qualityScore * 1.0 + ageScore * 1.2 + distScore * 0.6 + valueScore * 0.4 + talentScore * 0.8;
-            score = Math.max(0, Math.min(100, score));
-            label = score >= 75 ? 'elite' : score >= 55 ? 'strong' : score >= 35 ? 'reasonable' : 'pass';
-        } else {
-            score = qualityScore * 1.0 + ageScore + distScore * 0.8 + valueScore * 0.8 + talentScore * 1.0;
-            score = Math.max(0, Math.min(100, score));
-            label = score >= 75 ? 'elite' : score >= 55 ? 'strong' : score >= 35 ? 'reasonable' : 'pass';
-        }
+        score = qualityScore * 1.0 + ageScore * 1.2 + distScore * 0.8 + valueScore * 0.8 + talentScore * 1.0;
+        score = Math.max(0, Math.min(100, score));
+        label = score >= 75 ? 'elite' : score >= 55 ? 'strong' : score >= 35 ? 'reasonable' : 'pass';
 
         return {
             score: Math.round(score * 10) / 10,
