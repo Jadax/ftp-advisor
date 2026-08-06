@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         FTP Advisor
 // @namespace    http://tampermonkey.net/
-// @version      8.61
-// @description  Comprehensive tactical advisor for From the Pavilion cricket game (v8.61: experienced-player feedback — senior training schedule now goes Fielding to Exceptional (batsmen / medium or finger spinners) or Spectacular (pace bowlers) then Strength/Endurance to Exceptional from ~25, finishers placed at 5-7 with the keeper at 6, and the drinks-break rest plan was rebuilt to RE-ALLOCATE over numbers side-aware since the old free-slot patch silently collided with the other end's overs in a fully-packed innings; v8.60: Dynasty Score / potential-future comparison now projected to age 25 for EVERY player on one scale, and the academy level is always re-scraped from the Academy page DOM so an upgrade propagates to all squad and market projections; v8.59: EVERY player's Overall Rating projects to age 25, and projections assume the academy upgrades toward Deluxe over time).
+// @version      8.62
+// @description  Comprehensive tactical advisor for From the Pavilion cricket game (v8.62: age is now WEEK-aware everywhere — per-year tables like the scout base / youth dev curve read the displayed year (16y13w = 16, no more half-year 16y5w-vs-16y6w flip), training multipliers and rating/rank age scores interpolate continuously across the year, and 20y13w is unambiguously still youth; weeksToAge's float guard stops a boundary player gaining a phantom 51st week; added a FILE MAP at the top of the script so any concern maps to a grep-able function name; v8.61: experienced-player feedback — senior training schedule now goes Fielding to Exceptional (batsmen / medium or finger spinners) or Spectacular (pace bowlers) then Strength/Endurance to Exceptional from ~25, finishers placed at 5-7 with the keeper at 6, and the drinks-break rest plan was rebuilt to RE-ALLOCATE over numbers side-aware since the old free-slot patch silently collided with the other end's overs in a fully-packed innings; v8.60: Dynasty Score / potential-future comparison now projected to age 25 for EVERY player on one scale, and the academy level is always re-scraped from the Academy page DOM so an upgrade propagates to all squad and market projections; v8.59: EVERY player's Overall Rating projects to age 25, and projections assume the academy upgrades toward Deluxe over time).
 // @author       Tushant Sharma
 // @license      MIT
 // @match        https://www.fromthepavilion.org/*
@@ -20,6 +20,56 @@
 
 (function() {
     'use strict';
+
+    // ============================================================
+    // FILE MAP — find a concern, jump straight to it.
+    // Every name below is grep-able; the `// ===== ...` banner above
+    // each block marks its section. Read this instead of the whole file.
+    //   AGE MODEL & PARSING:      parseGameAge, formatAgeDisplay, ageYears,
+    //       ageFraction, isYouthAge, interpAgeTableValue, interpAgeSteps
+    //   PLAYER RATINGS:           computePlayerValueSkillSum,
+    //       computePlayerValuePerK, computeSpareRating, computeOverallRating,
+    //       computePlayerCeiling, weeksToAge20, weeksToAge, classifyProjectedPrimary
+    //   MARKET PRICING:           loadPriceHistory, recordPlayerPrice,
+    //       anchorPriceForPlayer, computeFairPrice, fairPriceLine
+    //   CACHE & PAGE ROUTING:     _saveCache/_loadCacheWithAge,
+    //       savePlayerCache/loadPlayerCache, isStale, detectPageType,
+    //       fetchAllData, _loadCacheRaw
+    //   SQUAD PARSING:            parsePlayerRow, parseOpponentPlayerRow,
+    //       parseSummaryViewBlock, scrapeSummaryView, fetchSquadSummaryView,
+    //       mergeTalentsIntoPlayers
+    //   TRANSFER SCOUTING:        AGE_SCOUT_THRESHOLDS, checkScoutBenchmark,
+    //       evaluateTransferTarget, calculateRank, _mapTransferHeader,
+    //       parseTransferRow, fetchPlayerPageDetails, scrapeTransferResults
+    //   YOUTH DEVELOPMENT:        YOUTH_DEV_CURVE, evaluateYouthDevelopment,
+    //       evaluateYouthRecruit, projectYouthToAge20
+    //   TRAINING:                 AGE_TRAINING_MULTIPLIER,
+    //       getAgeTrainingMultiplier, estimateWeeklyTrainingGain,
+    //       recommendTraining, _recommendYouthTraining,
+    //       _recommendSeniorTraining, _recommendAgingTraining,
+    //       simulateTrainingPlan, simulateAdaptiveTrainingPlan,
+    //       academySpeedAtWeek, scrapeTrainingPage, weeksToNextLevel
+    //   TACTICS:                  calculateBattingScore, calculateBowlingScore,
+    //       recommendLineup, recommendBattingOrder, allocateBowlingSpells
+    //       (fixAdjacency/numberAndTactics/partitionSideSpells),
+    //       recommendTossDecision, analyzeOpposition
+    //   GROUND / ACADEMY:         recommendPitchForSquad, recommendCapacity,
+    //       recommendAcademyAction, scrapeAcademyPage, parseAcademyDoc
+    //   SQUAD PLAN & SELLS:       buildSquadPlan, buildSeniorSellRanking,
+    //       buildYouthSellRanking, computeRoleSurplus,
+    //       seniorTalentProtection, youthTalentProtection, computeSquadStats
+    //   OPPONENT SCOUTING:        getOpponentTeamId,
+    //       extractOpponentTeamIdFromGame, fetchOpponentSquad,
+    //       scrapeOpponentSquad, fetchUpcomingFixtures
+    //   PLAYER ADVISOR:           scrapePlayerDetailPage, updatePlayerAdvisor,
+    //       comparePlayerToSquadPeers
+    //   PER-PAGE UI:              updateSquadAdvisor, updateOrdersAdvisor,
+    //       updateTrainingAdvisor, updateTransferAdvisor, updateGroundAdvisor,
+    //       updateAcademyAdvisor, updateYouthRecruitAdvisor,
+    //       updateClubStatusUI, updateMatchesAdvisor
+    //   SHARED UI LIB:            createPanel, addCommonStyles, makeDraggable,
+    //       computeConfidence, renderConfidenceBadge, escapeHtml
+    // ============================================================
 
     // Debug logging off by default (public userscript). Enable: localStorage.ftpDebug = '1'
     const FTP_DEBUG = (() => {
@@ -182,6 +232,60 @@
         const years = Math.floor(age);
         const weeks = Math.round((age - years) * 14);
         return weeks > 0 ? `${years}y${weeks}w` : `${years}`;
+    }
+
+    // ============================================================
+    // AGE MODEL — how "years + weeks" is read everywhere.
+    // The game tracks age as years + a week out of 14 (parseGameAge
+    // above). There are two genuinely different ways to read that one
+    // float, and picking the wrong one is exactly how the half-year
+    // "16y5w = 16, 16y6w = 17" cliffs and the 20y13w boundary bugs
+    // creeped in. The decision now lives here ONCE (v8.62) so callers
+    // stop re-deriving Math.round/Math.floor and drifting apart:
+    //   * ageYears(age)      — the year the player is CURRENTLY in
+    //     (floor). For per-year TABLE lookups and "age N" labels:
+    //     AGE_SCOUT_THRESHOLDS, YOUTH_DEV_CURVE, SENIOR_MINS_*. A
+    //     player does not become 17 at 16y7w — they are still 16 until
+    //     17.0, exactly as the game displays them.
+    //   * ageFraction(age)   — 0..<1 progress through that year
+    //     (weeks/14), for CONTINUOUS values that should ramp smoothly
+    //     (training speed, rating/rank age scores) rather than step.
+    //   * isYouthAge(age)    — the 20/21 senior-squad boundary, read
+    //     continuously (a 20y13w player has not turned 21).
+    // ============================================================
+    function ageYears(age) { return Math.floor(age || 0); }
+    function ageFraction(age) { const a = age || 0; return a - Math.floor(a); }
+    function isYouthAge(age) { return (age || 0) < 21; }
+
+    // Linear interpolation of one numeric field of a per-year table
+    // between the current year's row and the next year's (weeks-progress
+    // through the year). Returns null when the current year has no row
+    // (caller decides the fallback); the top year clamps to its own row.
+    // Rows are keyed by integer year (e.g. AGE_TRAINING_MULTIPLIER).
+    function interpAgeTableValue(table, age, field) {
+        const y = ageYears(age);
+        const lo = table[y];
+        if (lo == null || lo[field] == null) return null;
+        const hi = table[y + 1];
+        if (hi == null || hi[field] == null) return lo[field];
+        return lo[field] + (hi[field] - lo[field]) * ageFraction(age);
+    }
+
+    // Piecewise-linear score across age breakpoints [[year, value], ...].
+    // The values ARE the old per-integer-year scores (kept identical, so
+    // a player exactly on a year boundary scores exactly as before); the
+    // difference is the score now ramps smoothly across the 14-week year
+    // instead of stepping at the half-year. Clamps outside the range.
+    function interpAgeSteps(age, steps) {
+        const a = age || 0;
+        if (a <= steps[0][0]) return steps[0][1];
+        for (let i = 0; i < steps.length - 1; i++) {
+            if (a < steps[i + 1][0]) {
+                const [y0, v0] = steps[i], [y1, v1] = steps[i + 1];
+                return v0 + (v1 - v0) * ((a - y0) / (y1 - y0));
+            }
+        }
+        return steps[steps.length - 1][1];
     }
 
     // Which discipline (batting/bowling/keeping) is this player's actual
@@ -407,7 +511,7 @@
             t: Date.now(),
             role: primaryInfo.name, // 'batting' | 'bowling' | 'keeping'
             isYouth: (player.age || 0) < 21,
-            age: Math.round(player.age || 0), // v8.57 — pricing scales hugely with age (a 16yo and a 20yo are NOT the same market), so anchors must bucket by age band too
+            age: ageYears(player.age || 0), // v8.57 — pricing scales hugely with age (a 16yo and a 20yo are NOT the same market), so anchors must bucket by age band too; ageYears (floor) so the band matches the player's displayed age-year
             primary: primaryInfo.value,
             sum: computePlayerValueSkillSum(player), // visible-quality baseline so computeFairPrice can scale the anchor to a specific candidate (visible only — talents aren't in the transfer list scrape)
             price: price || 0,
@@ -437,7 +541,7 @@
         const primaryInfo = getPrimarySkillInfo(player);
         const role = primaryInfo.name;
         const isYouth = (player.age || 0) < 21;
-        const age = Math.round(player.age || 0);
+        const age = ageYears(player.age || 0);
         const primary = primaryInfo.value;
         const cutoff = Date.now() - 60 * 24 * 60 * 60 * 1000;
         const base = (e) => e.t >= cutoff && e.role === role && e.isYouth === isYouth && e.price > 0;
@@ -499,13 +603,14 @@
         return `<div class="vj-text-xs" style="color:${color};line-height:1.4;margin-top:2px;">\u2696 Fair price ~$${Math.round(fp.fair).toLocaleString()}${range} (${fp.count} similar seen)${asking > 0 ? ` \u00B7 asking $${asking.toLocaleString()} \u2192 ${tag}` : ''}</div>`;
     }
 
-    // Shared by projectYouthToAge20() and computePlayerCeiling() so "weeks
-    // until this youth turns 20" lives in exactly one formula instead of
-    // two copies quietly drifting apart (the exact class of bug the
-    // AGE_SKILL_EXPECTATIONS/YOUTH_DEV_CURVE duplication was, removed
-    // v8.21 — see the Map section).
+    // Weeks until this player turns 20 — the youth promotion boundary.
+    // Delegates to weeksToAge() (14 weeks per age-year, see parseGameAge
+    // / the 14-not-52 rule) so "weeks to a target age" lives in exactly
+    // one formula instead of two copies quietly drifting apart (the same
+    // class of bug the AGE_SKILL_EXPECTATIONS/YOUTH_DEV_CURVE duplication
+    // was, removed v8.21 — see the Map section).
     function weeksToAge20(age) {
-        return Math.ceil((20 - (age || 16)) * 14);
+        return weeksToAge(age, 20);
     }
 
     // Weeks from the player's current age to a target age (14 weeks per
@@ -515,7 +620,11 @@
     // promotion boundary, which understated what they'll contribute once
     // they become seniors.
     function weeksToAge(age, targetAge) {
-        return Math.max(0, Math.ceil((targetAge - (age || 16)) * 14));
+        // -1e-9 guards float drift at exact week boundaries: (20 - 16.42857)*14
+        // can evaluate to 50.00000000000002, which Math.ceil would wrongly
+        // round up to a 51st week for a player exactly 6 weeks into their
+        // 16th year (they need exactly 50 weeks to turn 20).
+        return Math.max(0, Math.ceil((targetAge - (age || 16)) * 14 - 1e-9));
     }
 
     // Community-consensus assessment thresholds for a projected primary
@@ -656,7 +765,7 @@
     function computeOverallRating(player, opts) {
         if (!opts) return { score: 0, label: 'no-context', parts: {}, breakdown: [] };
         const breakdown = [];
-        const isYouth = Math.round(player.age) < 21;
+        const isYouth = isYouthAge(player.age);
         const primaryInfo = getPrimarySkillInfo(player);
         const role = primaryInfo.name;
         const roleLabel = role === 'keeping' ? 'wicketkeeper' : role === 'bowling' ? 'bowler' : 'batter';
@@ -693,14 +802,17 @@
         // 2) Age/trajectory factor (0-10).
         //    Senior: reward youth-in-senior (long runway), penalise 30+
         //    (declining). Youth: younger = more development runway.
+        //    Both ramp SMOOTHLY across the year (interpAgeSteps) rather
+        //    than stepping at the half-year — a 24y6w senior is 85% of
+        //    the way to the 25yo tier, so they score between the two,
+        //    not a flat 10. The breakpoint values are the old per-integer-
+        //    year scores, unchanged.
         let ageScore;
         if (isYouth) {
-            const age = Math.round(player.age);
-            ageScore = age <= 16 ? 10 : age <= 17 ? 9 : age <= 18 ? 8 : age <= 19 ? 6 : 4;
-        } else if (Math.round(player.age) <= 24) { ageScore = 10; }
-        else if (Math.round(player.age) <= 27) { ageScore = 7; }
-        else if (Math.round(player.age) <= 29) { ageScore = 4; }
-        else { ageScore = 1; }
+            ageScore = interpAgeSteps(player.age, [[16, 10], [17, 9], [18, 8], [19, 6], [20, 4]]);
+        } else {
+            ageScore = interpAgeSteps(player.age, [[21, 10], [22, 10], [23, 10], [24, 10], [25, 7], [26, 7], [27, 7], [28, 4], [29, 4], [30, 1]]);
+        }
 
         // 3) Stat distribution (0-10) — a specialist's value comes from a
         //    deep primary + supporting skills, not a flat all-rounder sum.
@@ -954,7 +1066,13 @@
      * Returns { hasBenchmark, passed, failed: string[], met: string[] }.
      */
     function checkScoutBenchmark(player) {
-        const age = Math.round(player.age);
+        // ageYears (floor), not round: the "age 16" base was transcribed
+        // from a saved Talent Scout search that returns every player the
+        // game DISPLAYS as 16 (16.0-16.93). Rounding bumped 16y7w+ players
+        // onto the "17" base half a year early — a half-year cliff with no
+        // basis in the source data. A player stays on their displayed year's
+        // base until they actually turn the next age.
+        const age = ageYears(player.age);
         const t = AGE_SCOUT_THRESHOLDS[age] || (age > 27 ? AGE_SCOUT_THRESHOLDS[27] : null);
         if (!t) return { hasBenchmark: false, passed: true, failed: [], met: [] };
 
@@ -1029,9 +1147,24 @@
         32: { primary: 0.20, power: 0.50, endurance: 0.80 }
     };
 
+    // Age-based training-speed multipliers, interpolated by WEEKS through
+    // the current year (v8.62). Previously rounded the age to a whole
+    // year, which made a 16y6w player train at the full age-16 rate and a
+    // 16y7w player jump straight to the age-17 rate — a cliff at the
+    // half-year for a decay that actually happens continuously. Training
+    // speed is a continuous quantity, so it now lerps between the current
+    // year's row and the next year's using the player's actual weeks
+    // (e.g. 16y6w primary = 1.20 - (6/14)*(1.20-1.15) ≈ 1.178). Age 33+
+    // is not modelled in the source sheet and is clamped to the age-32
+    // rate (the interpolation's top-year clamp does this automatically).
     function getAgeTrainingMultiplier(age) {
-        const clamped = Math.max(16, Math.min(32, Math.round(age)));
-        return AGE_TRAINING_MULTIPLIER[clamped] || { primary: 0.20, power: 0.50, endurance: 0.80 };
+        const c = Math.max(16, Math.min(32, age || 0));
+        const out = { primary: 0.20, power: 0.50, endurance: 0.80 };
+        ['primary', 'power', 'endurance'].forEach(f => {
+            const v = interpAgeTableValue(AGE_TRAINING_MULTIPLIER, c, f);
+            if (v != null) out[f] = v;
+        });
+        return out;
     }
 
     // Skill-level slowdown (Refs!I15:J23). Once a skill reaches
@@ -1100,7 +1233,10 @@
     // or the target table has nothing for their age. Otherwise returns a
     // per-stat breakdown so the UI can show exactly what's behind/ahead.
     function evaluateYouthDevelopment(player) {
-        const age = Math.round(player.age);
+        // Same floor-based year lookup as checkScoutBenchmark: the "age 16"
+        // curve is the target for anyone the game displays as 16, all the
+        // way to 16y13w — not just the first half of the year.
+        const age = ageYears(player.age);
         const target = YOUTH_DEV_CURVE[age];
         if (!target) return null;
 
@@ -1900,7 +2036,7 @@
      * verdict: 'elite' | 'strong' | 'adequate' | 'weak' | 'poor'
      */
     function evaluateTransferTarget(player, squadStats) {
-        const age = Math.round(player.age);
+        const age = ageYears(player.age);
         const warnings = [];
         const strengths = [];
         let score = 0;
@@ -2258,7 +2394,7 @@
     // Skill-first, cost as tiebreaker
     function calculateRank(player, squadStats) {
         if (!player) return 0;
-        const age = Math.round(player.age);
+        const age = ageYears(player.age);
         const isYouth = age < 21;
         const primary = getPrimarySkillInfo(player).value;
 
@@ -2293,14 +2429,17 @@
             surplusScore = Math.min(2, totalSurplus * 0.25);
         }
 
-        // 3. Age value (0-1.5 points)
+        // 3. Age value (0-1.5 points) — ramps smoothly across the year
+        //    (interpAgeSteps), so a 24y6w senior scores halfway between
+        //    the 24yo peak tier and the 25yo next tier rather than a flat
+        //    1.5 until the instant they turn 25.
         let ageScore = 0;
         if (isYouth) {
             // Younger = more development time
-            ageScore = age <= 16 ? 1.5 : age <= 17 ? 1.2 : age <= 18 ? 0.9 : age <= 19 ? 0.5 : 0.2;
+            ageScore = interpAgeSteps(player.age, [[16, 1.5], [17, 1.2], [18, 0.9], [19, 0.5], [20, 0.2]]);
         } else {
             // Peak at 24-26, decline after
-            ageScore = (age >= 24 && age <= 26) ? 1.5 : (age >= 22 && age <= 23) ? 1.0 : (age <= 21) ? 0.8 : 0.3;
+            ageScore = interpAgeSteps(player.age, [[21, 0.8], [22, 1.0], [23, 1.0], [24, 1.5], [25, 1.5], [26, 1.5], [27, 0.3], [28, 0.3], [29, 0.3], [30, 0.3]]);
         }
 
         // 4. Talents (0-1 point) — role-aligned count, not raw count.
@@ -4661,10 +4800,7 @@
     }
 
     // ============================================================
-    // TACTICAL ADVICE GENERATOR
-    // ============================================================
-    // ============================================================
-    // ORDERS PAGE SCRAPER
+    // ORDERS PAGE SCRAPER + UI
     // ============================================================
     function scrapeAvailablePlayers() {
         const players = [];
@@ -7845,7 +7981,7 @@ table.ftp-table {
                     // Squad-peer comparison computed up front (not just at
                     // render time) so it can gate the senior filter below,
                     // not just annotate the card afterwards.
-                    const peerCompare = (Math.round(p.age) >= 21) ? comparePlayerToSquadPeers(p, seniorPlayers) : null;
+                    const peerCompare = (ageYears(p.age) >= 21) ? comparePlayerToSquadPeers(p, seniorPlayers) : null;
                     return { ...p, eval: ev, peerCompare };
                 });
 
@@ -7858,7 +7994,7 @@ table.ftp-table {
                 const SENIOR_MAX_AGE = 27;
 
                 const ageFiltered = evaluated.filter(e => {
-                    const age = Math.round(e.age);
+                    const age = ageYears(e.age);
                     return age >= 21 && age > SENIOR_MAX_AGE;
                 }).length;
 
@@ -7877,7 +8013,7 @@ table.ftp-table {
                 // against an age curve, not like-for-like swaps, so
                 // "better than your current squad" doesn't apply yet.
                 function isWorthShowing(e) {
-                    const age = Math.round(e.age);
+                    const age = ageYears(e.age);
                     const isYouth = age < 21;
                     if (!isYouth && age > SENIOR_MAX_AGE) {
                         e.eval.warnings.push(`Age ${age} — past prime years for senior transfer`);
@@ -7906,8 +8042,8 @@ table.ftp-table {
                 // hard-filter miss from a scrape/column-mapping gap
                 // (e.g. the v8.11/v8.12 always-0 bugs) without re-reading
                 // the scoring code each time.
-                const youthEval = evaluated.filter(e => Math.round(e.age) < 21);
-                const seniorEval = evaluated.filter(e => Math.round(e.age) >= 21);
+                const youthEval = evaluated.filter(e => ageYears(e.age) < 21);
+                const seniorEval = evaluated.filter(e => ageYears(e.age) >= 21);
                 // Reuses `filtered` (computed above) rather than calling
                 // isWorthShowing again — it pushes into e.eval.warnings as
                 // a side effect, and re-running it here would duplicate
@@ -8184,7 +8320,7 @@ table.ftp-table {
                             // candidateRank can shift slightly with real
                             // experience now known — recompute for consistency
                             // with the same isWorthShowing gate used above.
-                            p.peerCompare = (Math.round(p.age) >= 21) ? comparePlayerToSquadPeers(p, seniorPlayers) : null;
+                            p.peerCompare = (ageYears(p.age) >= 21) ? comparePlayerToSquadPeers(p, seniorPlayers) : null;
                         });
                         // Recompute Dynasty + Overall Rating now that wage/
                         // talent are known (they feed the rating's value and
@@ -8195,11 +8331,11 @@ table.ftp-table {
                             (b._overallRating && b._overallRating.score || 0) - (a._overallRating && a._overallRating.score || 0) ||
                             (verdictOrder[a.eval.verdict] ?? 9) - (verdictOrder[b.eval.verdict] ?? 9) ||
                             (a.price || 0) - (b.price || 0));
-                        logSquadGapDiagnostic(priorityBuys.filter(p => Math.round(p.age) >= 21));
+                        logSquadGapDiagnostic(priorityBuys.filter(p => ageYears(p.age) >= 21));
                         // Re-filter with the exact same rule as the initial
                         // pass (elite + genuine squad upgrade for seniors).
                         const reFiltered = priorityBuys.filter(isWorthShowing);
-                        const reAgeFiltered = priorityBuys.filter(p => { const age = Math.round(p.age); return age >= 21 && age > SENIOR_MAX_AGE; }).length;
+                        const reAgeFiltered = priorityBuys.filter(p => { const age = ageYears(p.age); return age >= 21 && age > SENIOR_MAX_AGE; }).length;
                         const reVerdictFiltered = priorityBuys.length - reAgeFiltered - reFiltered.length;
                         resultsEl.innerHTML = renderTransferResults(reFiltered, evaluated.length, reAgeFiltered, reVerdictFiltered, true);
                     });
@@ -8416,7 +8552,7 @@ table.ftp-table {
         scored.forEach((r, i) => {
             const sev = r.s >= 20 ? 'critical' : r.s >= 10 ? 'high' : 'medium';
             const cause = r.reasons.length ? r.reasons.join(' · ') : `score ${r.s}`;
-            html += `<div class="vj-text-xs" style="color:var(--vj-${sev === 'critical' ? 'red' : sev === 'high' ? 'amber' : 'muted'});margin-top:2px;">${i + 1}. <strong>${r.player.name}</strong> (age ${Math.round(r.player.age)}, ${skillLabel(getPrimarySkillInfo(r.player).value)}) — ${cause}</div>`;
+            html += `<div class="vj-text-xs" style="color:var(--vj-${sev === 'critical' ? 'red' : sev === 'high' ? 'amber' : 'muted'});margin-top:2px;">${i + 1}. <strong>${r.player.name}</strong> (age ${ageYears(r.player.age)}, ${skillLabel(getPrimarySkillInfo(r.player).value)}) — ${cause}</div>`;
         });
         return html;
     }
@@ -9031,7 +9167,7 @@ table.ftp-table {
         const cache = loadPlayerCache();
         const squadPlayers = cache ? cache.players : [];
         const squadStats = computeSquadStats(squadPlayers);
-        const isYouth = Math.round(player.age) < 21;
+        const isYouth = isYouthAge(player.age);
         const evalResult = evaluateTransferTarget(player, squadStats);
         const rank = calculateRank(player, squadStats);
         const keepVerdict = evalResult.verdict === 'poor' || evalResult.verdict === 'weak' ? 'RELEASE' : 'KEEP';
@@ -9067,7 +9203,7 @@ table.ftp-table {
         const overallRating = computeOverallRating(player, { academySpeed, squadContext, seniorCeiling: dynastyCeiling });
 
         let html = `<div class="vj-flex-between vj-mb-4">
-                <span class="vj-fw-700" style="font-size:14px;">${player.name} <span class="vj-text-xs vj-text-muted">(${Math.round(player.age)}yo)</span></span>
+                <span class="vj-fw-700" style="font-size:14px;">${player.name} <span class="vj-text-xs vj-text-muted">(${formatAgeDisplay(player.age)}yo)</span></span>
                 <div style="display:flex;gap:4px;align-items:center;">
                     <span class="ftp-stat-badge ${badgeClass}" style="font-size:13px;">${keepVerdict}</span>
                     ${overallRatingBadge(overallRating)}
