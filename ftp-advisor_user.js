@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         FTP Advisor
 // @namespace    http://tampermonkey.net/
-// @version      8.62
-// @description  Comprehensive tactical advisor for From the Pavilion cricket game (v8.62: age is now WEEK-aware everywhere — per-year tables like the scout base / youth dev curve read the displayed year (16y13w = 16, no more half-year 16y5w-vs-16y6w flip), training multipliers and rating/rank age scores interpolate continuously across the year, and 20y13w is unambiguously still youth; weeksToAge's float guard stops a boundary player gaining a phantom 51st week; added a FILE MAP at the top of the script so any concern maps to a grep-able function name; v8.61: experienced-player feedback — senior training schedule now goes Fielding to Exceptional (batsmen / medium or finger spinners) or Spectacular (pace bowlers) then Strength/Endurance to Exceptional from ~25, finishers placed at 5-7 with the keeper at 6, and the drinks-break rest plan was rebuilt to RE-ALLOCATE over numbers side-aware since the old free-slot patch silently collided with the other end's overs in a fully-packed innings; v8.60: Dynasty Score / potential-future comparison now projected to age 25 for EVERY player on one scale, and the academy level is always re-scraped from the Academy page DOM so an upgrade propagates to all squad and market projections; v8.59: EVERY player's Overall Rating projects to age 25, and projections assume the academy upgrades toward Deluxe over time).
+// @version      8.63
+// @description  Comprehensive tactical advisor for From the Pavilion cricket game (v8.63: the Dynasty Score is now an audited, tamper-proof differentiator - experience is folded into the weighted value sum per your weight list (primary/technique/fielding/endurance/experience) and projected honestly toward the scout-benchmark per-age expectation scaled by remaining runway (a 21.5yo exp 4 projects to ~6, never reduces, weeks=0 keeps ceiling==current), while power stays out since it's a batting-only stroke skill that would bias bowler/keeper scores - verified with a new 31-assertion dynastyaudit harness (academy/runway/talent/wage-price sensitivity all confirmed) plus a full regression; v8.62: age is now WEEK-aware everywhere — per-year tables like the scout base / youth dev curve read the displayed year (16y13w = 16, no more half-year 16y5w-vs-16y6w flip), training multipliers and rating/rank age scores interpolate continuously across the year, and 20y13w is unambiguously still youth; weeksToAge's float guard stops a boundary player gaining a phantom 51st week; added a FILE MAP at the top of the script so any concern maps to a grep-able function name; v8.61: experienced-player feedback — senior training schedule now goes Fielding to Exceptional (batsmen / medium or finger spinners) or Spectacular (pace bowlers) then Strength/Endurance to Exceptional from ~25, finishers placed at 5-7 with the keeper at 6, and the drinks-break rest plan was rebuilt to RE-ALLOCATE over numbers side-aware since the old free-slot patch silently collided with the other end's overs in a fully-packed innings; v8.60: Dynasty Score / potential-future comparison now projected to age 25 for EVERY player on one scale, and the academy level is always re-scraped from the Academy page DOM so an upgrade propagates to all squad and market projections; v8.59: EVERY player's Overall Rating projects to age 25, and projections assume the academy upgrades toward Deluxe over time).
 // @author       Tushant Sharma
 // @license      MIT
 // @match        https://www.fromthepavilion.org/*
@@ -379,8 +379,12 @@
      * - Primary skill (batting/bowling/keeping, via getPrimarySkillInfo)
      *   counted double — it's the actual reason this player is picked
      *   and paid; everything else is supporting.
-     * - Technique/fielding/endurance count once each — real supporting
-     *   contributors for every role.
+     * - Technique/fielding/endurance/experience count once each — real
+     *   supporting contributors for every role. Experience was added in
+     *   v8.63 per the user's explicit weight list (primary, technique,
+     *   fielding, endurance, experience); power is deliberately NOT in
+     *   the sum — the same user list omitted it, and it's batting-oriented
+     *   (stroke power) while this number is a universal comparator.
      * - Keepers ALSO get half credit for batting (they need to be a
      *   competent batsman too, not a specialist one — see
      *   keeperBattingMin()'s reasoning from the transfer-scouting work).
@@ -403,6 +407,7 @@
         sum += player.technique || 0;
         sum += player.fielding || 0;
         sum += player.endurance || 0;
+        sum += player.experience || 0;
         if (primaryInfo.name === 'keeping') sum += (player.batting || 0) * 0.5;
 
         // Role-aligned only — a mismatched role-specific talent (e.g.
@@ -705,6 +710,27 @@
             : (isYouth ? 'to age 20' : (age >= 30 ? '1 age-year outlook' : '2 age-year outlook'));
         const plan = simulateAdaptiveTrainingPlan(player, weeks, academySpeed, squadContext);
         const projectedSkills = Object.assign({}, player, plan.finalSkills);
+
+        // Experience is a real value driver (see computePlayerValueSkillSum)
+        // but CANNOT be projected by the training sim — the game grows it
+        // through matchplay, not training. Carrying today's value forward
+        // unchanged would under-rate every youth's ceiling by the experience
+        // they'll realistically have accrued by the horizon (a 16yo with exp
+        // 2 would still be exp 2 at 25). Project instead toward the game's
+        // own per-age expectation (AGE_SCOUT_THRESHOLDS' experience rows —
+        // real data from the user's saved scout searches), scaled by how
+        // much of the full 16→25 career window (9 age-years = 126 weeks)
+        // this player has left. Never reduces: a player already above the
+        // expectation keeps their real number, and weeks=0 (already past
+        // the horizon) → no growth → ceiling==current invariant preserved.
+        const horizonAge = age + weeks / 14;
+        const expTableAge = Math.min(horizonAge, 26); // table tops out at 26
+        const expectedExp = interpAgeTableValue(AGE_SCOUT_THRESHOLDS, expTableAge, 'experience');
+        const careerFrac = Math.min(1, weeks / (9 * 14));
+        const currentExp = player.experience || 0;
+        if (expectedExp != null) {
+            projectedSkills.experience = Math.max(currentExp, Math.round(currentExp + (expectedExp - currentExp) * careerFrac));
+        }
         return {
             current: computePlayerValueSkillSum(player),
             ceiling: computePlayerValueSkillSum(projectedSkills),
