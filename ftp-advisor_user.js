@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         FTP Advisor
 // @namespace    http://tampermonkey.net/
-// @version      8.69
+// @version      8.70
 // @description  Tactical/scouting advisor for fromthepavilion.org (cricket sim): team, tactics, pitch, training, transfer market, youth and squad plan advice with projections. Full changelog: github.com/Jadax/ftp-advisor
 // @author       Tushant Sharma
 // @license      MIT
@@ -6700,10 +6700,20 @@ table.ftp-table {
 
     // Helper: detect player role + talent flags (shared by all paths)
     function _detectPlayerContext(player) {
-        const isBatsman = player.batting >= player.bowling && player.batting >= player.keeping;
-        const isBowler = player.bowling > player.batting && player.bowling > player.keeping;
-        const isKeeper = player.keeping >= player.batting && player.keeping >= player.bowling && player.keeping >= 4;
-        const isAllrounder = Math.abs(player.batting - player.bowling) <= 2 && player.batting >= 4 && player.bowling >= 4;
+        // Routed through the same getPrimarySkillInfo() every other
+        // role-detection site in this file uses, rather than an
+        // independent ad hoc comparison that merely happened to agree
+        // with it (both used a keeping>=4 threshold) — this is the exact
+        // kind of near-duplicate logic that has silently drifted apart
+        // elsewhere in this file before (see evaluateYouthRecruit's fix,
+        // same session). This function drives ALL training
+        // recommendations (senior/aging/youth staging), so keeping it on
+        // the one canonical implementation matters more here than most.
+        const primaryInfo = getPrimarySkillInfo(player);
+        const isBatsman = primaryInfo.name === 'batting';
+        const isBowler = primaryInfo.name === 'bowling';
+        const isKeeper = primaryInfo.name === 'keeping';
+        const isAllrounder = !isKeeper && Math.abs(player.batting - player.bowling) <= 2 && player.batting >= 4 && player.bowling >= 4;
         const isWristSpinner = player.bowlerType === 'rws' || player.bowlerType === 'lws';
         const isProdigy = player.talents.some(t => t.toLowerCase().includes('prodigy'));
         const hasGiftedBatting = player.talents.some(t => t.toLowerCase().includes('gifted') && t.toLowerCase().includes('batting'));
@@ -7414,9 +7424,19 @@ table.ftp-table {
         const talents = player.talents || [];
 
         // --- SCORING ---
-        // Primary skill (what they're best at)
-        const primarySkill = Math.max(batting, bowling, keeping);
-        const primaryName = primarySkill === keeping ? 'keeping' : primarySkill === bowling ? 'bowling' : 'batting';
+        // Primary skill (what they're best at) — routed through the same
+        // getPrimarySkillInfo() every other role-detection site in this
+        // file uses (transfer scouting, sell lists, tactics, Dynasty
+        // Score). This function used to compute its own independent
+        // Math.max(batting, bowling, keeping) + a keeper threshold of 3
+        // (vs getPrimarySkillInfo's 4) — the exact class of duplicate-
+        // logic drift that has caused real reported bugs elsewhere in
+        // this file before (a genuine keeper judged on bat/bowl instead
+        // of keeping, a 0/0 no-data player misclassified as a bowler).
+        // One canonical implementation now, not a second near-copy.
+        const primaryInfo = getPrimarySkillInfo(player);
+        const primarySkill = primaryInfo.value;
+        const primaryName = primaryInfo.name;
 
         // Talent bonuses (from wiki: Gifted trains faster, Skilled matches better, Prodigy trains all faster)
         let talentScore = 0;
@@ -7456,11 +7476,15 @@ table.ftp-table {
         // Total score
         result.score = Math.round((skillScore + talentScore + ageBonus) * 10) / 10;
 
-        // --- ROLE DETECTION ---
-        const isBatsman = batting >= bowling && batting >= keeping;
-        const isBowler = bowling > batting && bowling > keeping;
-        const isKeeper = keeping >= batting && keeping >= bowling && keeping >= 3;
-        const isAllrounder = Math.abs(batting - bowling) <= 2 && batting >= 3 && bowling >= 3;
+        // --- ROLE DETECTION --- derived from the same primaryName above,
+        // not a second independent comparison (see the comment on
+        // primaryInfo). isAllrounder is a genuinely distinct concept
+        // (close bat/bowl regardless of which one primaryName lands on)
+        // so it stays its own check.
+        const isKeeper = primaryName === 'keeping';
+        const isBowler = primaryName === 'bowling';
+        const isBatsman = primaryName === 'batting';
+        const isAllrounder = !isKeeper && Math.abs(batting - bowling) <= 2 && batting >= 3 && bowling >= 3;
 
         if (isProdigy) result.roleFit = 'All (Prodigy trains all faster)';
         else if (isKeeper) result.roleFit = 'Wicketkeeper-Batsman';
