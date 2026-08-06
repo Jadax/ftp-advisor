@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         FTP Advisor
 // @namespace    http://tampermonkey.net/
-// @version      8.66
+// @version      8.67
 // @description  Tactical/scouting advisor for fromthepavilion.org (cricket sim): team, tactics, pitch, training, transfer market, youth and squad plan advice with projections. Full changelog: github.com/Jadax/ftp-advisor
 // @author       Tushant Sharma
 // @license      MIT
@@ -1080,14 +1080,14 @@
         24: { primary: 11, technique: 11, experience: 8, fielding: 7 },
         25: { primary: 11, technique: 11, experience: 8, fielding: 8 },
         26: { primary: 11, technique: 11, experience: 8, fielding: 8 },
-        27: { primary: 11, technique: 11, fielding: 9, power: 8 },
+        27: { primary: 11, technique: 11, fielding: 9 },
     };
 
     /**
      * Check a transfer target (youth or senior) against "the base" —
      * the age-specific scout benchmarks above. This is a HARD filter on
      * ONLY the fields defined for that age (primary, technique,
-     * experience, fielding, and where present power/rating) — a player
+     * experience, fielding, and where present rating) — a player
      * must meet 100% of those or is filtered out. Every other skill
      * (endurance, keeping, etc.) is intentionally NOT gated here: higher
      * is simply better and that's handled by the scoring/ranking logic
@@ -1134,7 +1134,6 @@
             const battingMin = keeperBattingMin(t.primary);
             checks.push({ name: 'Batting (WK)', value: player.batting || 0, min: battingMin, known: (player.batting || 0) > 0 });
         }
-        if (t.power != null) checks.push({ name: 'Power', value: player.power || 0, min: t.power, known: (player.power || 0) > 0 });
         if (t.rating != null) checks.push({ name: 'Rating', value: player.rating || 0, min: t.rating, known: (player.rating || 0) > 0, isMoney: true });
 
         const fmt = (c, v) => c.isMoney ? v.toLocaleString() : skillLabel(v);
@@ -1243,8 +1242,8 @@
         17: { primary: 5, technique: 5, fielding: 5 },                                   // Reasonable
         18: { primary: 6, primaryGood: 7, technique: 6, techniqueGood: 7, fielding: 6 },  // Capable→Reliable / Capable
         19: { primary: 8, technique: 8, fielding: 6, fieldingGood: 7 },                   // Accomplished / Capable+
-        20: { primary: 9, technique: 9, fielding: 7, fieldingGood: 8,                     // Expert / Reliable→Accomplished
-              endurance: 3, experience: 3 }                                               // Ordinary+
+20: { primary: 9, technique: 9, fielding: 8,                                    // Expert / Accomplished
+             endurance: 3, experience: 3 }                                               // Ordinary+
     };
 
     // Delegates to getPrimarySkillInfo() — this used to be a separate
