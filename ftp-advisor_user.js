@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         FTP Advisor
 // @namespace    http://tampermonkey.net/
-// @version      8.67
+// @version      8.68
 // @description  Tactical/scouting advisor for fromthepavilion.org (cricket sim): team, tactics, pitch, training, transfer market, youth and squad plan advice with projections. Full changelog: github.com/Jadax/ftp-advisor
 // @author       Tushant Sharma
 // @license      MIT
@@ -1267,6 +1267,11 @@
     // Returns null if the player is outside the tracked age window (16-20)
     // or the target table has nothing for their age. Otherwise returns a
     // per-stat breakdown so the UI can show exactly what's behind/ahead.
+    // Since v8.68 "behind" is TIME-AWARE: a below-target trainable stat is
+    // only 'behind' if it can't realistically reach its target before the
+    // player's displayed age increments (see the feasibility logic below);
+    // if it can, the row is 'catching-up' instead. Statuses: ahead /
+    // on-track / catching-up / behind. overallStatus is the worst of these.
     function evaluateYouthDevelopment(player) {
         // Same floor-based year lookup as checkScoutBenchmark: the "age 16"
         // curve is the target for anyone the game displays as 16, all the
@@ -1277,28 +1282,95 @@
 
         const primaryStatName = getYouthPrimarySkillName(player);
         const primaryValue = player[primaryStatName] || 0;
+        const techniqueProgram = primaryStatName === 'keeping' ? 'keeperbatting' : primaryStatName === 'bowling' ? 'bowlingtech' : 'battingtech';
         const rows = [
-            { label: `Primary (${primaryStatName})`, value: primaryValue, min: target.primary, good: target.primaryGood },
-            { label: 'Technique', value: player.technique || 0, min: target.technique, good: target.techniqueGood },
-            { label: 'Fielding', value: player.fielding || 0, min: target.fielding, good: target.fieldingGood }
+            { label: `Primary (${primaryStatName})`, skill: primaryStatName, value: primaryValue, min: target.primary, good: target.primaryGood },
+            { label: 'Technique', skill: 'technique', value: player.technique || 0, min: target.technique, good: target.techniqueGood },
+            { label: 'Fielding', skill: 'fielding', value: player.fielding || 0, min: target.fielding, good: target.fieldingGood }
         ];
         if (primaryStatName === 'keeping') {
             // User's note: wicketkeepers are judged on keeping AND batting,
             // not keeping alone — but batting is a secondary requirement,
             // not held to the same bar as keeping itself (keeperBattingMin
             // shared with the transfer-scouting hard filters below).
-            rows.push({ label: 'Batting (WK)', value: player.batting || 0, min: keeperBattingMin(target.primary) });
+            rows.push({ label: 'Batting (WK)', skill: 'batting', value: player.batting || 0, min: keeperBattingMin(target.primary) });
         }
-        if (target.endurance !== undefined) rows.push({ label: 'Endurance', value: player.endurance || 0, min: target.endurance });
-        if (target.experience !== undefined) rows.push({ label: 'Experience', value: player.experience || 0, min: target.experience });
+        if (target.endurance !== undefined) rows.push({ label: 'Endurance', skill: 'endurance', value: player.endurance || 0, min: target.endurance });
+        if (target.experience !== undefined) rows.push({ label: 'Experience', skill: 'experience', value: player.experience || 0, min: target.experience });
+
+        // Time-aware "behind" (v8.68): a below-target TRAINABLE stat is only
+        // genuinely behind if it can't plausibly reach its target before the
+        // player's displayed age increments — a 20yo has until they turn 21
+        // (i.e. 20.14), a 16yo until 17. A flat value-vs-min check wrongly
+        // treated a 20y1w at fielding 7 exactly like a 20y14w at fielding 7,
+        // when the first has ~14 weeks to close a ~5-week gap and the second
+        // has a single week. Weeks-to-close come from the SAME per-week
+        // training-rate model as the training sim (estimateWeeklyTrainingGain)
+        // and are SUMMED across all below-target trainable skills, compared
+        // against the weeks left in the year — so being behind on 2+ stats at
+        // once is naturally infeasible (you can't run two youth programs at
+        // once), which is the user's key constraint. Result: three statuses
+        // instead of the old binary behind/on-track:
+        //   behind      — below target AND not enough time left this year
+        //   catching-up — below target but can realistically reach it this year
+        //   on-track/ahead — at/above target (unchanged)
+        const programToSkill = { batting: 'batting', bowling: 'bowling', keeping: 'keeping', battingtech: 'technique', bowlingtech: 'technique', keeperbatting: 'technique', fielding: 'fielding', fitness: 'endurance' };
+        const TRAINABLE = { batting: 'batting', bowling: 'bowling', keeping: 'keeping', technique: techniqueProgram, fielding: 'fielding', endurance: 'fitness' };
+        const weeksLeft = weeksToAge(player.age, age + 1);
+        const academySpeed = getAcademySpeedForPlayer(player, loadAcademyCache());
+        let totalWeeksToClose = 0, canEstimate = true;
+        const nonTrainableBelow = rows.some(r => r.value < r.min && !TRAINABLE[r.skill]);
+        rows.forEach(r => {
+            if (r.value < r.min && TRAINABLE[r.skill]) {
+                const wk = weeksToTrainSkill(TRAINABLE[r.skill], programToSkill[TRAINABLE[r.skill]], r.value, r.min, player, academySpeed);
+                if (wk == null) canEstimate = false; else totalWeeksToClose += wk;
+            }
+        });
+        const feasible = canEstimate && !nonTrainableBelow && totalWeeksToClose <= weeksLeft;
 
         rows.forEach(r => {
-            if (r.value < r.min) r.status = 'behind';
-            else if (r.good && r.value >= r.good) r.status = 'ahead';
-            else r.status = 'on-track';
+            if (r.value < r.min) {
+                if (!TRAINABLE[r.skill]) {
+                    // experience — grows by playing, not a trainable program
+                    r.status = 'behind';
+                    r.reason = `${r.label} below target and not trainable via a youth program`;
+                } else if (!feasible) {
+                    r.status = 'behind';
+                    r.reason = `needs ~${totalWeeksToClose}wk to reach age-${age} targets but only ${weeksLeft}wk left of age ${age}`;
+                } else {
+                    r.status = 'catching-up';
+                    r.reason = `~${totalWeeksToClose}wk to target, ${weeksLeft}wk left of age ${age}`;
+                }
+            } else if (r.good && r.value >= r.good) {
+                r.status = 'ahead';
+            } else {
+                r.status = 'on-track';
+            }
         });
 
-        return { age, rows, overallStatus: rows.some(r => r.status === 'behind') ? 'behind' : 'on-track' };
+        const overallStatus = rows.some(r => r.status === 'behind') ? 'behind'
+            : rows.some(r => r.status === 'catching-up') ? 'catching-up' : 'on-track';
+
+        return { age, rows, overallStatus };
+    }
+
+    // Weeks to train a skill from its current level up to a target min,
+    // using the same per-week gain model as the training sim. Assumes the
+    // player trains rested (fatiguePenalty 0, like the simulation baseline)
+    // at the full squad size (no overcrowding penalty) — a tractable
+    // best-case for "can they close this gap this year". Conservative
+    // scaling: each level costs the full 1000 points from the TOP of the
+    // current level (the same assumption as weeksToNextLevel). Returns null
+    // when the gain can't be estimated (the caller treats that as infeasible
+    // / behind).
+    function weeksToTrainSkill(programKey, skillKey, value, min, player, academySpeed) {
+        const gain = estimateWeeklyTrainingGain(programKey, player, academySpeed, { fatiguePenalty: 0, squadSizePenalty: 1 });
+        if (!gain) return null;
+        const weekly = gain[skillKey];
+        if (!weekly || weekly <= 0) return null;
+        const levels = Math.max(0, min - value);
+        if (levels <= 0) return 0;
+        return levels * weeksToNextLevel(weekly);
     }
 
     // ============================================================
@@ -2108,7 +2180,17 @@
                     warnings.push(`${belowSkills.length} skill${belowSkills.length > 1 ? 's' : ''} below age ${age} targets — filtered`);
                 } else {
                     score += 3;
-                    strengths.push(`All skills meet age ${age} targets`);
+                    // A below-target stat that's only 'catching-up' (can still
+                    // reach the target this age-year) isn't "meeting targets"
+                    // yet — say so honestly rather than the misleading "All
+                    // skills meet age X targets". Only genuinely-behind rows
+                    // (status === 'behind') filter the candidate out above.
+                    const catchingUp = ydEval.rows.filter(r => r.status === 'catching-up');
+                    if (catchingUp.length > 0) {
+                        strengths.push(`Within reach of age ${age} targets by age end (${catchingUp.map(r => `${r.label.replace(/\s*\(.*\)/, '')} ${skillLabel(r.value)}→${skillLabel(r.min)}`).join(', ')})`);
+                    } else {
+                        strengths.push(`All skills meet age ${age} targets`);
+                    }
                     const aheadCount = ydEval.rows.filter(r => r.value > 0 && r.status === 'ahead').length;
                     if (aheadCount >= 3) {
                         score += 3;
@@ -8764,9 +8846,13 @@ table.ftp-table {
         let youthHtml = '';
         const youthYd = youth.map(p => ({ p, yd: evaluateYouthDevelopment(p) }));
         const youthBehind = youthYd.filter(x => x.yd && x.yd.overallStatus === 'behind');
+        const youthCatching = youthYd.filter(x => x.yd && x.yd.overallStatus === 'catching-up');
         youthHtml += `<div class="ftp-stat-row"><span class="ftp-stat-label">Youth count</span><span class="ftp-stat-value">${youth.length} <span class="vj-text-xs vj-text-muted">(keep ≥12 to avoid auto-draft)</span></span></div>`;
         youthHtml += `<div class="ftp-stat-row"><span class="ftp-stat-label">Behind curve</span><span class="ftp-stat-value" style="color:${youthBehind.length > 0 ? 'var(--vj-red)' : 'var(--vj-green)'};">${youthBehind.length} player${youthBehind.length === 1 ? '' : 's'}</span></div>`;
-        youthHtml += `<div class="vj-text-xs vj-text-muted" style="margin-top:4px;line-height:1.5;">Youth must meet the age-based development-curve minimums (primary/technique/fielding against the 16-20 targets) to justify carrying to a senior spot. Behind on 2+ stats \u2014 especially at age 19-20 with no time left to catch up \u2014 is a strong sell/retire signal.</div>`;
+        if (youthCatching.length > 0) {
+            youthHtml += `<div class="ftp-stat-row"><span class="ftp-stat-label">Catching up</span><span class="ftp-stat-value" style="color:var(--vj-amber);">${youthCatching.length} player${youthCatching.length === 1 ? '' : 's'} <span class="vj-text-xs vj-text-muted">(can still reach targets this age-year)</span></span></div>`;
+        }
+        youthHtml += `<div class="vj-text-xs vj-text-muted" style="margin-top:4px;line-height:1.5;">Youth must meet the age-based development-curve minimums (primary/technique/fielding against the 16-20 targets) to justify carrying to a senior spot. A stat below target counts as "behind" only if it can't be trained up before the age-year ends — 20.14 for a 20yo. Behind on 2+ stats \u2014 especially at age 19-20 with no time left to catch up \u2014 is a strong sell/retire signal.</div>`;
         // Ranked youth sell list embedded too (same scoring as
         // buildYouthSellRanking) — behind-curve prospects first.
         youthHtml += buildYouthSellRanking(youth, players, squadStats);
@@ -9290,7 +9376,7 @@ table.ftp-table {
         if (isYouth) {
             const yd = evaluateYouthDevelopment(player);
             if (yd) {
-                html += `<div class="vj-text-xs vj-mt-8"><span class="vj-fw-700">16-20 development curve:</span> ${yd.overallStatus === 'behind' ? '<span style="color:var(--vj-red);">Behind curve</span>' : '<span style="color:var(--vj-green);">On track</span>'}</div>`;
+                html += `<div class="vj-text-xs vj-mt-8"><span class="vj-fw-700">16-20 development curve:</span> ${yd.overallStatus === 'behind' ? '<span style="color:var(--vj-red);">Behind curve</span>' : yd.overallStatus === 'catching-up' ? `<span style="color:var(--vj-amber);">Catching up — ${yd.rows.filter(r => r.status === 'catching-up').map(r => `${r.label.replace(/\s*\(.*\)/, '')} ${skillLabel(r.value)}→${skillLabel(r.min)}`).join(', ')} reachable within age ${yd.age}</span>` : '<span style="color:var(--vj-green);">On track</span>'}</div>`;
             }
         }
         verdictEl.innerHTML = html;
