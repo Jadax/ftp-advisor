@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         FTP Advisor
 // @namespace    http://tampermonkey.net/
-// @version      8.70
+// @version      8.71
 // @description  Tactical/scouting advisor for fromthepavilion.org (cricket sim): team, tactics, pitch, training, transfer market, youth and squad plan advice with projections. Full changelog: github.com/Jadax/ftp-advisor
 // @author       Tushant Sharma
 // @license      MIT
@@ -8888,8 +8888,23 @@ table.ftp-table {
         // buildYouthSellRanking) — behind-curve prospects first.
         youthHtml += buildYouthSellRanking(youth, players, squadStats);
 
+        // Dynasty ceilings shown in the embedded sell rankings above use
+        // getAcademySpeedForPlayer(), which silently falls back to a
+        // generic 100%-speed curve when the Academy page hasn't been
+        // cached yet \u2014 a real reported case where a youth's ceiling
+        // dropped noticeably (59\u219252) between two loads seconds apart,
+        // purely because the academy cache finished loading in between.
+        // Not a bug in the math (deterministic given its inputs), but
+        // silently misleading without this note \u2014 same pattern as the
+        // transfer page's academyContext line.
+        const squadPlanAcademyInfo = loadAcademyCache();
+        const academyPlanNote = (!squadPlanAcademyInfo || !squadPlanAcademyInfo.level || squadPlanAcademyInfo.level === 'unknown')
+            ? `<div class="vj-text-xs" style="color:var(--vj-amber);margin-bottom:6px;">\u26a0 Academy not cached yet \u2014 Dynasty ceilings below use a 100% generic training-speed fallback. Visit the Academy page once for accurate numbers (they can shift once the real speed loads).</div>`
+            : '';
+
         return `<div class="ftp-info-box" style="border-left:3px solid var(--vj-gold);">
             <div class="vj-fw-700 vj-mb-4">Squad Plan \u2014 who to sell vs who to buy</div>
+            ${academyPlanNote}
             <div class="vj-fw-700" style="font-size:11px;margin-top:2px;">SENIOR</div>
             ${seniorHtml}
             <div class="vj-fw-700" style="font-size:11px;margin-top:8px;">YOUTH</div>
@@ -9396,7 +9411,8 @@ table.ftp-table {
                 const vpk = computePlayerValuePerK(player);
                 return vpk != null ? ` · ${vpk.toFixed(1)} skill/$K` : '';
             })()} ${spareRatingBadge(computeSpareRating(player))}</div>
-            <div class="vj-text-xs vj-mb-4"><span class="vj-fw-700">Dynasty Score:</span> ${dynastyCeiling.current.toFixed(1)} now → <span class="vj-fw-700" style="color:var(--vj-gold);">${dynastyCeiling.ceiling.toFixed(1)} ceiling</span> (${dynastyCeiling.label}, age/academy/training-aware — same units as the sell lists and transfer market, safe to compare across ages)</div>`;
+            <div class="vj-text-xs vj-mb-4"><span class="vj-fw-700">Dynasty Score:</span> ${dynastyCeiling.current.toFixed(1)} now → <span class="vj-fw-700" style="color:var(--vj-gold);">${dynastyCeiling.ceiling.toFixed(1)} ceiling</span> (${dynastyCeiling.label}, age/academy/training-aware — same units as the sell lists and transfer market, safe to compare across ages)</div>
+            ${!academyInfo ? `<div class="vj-text-xs" style="color:var(--vj-amber);margin-bottom:4px;">⚠ Academy data not cached yet — Dynasty Score/Overall Rating above are using a 100% generic training-speed fallback, NOT your real academy efficiency. Visit the Academy page once, then reload this page — the ceiling can shift noticeably once the real (usually lower) speed is known.</div>` : ''}`;
 
         if (evalResult.strengths.length > 0) {
             html += `<div class="vj-text-xs vj-mt-4" style="color:var(--vj-green);">✓ ${evalResult.strengths.join(' · ')}</div>`;
