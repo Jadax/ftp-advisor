@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         FTP Advisor
 // @namespace    http://tampermonkey.net/
-// @version      8.78
+// @version      8.79
 // @description  Tactical/scouting advisor for fromthepavilion.org (cricket sim): team, tactics, pitch, training, transfer market, youth and squad plan advice with projections. Full changelog: github.com/Jadax/ftp-advisor
 // @author       Tushant Sharma
 // @license      MIT
@@ -4616,25 +4616,40 @@
             }
 
             // Strategy 2.5: still deficit — retry EVERY bowler with cap
-            // room, ignoring the end-adjacency exclusion this time. A
-            // same-XI bowler with unused overs left is always a legal fix
-            // (worst case, a short top-up spell below the normal
-            // minPerSpell — real matches do sometimes give someone a
-            // single closing over), and the manual-confirmed per-bowler
-            // over limit should never be violated while one exists. This
+            // room, ignoring the end-adjacency exclusion this time. This
             // catches exactly the case Strategy 2 misses: a weaker bowler
             // who was skipped there only because they happened to be the
             // last bowler on the other end at that moment, not because
             // they were actually unavailable. Any adjacency issue this
             // introduces is caught by the "no consecutive overs" fixup
             // pass that already runs after this function.
+            //
+            // v8.79 — REAL BUG (found via automated verification against a
+            // real match report, not inspection): this used to accept ANY
+            // c > 0, explicitly allowing "a short top-up spell below the
+            // normal minPerSpell" on the premise that "real matches do
+            // sometimes give someone a single closing over." That premise
+            // was wrong — the manual-confirmed minimum spell length (2 OD
+            // / 1 T20, already enforced in Strategy 2 just above and
+            // everywhere else in this file) has no exception; a 1-over
+            // spell is never legal. A tight 5-real-bowler OD lineup (all 5
+            // at their exact 10-over cap) reliably produced exactly this:
+            // a genuine 1-over spell for one bowler. Fixed to require
+            // c >= minPerSpell here too, same guard as Strategy 2. Any
+            // deficit this can't clear falls through to Strategy 3, which
+            // extends an EXISTING legal spell past its bowler's over cap
+            // instead — an already-known, already-flagged tradeoff
+            // ("squad has too few bowling options... recruit/train
+            // another bowler") for genuinely under-resourced squads, and
+            // a real over-cap overrun is a far smaller, more honestly-
+            // surfaced problem than a silently illegal spell length.
             if (deficit > 0) {
                 for (const b of bowlers) {
                     if (deficit <= 0) break;
                     const capLeft = cap[b.id] || 0;
-                    if (capLeft <= 0) continue;
+                    if (capLeft < minPerSpell) continue;
                     const c = Math.min(deficit, capLeft, maxPerSpell);
-                    if (c > 0) {
+                    if (c >= minPerSpell) {
                         spells.push({ player: b, overs: c, phase: 'Death overs', end: endName });
                         cap[b.id] -= c;
                         deficit -= c;
@@ -4792,13 +4807,20 @@
         // during drinks breaks and during the change of innings"
         // (rulespage=matchengine). Giving a bowler some overs before the
         // halfway break and some after is a real rest window, instead of
-        // bowling their whole allocation in one continuous block. Per
-        // experienced-player feedback, LOW-endurance bowlers (youth
-        // Average-or-worse = <=4, senior Accomplished-or-worse = <=8) get
-        // the same treatment from just 2 overs up ("it's fine to bowl
-        // everyone 50/50"). T20 spells are short (max 4) and the manual
-        // treats the break as a minor factor there, so this pass is
-        // OD/YOD-only.
+        // bowling their whole allocation in one continuous block. T20
+        // spells are short (max 4) and the manual treats the break as a
+        // minor factor there, so this pass is OD/YOD-only.
+        //
+        // v8.79 — a spell can only be split if BOTH resulting halves still
+        // meet the manual-confirmed minimum spell length (`minPerSpell`,
+        // already enforced elsewhere in this function — 2 overs for OD).
+        // The original v8.32-era design let LOW-endurance bowlers split
+        // from as little as 2 overs ("it's fine to bowl everyone 50/50" —
+        // real user feedback at the time), but 2 overs split "50/50" is
+        // 1+1, which is not a legal spell length at all — that case was
+        // never actually reachable without breaking the game's own rule,
+        // so the low-endurance carve-out is gone; every candidate now
+        // needs >= 2*minPerSpell overs to split, endurance or not.
         //
         // v8.61: this is a REBUILD, not a patch. The pre-v8.61 approach
         // tried to insert a split spell's far-side part at a "free" over
@@ -4814,8 +4836,9 @@
         // whose overs sums exactly match how many over-numbers of that
         // end's parity exist on each side of the break (50-over: Gibson 13
         // before + 12 after, Southern 12 before + 13 after), splits every
-        // >=4-over spell (>=2 for low-endurance) across the boundary so its
-        // bowler bowls both sides, then reuses the same adjacency/numbering
+        // spell with overs >= 2*minPerSpell across the boundary so its
+        // bowler bowls both sides (each half kept >= minPerSpell — see
+        // v8.79 note above), then reuses the same adjacency/numbering
         // helpers as the main allocator — numbering side-aware so a
         // before-spell can never land after the break and vice versa. The
         // bowler's total overs never changes, so per-bowler over limits
@@ -4827,10 +4850,14 @@
             // Partition one end's spell list into before/after parts whose
             // before-side total is exactly beforeTarget overs.
             const partitionSideSpells = (endSpells, beforeTarget) => {
-                const candidate = (sp) => sp.overs >= 4 || (lowEndurance(sp.player) && sp.overs >= 2);
+                // A spell can only split if BOTH halves can still meet
+                // minPerSpell — anything shorter has to stay one continuous
+                // block (splitting a 2-over OD spell "50/50" would mean two
+                // 1-over spells, which the game doesn't allow at all).
+                const candidate = (sp) => sp.overs >= minPerSpell * 2;
                 const parts = endSpells.map(sp => {
                     if (candidate(sp)) {
-                        const pre = Math.max(1, Math.floor(sp.overs / 2));
+                        const pre = Math.max(minPerSpell, Math.floor(sp.overs / 2));
                         return { sp, before: pre, after: sp.overs - pre, candidate: true };
                     }
                     return { sp, before: sp.overs, after: 0, candidate: false };
@@ -4839,28 +4866,51 @@
                 let delta = parts.reduce((s, p) => s + p.before, 0) - beforeTarget;
                 if (delta > 0) {
                     // Too much before: move overs to the after side, working
-                    // from the END of the list in; candidates keep >=1 before
-                    // over so they still bowl on both sides.
+                    // from the END of the list in. Candidates can move a
+                    // PARTIAL amount but must keep at least minPerSpell on
+                    // the shrinking side. Non-candidates (spells excluded
+                    // from splitting because they're too short) can ONLY be
+                    // relocated WHOLESALE — moving them partially would
+                    // silently manufacture the exact illegal sub-minPerSpell
+                    // fragment they were excluded to avoid (a real bug: a
+                    // realistic 8-bowler lineup's leftover 3-over spell got
+                    // sliced to e.g. 2+1 here, and every permutation the
+                    // search tried downstream inherited that same illegal
+                    // fragment, so NOTHING ever verified clean and the split
+                    // silently never happened).
                     for (let i = parts.length - 1; i >= 0 && delta > 0; i--) {
                         const p = parts[i];
-                        const available = p.before - (p.candidate ? 1 : 0);
-                        if (available > 0) {
-                            const move = Math.min(available, delta);
-                            p.before -= move;
-                            p.after += move;
-                            delta -= move;
+                        if (p.candidate) {
+                            const available = p.before - minPerSpell;
+                            if (available > 0) {
+                                const move = Math.min(available, delta);
+                                p.before -= move;
+                                p.after += move;
+                                delta -= move;
+                            }
+                        } else if (p.before > 0 && p.before <= delta) {
+                            delta -= p.before;
+                            p.after += p.before;
+                            p.before = 0;
                         }
                     }
                 } else if (delta < 0) {
-                    // Too little before: move overs from after to before.
+                    // Too little before: move overs from after to before —
+                    // same wholesale-only rule for non-candidates.
                     for (let i = 0; i < parts.length && delta < 0; i++) {
                         const p = parts[i];
-                        const available = p.after - (p.candidate ? 1 : 0);
-                        if (available > 0) {
-                            const move = Math.min(available, -delta);
-                            p.after -= move;
-                            p.before += move;
-                            delta += move;
+                        if (p.candidate) {
+                            const available = p.after - minPerSpell;
+                            if (available > 0) {
+                                const move = Math.min(available, -delta);
+                                p.after -= move;
+                                p.before += move;
+                                delta += move;
+                            }
+                        } else if (p.after > 0 && p.after <= -delta) {
+                            delta += p.after;
+                            p.before += p.after;
+                            p.after = 0;
                         }
                     }
                 }
@@ -4932,7 +4982,14 @@
                     for (let o = 1; o < totalOvers; o++) {
                         if (overMap.get(o) && overMap.get(o) === overMap.get(o + 1)) adjacent = true;
                     }
-                    return { ok: !collides && !outOfRange && !adjacent, candidate };
+                    // v8.79: partitionSideSpells is built to never produce a
+                    // spell shorter than minPerSpell, but this is cheap to
+                    // double-check here too — a silent minPerSpell violation
+                    // (e.g. a future edit to the partition math) would be a
+                    // real rules violation, not just a cosmetic issue, and
+                    // wouldn't be caught by collides/outOfRange/adjacent.
+                    const tooShort = candidate.some(sp => sp.overs < minPerSpell);
+                    return { ok: !collides && !outOfRange && !adjacent && !tooShort, candidate };
                 };
 
                 // Reordering entries WITHIN one end's after-list only changes
