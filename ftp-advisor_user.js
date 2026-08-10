@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         FTP Advisor
 // @namespace    http://tampermonkey.net/
-// @version      8.76
+// @version      8.77
 // @description  Tactical/scouting advisor for fromthepavilion.org (cricket sim): team, tactics, pitch, training, transfer market, youth and squad plan advice with projections. Full changelog: github.com/Jadax/ftp-advisor
 // @author       Tushant Sharma
 // @license      MIT
@@ -10058,7 +10058,10 @@ table.ftp-table {
     async function init() {
         const pageType = detectPageType();
         console.log('[FTP Advisor] Page:', pageType);
-        createMatchPasteUI();
+        // Only on teamfixtures.htm (own or opponent — that's where completed
+        // match HTML actually gets copied from) per explicit user request;
+        // it was cluttering every page before this.
+        if (pageType === 'matches') createMatchPasteUI();
 
         // One-time cleanup: getOpponentTeamId()/extractOpponentTeamIdFromGame()
         // used to blindly treat "Home" as the opponent, which is wrong on a
