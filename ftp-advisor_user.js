@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         FTP Advisor
 // @namespace    http://tampermonkey.net/
-// @version      8.72
+// @version      8.73
 // @description  Tactical/scouting advisor for fromthepavilion.org (cricket sim): team, tactics, pitch, training, transfer market, youth and squad plan advice with projections. Full changelog: github.com/Jadax/ftp-advisor
 // @author       Tushant Sharma
 // @license      MIT
@@ -5611,7 +5611,12 @@
             runs: parseInt(cells[n - 5], 10), balls: parseInt(cells[n - 4], 10),
             fours: parseInt(cells[n - 3], 10), sixes: parseInt(cells[n - 2], 10),
             sr: parseFloat(cells[n - 1]),
-            isKeeper: /\(wk\)/i.test(cells[0]),
+            // Matches "(wk)" alone AND combos like "(c,wk)"/"(wk,c)" — a
+            // captain-wicketkeeper is common in real scorecards (e.g. "B.
+            // McCullum (c,wk)") and the old exact-"(wk)" match silently
+            // missed them, dropping the keeper line from that innings'
+            // review with no indication anything was skipped.
+            isKeeper: /\([^)]*\bwk\b[^)]*\)/i.test(cells[0]),
             isNotOut: /not out/i.test(cells.slice(1, n - 5).join(' '))
         };
     }
@@ -5778,8 +5783,22 @@
         if (match.innings.length >= 2) {
             const in1 = match.innings[0], in2 = match.innings[1];
             const res = match.result || '';
-            if (res.toLowerCase().includes(in2.battingTeam.toLowerCase()) && /won/i.test(res) && in1.rr != null && in2.rr != null) {
+            const in2Won = res.toLowerCase().includes(in2.battingTeam.toLowerCase()) && /won/i.test(res);
+            const in1Won = res.toLowerCase().includes(in1.battingTeam.toLowerCase()) && /won/i.test(res);
+            if (in2Won && in1.rr != null && in2.rr != null) {
                 out.push(`\u2713 ${in2.battingTeam} chased ${in1.runs} at RR ${in2.rr} (needed ${in1.rr}) — ${in2.rr >= in1.rr ? 'paced at/above the required rate' : 'paced under rate but wickets in hand'}`);
+            } else if (in1Won) {
+                // Defended total / failed chase - previously produced NO
+                // pacing commentary at all (the only branch handled a
+                // successful chase). Most completed matches are this shape:
+                // the side batting second loses more often than it
+                // successfully chases a target down.
+                const shortfall = in1.runs - in2.runs;
+                if (in2.wickets >= 10) {
+                    out.push(`✗ ${in2.battingTeam} bowled out for ${in2.runs} in ${in2.overs} overs chasing ${in1.runs} (${shortfall} short) — ${in1.battingTeam} defended successfully`);
+                } else if (in1.rr != null && in2.rr != null) {
+                    out.push(`✗ ${in2.battingTeam} fell short at ${in2.runs}/${in2.wickets} (RR ${in2.rr} vs required ${in1.rr}) chasing ${in1.runs} — ran out of overs, ${in1.battingTeam} defended successfully`);
+                }
             }
         }
         return out;
