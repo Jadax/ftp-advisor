@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         FTP Advisor
 // @namespace    http://tampermonkey.net/
-// @version      8.74
+// @version      8.75
 // @description  Tactical/scouting advisor for fromthepavilion.org (cricket sim): team, tactics, pitch, training, transfer market, youth and squad plan advice with projections. Full changelog: github.com/Jadax/ftp-advisor
 // @author       Tushant Sharma
 // @license      MIT
@@ -150,6 +150,14 @@
     // and pruned — this is a rough value anchor, not a full market database.
     const TRANSFER_PRICE_KEY = 'ftp_transfer_price_history';
     const TRANSFER_PRICE_MAX = 400; // cap stored entries to bound GM storage
+
+    // Pasted-match history — every match run through the Match Review paste
+    // box is kept (parsed scorecard only, no HTML) so the tactics/ground
+    // advisors can look up real evidence for named players/teams later,
+    // not just produce a one-off review. Small (a scorecard is a few KB),
+    // capped to bound GM storage growth.
+    const MATCH_HISTORY_KEY = 'ftp_match_history';
+    const MATCH_HISTORY_MAX = 150;
 
     // Staleness thresholds (hours)
     const STALE_SQUAD_HOURS = 24;
@@ -5114,6 +5122,11 @@
         if (opponentAnalysis && opponentAnalysis.inForm) {
             dangerHtml += `<div class="ftp-alert warning" style="margin:4px 0 0 0;"><span>\u26A0</span><div>Opponent is in strong form (avg form ${(opponentAnalysis.avgForm || 0).toFixed(1)}/10). Expect aggressive play.</div></div>`;
         }
+        // Real-match evidence from the pasted Match Review history \u2014 cross
+        // references the opponent's actual squad names first (most precise),
+        // falls back to a team-name-level aggregate. Silently renders nothing
+        // when no pasted matches touch this opponent yet.
+        dangerHtml += buildPastedScoutingHtml(opponentCache ? opponentCache.players : null, getOpponentTeamName());
 
         document.getElementById('ftp-toss').innerHTML = `
             <div class="ftp-info-box success" style="text-align:center;">
@@ -5522,9 +5535,17 @@
 
                 currentHtml += `<tr><td style="font-weight:600;">${className}</td><td><span class="ftp-stat-badge ${isMatch ? 'green' : 'neutral'}">${currentPitch}</span></td><td><span class="ftp-stat-badge ${isMatch ? 'green' : 'amber'}">${rec.pitch}</span></td></tr>`;
                 if (className) {
+                    // Real pasted-match evidence for the CURRENT pitch, if any
+                    // exists — only shown when there's actually a Pitch: row
+                    // in history for it (raw-HTML pastes only), never guessed.
+                    const pitchEvidence = getPitchHistoryStats(currentPitch);
+                    const evidenceLine = pitchEvidence
+                        ? `<div class="vj-text-xs vj-mt-4" style="color:var(--vj-blue);">📋 ${pitchEvidence.matches} pasted match${pitchEvidence.matches > 1 ? 'es' : ''} on ${currentPitch}: seam econ ${pitchEvidence.seamEcon ?? '—'} vs spin econ ${pitchEvidence.spinEcon ?? '—'}</div>`
+                        : '';
                     recHtml += `<div class="ftp-rec ${isMatch ? 'low' : 'medium'}" style="margin:5px 0;">
                         <div class="vj-flex-between"><span class="vj-fw-700">${className}</span>${isMatch ? '<span class="ftp-stat-badge green">Already set</span>' : `<span class="ftp-stat-badge amber">Consider: ${rec.pitch}</span>`}</div>
                         <div class="vj-text-xs vj-text-secondary vj-mt-4">${rec.reason}</div>
+                        ${evidenceLine}
                     </div>`;
                 }
             }
@@ -5785,7 +5806,7 @@
         const titleText = (h1 ? h1.textContent : (doc.querySelector('title') ? doc.querySelector('title').textContent : '')).trim();
         const teams = parseMatchTeams(titleText);
 
-        let result = '', toss = '', motm = '';
+        let result = '', toss = '', motm = '', ground = '', pitch = '', weather = '';
         doc.querySelectorAll('table.data tr').forEach(tr => {
             const th = tr.querySelector('th');
             const td = tr.querySelector('td');
@@ -5794,6 +5815,13 @@
             if (/^Result:/i.test(label)) result = td.textContent.trim();
             else if (/^Toss:/i.test(label)) toss = td.textContent.trim();
             else if (/^Man of the match:/i.test(label)) motm = td.textContent.trim();
+            // Ground/Pitch/Weather aren't always present on every scorecard
+            // layout — best-effort only, left blank (not fabricated) when
+            // the page doesn't expose them, so aggregation just skips those
+            // matches rather than working off a guessed value.
+            else if (/^Ground:/i.test(label)) ground = td.textContent.trim();
+            else if (/^Pitch:/i.test(label)) pitch = td.textContent.trim();
+            else if (/^Weather:/i.test(label)) weather = td.textContent.trim();
         });
 
         // Each innings is one of the plain (non-"marg-bottom"-table)
@@ -5814,7 +5842,7 @@
             innings[1].bowlingTeam = innings[0].battingTeam;
         }
         if (innings.length === 0) return null;
-        return { teams, result, toss, motm, innings };
+        return { teams, result, toss, motm, innings, ground: ground || undefined, pitch: pitch || undefined, weather: weather || undefined };
     }
 
     function parseMatchScorecard(text) {
@@ -5948,6 +5976,203 @@
         return out;
     }
 
+    // ── Pasted-match history persistence + scouting lookups ──
+    // The point of the Match Review paste box isn't the one-off report — it's
+    // feeding real observed evidence (who actually bowled/batted well, at what
+    // economy/SR) forward into the tactics advisor for future team setup.
+    // Every parsed match is stored (compact — just the scorecard numbers
+    // already on `match`, no HTML) so a later visit to Match Orders / Ground
+    // can look up any named player or team that's shown up in a pasted match.
+    function loadMatchHistory() {
+        try {
+            const raw = GM_getValue(MATCH_HISTORY_KEY, null);
+            return raw ? JSON.parse(raw) : [];
+        } catch (e) { return []; }
+    }
+
+    function saveMatchesToHistory(matches) {
+        if (!matches || !matches.length) return;
+        try {
+            let hist = loadMatchHistory();
+            // Dedupe on (teams+result+both innings' final score) so re-analyzing
+            // the same paste (e.g. re-clicking Analyze) doesn't duplicate it.
+            const sig = m => [m.teams.join('|'), m.result, ...m.innings.map(i => `${i.battingTeam}:${i.runs}/${i.wickets}`)].join('~');
+            const known = new Set(hist.map(sig));
+            matches.forEach(m => {
+                if (!known.has(sig(m))) { hist.push(Object.assign({ savedAt: Date.now() }, m)); known.add(sig(m)); }
+            });
+            if (hist.length > MATCH_HISTORY_MAX) hist = hist.slice(hist.length - MATCH_HISTORY_MAX);
+            GM_setValue(MATCH_HISTORY_KEY, JSON.stringify(hist));
+        } catch (e) { /* non-fatal; ignore storage failures */ }
+    }
+
+    // Aggregates every pasted-match appearance of a named player (case/
+    // whitespace-insensitive) into overall bowling/batting figures. Returns
+    // null when the name has never appeared, so callers can tell "no
+    // evidence" apart from "evidence of a weak player".
+    function getPlayerHistoryStats(name, history) {
+        if (!name) return null;
+        const target = String(name).trim().toLowerCase();
+        if (!target) return null;
+        const hist = history || loadMatchHistory();
+        let bOvers = 0, bRuns = 0, bWkts = 0, bMatches = 0;
+        let batRuns = 0, batBalls = 0, batInnings = 0, batBest = 0;
+        hist.forEach(m => {
+            (m.innings || []).forEach(inn => {
+                (inn.bowlingPlayers || []).forEach(bp => {
+                    if (bp.name && bp.name.trim().toLowerCase() === target) {
+                        bOvers += bp.overs || 0; bRuns += bp.runs || 0; bWkts += bp.wickets || 0; bMatches++;
+                    }
+                });
+                (inn.battingPlayers || []).forEach(bp => {
+                    if (bp.name && bp.name.trim().toLowerCase() === target) {
+                        batRuns += bp.runs || 0; batBalls += bp.balls || 0; batInnings++;
+                        if (bp.runs > batBest) batBest = bp.runs;
+                    }
+                });
+            });
+        });
+        if (bMatches === 0 && batInnings === 0) return null;
+        return {
+            bowling: bMatches > 0 ? { overs: +bOvers.toFixed(1), runs: bRuns, wickets: bWkts, econ: bOvers > 0 ? +(bRuns / bOvers).toFixed(2) : 0, matches: bMatches } : null,
+            batting: batInnings > 0 ? { runs: batRuns, balls: batBalls, sr: batBalls > 0 ? +(batRuns / batBalls * 100).toFixed(1) : 0, innings: batInnings, best: batBest } : null
+        };
+    }
+
+    // Team-level fallback for when the opponent's current squad isn't
+    // cached (so individual names can't be cross-referenced) but the team
+    // NAME shown up in a pasted match — aggregates seam/spin economy for
+    // their bowling and average SR for their batting.
+    function getTeamHistoryStats(teamName, history) {
+        if (!teamName) return null;
+        const target = String(teamName).trim().toLowerCase();
+        if (!target) return null;
+        const hist = history || loadMatchHistory();
+        let matchesFound = 0;
+        const bowlers = {}; // name -> {overs,runs,wickets}
+        const batters = {}; // name -> {runs,balls}
+        hist.forEach(m => {
+            // Match against each innings' own battingTeam/bowlingTeam rather
+            // than m.teams — the tab-paste header parser can leave trailing
+            // junk (e.g. "Team >> Scorecard") on the second team name, while
+            // the innings team names (read straight off the stats table
+            // header) are always clean.
+            const involved = (m.innings || []).some(inn =>
+                (inn.battingTeam && inn.battingTeam.trim().toLowerCase() === target) ||
+                (inn.bowlingTeam && inn.bowlingTeam.trim().toLowerCase() === target));
+            if (!involved) return;
+            matchesFound++;
+            (m.innings || []).forEach(inn => {
+                if (inn.bowlingTeam && inn.bowlingTeam.trim().toLowerCase() === target) {
+                    (inn.bowlingPlayers || []).forEach(bp => {
+                        const e = bowlers[bp.name] || (bowlers[bp.name] = { overs: 0, runs: 0, wickets: 0 });
+                        e.overs += bp.overs || 0; e.runs += bp.runs || 0; e.wickets += bp.wickets || 0;
+                    });
+                }
+                if (inn.battingTeam && inn.battingTeam.trim().toLowerCase() === target) {
+                    (inn.battingPlayers || []).forEach(bp => {
+                        const e = batters[bp.name] || (batters[bp.name] = { runs: 0, balls: 0 });
+                        e.runs += bp.runs || 0; e.balls += bp.balls || 0;
+                    });
+                }
+            });
+        });
+        if (matchesFound === 0) return null;
+        const bowlerList = Object.entries(bowlers).map(([name, e]) => ({ name, overs: +e.overs.toFixed(1), wickets: e.wickets, econ: e.overs > 0 ? +(e.runs / e.overs).toFixed(2) : 0 }))
+            .filter(b => b.overs >= 2).sort((a, b) => (b.wickets - a.wickets) || (a.econ - b.econ));
+        const batterList = Object.entries(batters).map(([name, e]) => ({ name, runs: e.runs, sr: e.balls > 0 ? +(e.runs / e.balls * 100).toFixed(1) : 0 }))
+            .filter(b => b.runs >= 10).sort((a, b) => b.runs - a.runs);
+        return { matchesFound, bowlers: bowlerList.slice(0, 3), batters: batterList.slice(0, 3) };
+    }
+
+    // Aggregates seam-vs-spin economy across every pasted match that recorded
+    // a given pitch type (only present when the pasted input was raw HTML
+    // with a Pitch: row — the tab-delimited copy has no pitch info, so those
+    // matches are simply skipped here rather than guessed at). Returns null
+    // below a small evidence floor (2 matches) to avoid a one-match fluke
+    // reading as a real trend.
+    function getPitchHistoryStats(pitchName, history) {
+        if (!pitchName) return null;
+        const target = String(pitchName).trim().toLowerCase();
+        const hist = (history || loadMatchHistory()).filter(m => m.pitch && m.pitch.trim().toLowerCase() === target);
+        if (hist.length < 2) return null;
+        let seamOvers = 0, seamRuns = 0, spinOvers = 0, spinRuns = 0;
+        hist.forEach(m => (m.innings || []).forEach(inn => (inn.bowlingPlayers || []).forEach(bp => {
+            if (bp.category === 'seam') { seamOvers += bp.overs || 0; seamRuns += bp.runs || 0; }
+            else if (bp.category === 'spin') { spinOvers += bp.overs || 0; spinRuns += bp.runs || 0; }
+        })));
+        if (seamOvers < 5 && spinOvers < 5) return null;
+        return {
+            matches: hist.length,
+            seamEcon: seamOvers > 0 ? +(seamRuns / seamOvers).toFixed(2) : null,
+            spinEcon: spinOvers > 0 ? +(spinRuns / spinOvers).toFixed(2) : null
+        };
+    }
+
+    // Twin of getOpponentTeamId() — same Home/Away scan, but returns the
+    // opponent's NAME (the link's own text) instead of their ID, since
+    // pasted-match history is keyed by team name, not team ID.
+    function getOpponentTeamName() {
+        const allElements = document.querySelectorAll('th');
+        let homeName = null, homeId = null, awayName = null, awayId = null;
+        for (const th of allElements) {
+            const label = th.textContent.trim();
+            if (label !== 'Home' && label !== 'Away') continue;
+            const td = th.nextElementSibling;
+            const link = td ? td.querySelector('a') : null;
+            if (!link) continue;
+            const match = link.href.match(/teamId=(\d+)/);
+            if (!match) continue;
+            if (label === 'Home') { homeId = match[1]; homeName = link.textContent.trim(); }
+            else { awayId = match[1]; awayName = link.textContent.trim(); }
+        }
+        if (homeId && homeId !== String(TEAM_ID)) return homeName;
+        if (awayId && awayId !== String(TEAM_ID)) return awayName;
+        return null;
+    }
+
+    // Builds the "real match evidence" alert for the Match Orders toss
+    // section — cross-references named opponent squad players (if cached)
+    // against pasted-match history first (most precise: same actual player),
+    // falling back to a team-level aggregate keyed by opponent name when no
+    // squad cache or no name matches are available.
+    function buildPastedScoutingHtml(opponentPlayers, opponentName) {
+        const history = loadMatchHistory();
+        if (!history.length) return '';
+        const playerHits = [];
+        if (opponentPlayers && opponentPlayers.length) {
+            opponentPlayers.forEach(p => {
+                const stats = getPlayerHistoryStats(p.name, history);
+                if (stats) playerHits.push({ name: p.name, stats });
+            });
+        }
+        if (playerHits.length > 0) {
+            const bowlLines = playerHits.filter(h => h.stats.bowling).sort((a, b) => a.stats.bowling.econ - b.stats.bowling.econ).slice(0, 3)
+                .map(h => `${h.name} (${h.stats.bowling.wickets}wk @${h.stats.bowling.econ} econ over ${h.stats.bowling.matches}m)`);
+            const batLines = playerHits.filter(h => h.stats.batting).sort((a, b) => b.stats.batting.sr - a.stats.batting.sr).slice(0, 3)
+                .map(h => `${h.name} (SR ${h.stats.batting.sr}, best ${h.stats.batting.best})`);
+            const parts = [];
+            if (bowlLines.length) parts.push(`<strong>Bowlers to watch:</strong> ${bowlLines.join('; ')}`);
+            if (batLines.length) parts.push(`<strong>Batters to watch:</strong> ${batLines.join('; ')}`);
+            if (!parts.length) return '';
+            return `<div class="ftp-alert info" style="margin:4px 0 0 0;"><span>📋</span><div>Real evidence from ${playerHits.length} squad player${playerHits.length > 1 ? 's' : ''} seen in pasted matches: ${parts.join(' · ')}</div></div>`;
+        }
+        // No per-player cross-reference (squad not cached, or none of these
+        // names have shown up in a pasted match yet) — fall back to a
+        // team-level aggregate if the opponent's name itself is in history.
+        if (opponentName) {
+            const teamStats = getTeamHistoryStats(opponentName, history);
+            if (teamStats) {
+                const parts = [];
+                if (teamStats.bowlers.length) parts.push(`<strong>Bowlers:</strong> ${teamStats.bowlers.map(b => `${b.name} (${b.wickets}wk @${b.econ})`).join('; ')}`);
+                if (teamStats.batters.length) parts.push(`<strong>Batters:</strong> ${teamStats.batters.map(b => `${b.name} (${b.runs}r, SR ${b.sr})`).join('; ')}`);
+                if (!parts.length) return '';
+                return `<div class="ftp-alert info" style="margin:4px 0 0 0;"><span>📋</span><div>Real evidence from ${teamStats.matchesFound} pasted match${teamStats.matchesFound > 1 ? 'es' : ''} of ${escapeHtml(opponentName)}: ${parts.join(' · ')}</div></div>`;
+            }
+        }
+        return '';
+    }
+
     function renderMatchReview(matches) {
         if (!matches || !matches.length) return '<div class="vj-text-xs vj-text-muted">Couldn\u2019t parse any matches \u2014 paste a full scorecard block (Result / Toss / two innings).</div>';
         return matches.map(m => {
@@ -5991,7 +6216,13 @@
         });
         panel.querySelector('#ftp-match-analyze').addEventListener('click', () => {
             const input = panel.querySelector('#ftp-match-input');
-            panel.querySelector('#ftp-match-output').innerHTML = renderMatchReview(parseMatchScorecard(input.value));
+            const matches = parseMatchScorecard(input.value);
+            // Persist so Match Orders/Ground can use this as real scouting
+            // evidence later — the review text below is a side effect, not
+            // the point.
+            saveMatchesToHistory(matches);
+            panel.querySelector('#ftp-match-output').innerHTML = renderMatchReview(matches) +
+                (matches.length ? `<div class="vj-text-xs vj-text-muted" style="margin-top:4px;">Saved to match history (${loadMatchHistory().length} total) — will surface as scouting evidence on Match Orders when these players/teams come up.</div>` : '');
         });
     }
 
