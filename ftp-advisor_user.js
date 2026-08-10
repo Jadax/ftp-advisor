@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         FTP Advisor
 // @namespace    http://tampermonkey.net/
-// @version      8.71
+// @version      8.72
 // @description  Tactical/scouting advisor for fromthepavilion.org (cricket sim): team, tactics, pitch, training, transfer market, youth and squad plan advice with projections. Full changelog: github.com/Jadax/ftp-advisor
 // @author       Tushant Sharma
 // @license      MIT
@@ -61,6 +61,9 @@
     //   OPPONENT SCOUTING:        getOpponentTeamId,
     //       extractOpponentTeamIdFromGame, fetchOpponentSquad,
     //       scrapeOpponentSquad, fetchUpcomingFixtures
+    //   MATCH REVIEW (v8.72):      parseMatchScorecard, parseMatchChunk,
+    //       reviewMatch, reviewBatting, reviewBowling, detectCollapse,
+    //       aggregateByType, renderMatchReview, createMatchReviewUI
     //   PLAYER ADVISOR:           scrapePlayerDetailPage, updatePlayerAdvisor,
     //       comparePlayerToSquadPeers
     //   PER-PAGE UI:              updateSquadAdvisor, updateOrdersAdvisor,
@@ -5579,6 +5582,256 @@
         }
     }
 
+    // ============================================================
+    // MATCH REVIEW (v8.72) — paste a scorecard, get reasoning about
+    // why batters/bowlers/tactics worked or didn't.
+    // The game's scorecard copy is tab/whitespace-delimited and carries
+    // enough info to reason WITHOUT the skill sheet: runs, balls, SR,
+    // wickets, economy, the bowler's style (rws/rfs/... in parens, so we
+    // can split seam vs spin), the fall-of-wickets (collapse detection)
+    // and the chase pacing. This is deliberately input-only (no scraping)
+    // so you can also analyse opponent / world-cup / any pasted results.
+    // ============================================================
+    const MATCH_BAT_HEADER = /^(.*?)\tRuns\tBalls\t4s\t6s\tSR/i;
+    const MATCH_BOWL_HEADER = /^Bowling\tOvers\tMaidens\tRuns\tWickets\tEcon/i;
+
+    function oversToDecimal(text) {
+        const m = String(text || '').trim().match(/^(\d+)(?:\.(\d))?$/);
+        if (!m) return parseFloat(text) || 0;
+        return parseInt(m[1], 10) + (m[2] ? parseInt(m[2], 10) / 6 : 0);
+    }
+
+    function parseBattingRow(cells) {
+        // non-empty cells; trailing 5 = runs, balls, 4s, 6s, SR
+        if (cells.length < 6) return null;
+        const n = cells.length;
+        return {
+            name: cells[0].trim(),
+            dismissal: cells.slice(1, n - 5).join(' ').trim(),
+            runs: parseInt(cells[n - 5], 10), balls: parseInt(cells[n - 4], 10),
+            fours: parseInt(cells[n - 3], 10), sixes: parseInt(cells[n - 2], 10),
+            sr: parseFloat(cells[n - 1]),
+            isKeeper: /\(wk\)/i.test(cells[0]),
+            isNotOut: /not out/i.test(cells.slice(1, n - 5).join(' '))
+        };
+    }
+
+    function parseBowlingRow(cells) {
+        if (cells.length < 6) return null;
+        const name = cells[0].trim();
+        const tm = name.match(/\(([^)]+)\)/);
+        const type = tm ? tm[1] : '';
+        return {
+            name: name.replace(/\s*\([^)]*\)/, '').trim(),
+            type, category: BOWLER_CATEGORY[type] || 'none',
+            oversText: cells[1], overs: oversToDecimal(cells[1]),
+            maidens: parseInt(cells[2], 10), runs: parseInt(cells[3], 10),
+            wickets: parseInt(cells[4], 10), econ: parseFloat(cells[5]),
+            noballs: parseInt(cells[6] || 0, 10), wides: parseInt(cells[7] || 0, 10)
+        };
+    }
+
+    function parseMatchTeams(header) {
+        let seg = header.match(/\((.+?)\s*>>\s*Scorecard/i);
+        seg = seg ? seg[1] : (header.match(/\((.+?)\)/i) || [null, header])[1];
+        const parts = String(seg || '').split(/\s+v\s+/i).map(s => s.trim()).filter(Boolean);
+        return parts.length >= 2 ? parts : [seg || '', ''];
+    }
+
+    function parseMatchChunk(chunk) {
+        const innings = [];
+        let active = null, inBowling = false;
+        let result = '', toss = '', motm = '';
+        for (const raw of chunk.lines) {
+            let line = raw;
+            if (line.indexOf('\t') === -1) line = line.replace(/\s{2,}/g, '\t'); // tolerate space-aligned paste
+            const tl = line.trim();
+            if (!tl) continue;
+            if (/^Result:/i.test(tl)) { result = tl.replace(/^Result:\s*/i, ''); continue; }
+            if (/^Toss:/i.test(tl)) { toss = tl.replace(/^Toss:\s*/i, ''); continue; }
+            if (/^Man of the match:/i.test(tl)) { motm = tl.replace(/^Man of the match:\s*/i, ''); continue; }
+
+            const bh = line.match(MATCH_BAT_HEADER);
+            if (bh) { if (active) innings.push(active); active = { battingTeam: bh[1].trim(), battingPlayers: [], bowlingPlayers: [], runs: 0, wickets: 0, overs: '', extras: '', fall: [], rr: null }; inBowling = false; continue; }
+            if (MATCH_BOWL_HEADER.test(line)) { if (active) inBowling = true; continue; }
+            if (!active) continue;
+
+            if (/^Extras:/i.test(tl)) { active.extras = tl; continue; }
+            if (/^Fall of wickets:/i.test(tl)) {
+                active.fall = (tl.replace(/^Fall of wickets:\s*/i, '').match(/\d+-\d+\s*\([^)]*\)/g) || []).map(it => {
+                    const m = it.match(/(\d+)-(\d+)\s*\(([^)]*?),?\s*([\d.]+?)\s*ov\)/i);
+                    return m ? { wk: +m[1], score: +m[2], over: m[4] } : null;
+                }).filter(Boolean);
+                continue;
+            }
+            const tm = tl.match(/^Total:\s*\((\d+)\s+wickets?,\s*([\d.]+)\s+overs?\)\s*(\d+)(?:\s*RR:\s*([\d.]+))?/i);
+            if (tm) { active.wickets = +tm[1]; active.overs = tm[2]; active.runs = +tm[3]; active.rr = tm[4] ? +tm[4] : null; continue; }
+
+            const cells = line.split('\t').map(c => c.trim()).filter(c => c !== '');
+            if (cells.length === 0) continue;
+            const row = inBowling ? parseBowlingRow(cells) : parseBattingRow(cells);
+            if (row) {
+                if (inBowling) active.bowlingPlayers.push(row);
+                else active.battingPlayers.push(row);
+            }
+        }
+        if (active) innings.push(active);
+        if (innings.length === 0) return null;
+        if (innings.length >= 2) {
+            innings[0].bowlingTeam = innings[1].battingTeam;
+            innings[1].bowlingTeam = innings[0].battingTeam;
+        }
+        return { teams: parseMatchTeams(chunk.header), result, toss, motm, innings };
+    }
+
+    function parseMatchScorecard(text) {
+        const chunks = [];
+        let cur = null;
+        for (const raw of String(text || '').replace(/\r/g, '').split('\n')) {
+            const line = raw.trimEnd();
+            const isHeader = /match\s+\d+\s*\(/i.test(line) || (/scorecard/i.test(line) && /\sv\s+/i.test(line));
+            if (isHeader) { if (cur) chunks.push(cur); cur = { header: line, lines: [] }; }
+            else if (cur) cur.lines.push(line);
+        }
+        if (cur) chunks.push(cur);
+        return chunks.map(parseMatchChunk).filter(Boolean);
+    }
+
+    // Largest cluster of consecutive wickets falling within 12 runs of each
+    // other (a wobble/collapse), reported as "N wkts for X runs".
+    function detectCollapse(fall) {
+        if (!fall || fall.length < 2) return null;
+        let best = null;
+        for (let i = 0; i < fall.length - 1; i++) {
+            let j = i;
+            while (j + 1 < fall.length && (fall[j + 1].score - fall[j].score) <= 12) j++;
+            const count = j - i + 1;
+            if (count >= 2) {
+                const runs = fall[j].score - fall[i].score;
+                if (!best || count > best.count || (count === best.count && runs < best.runs)) best = { count, runs, span: `${fall[i].over}-${fall[j].over} ov` };
+            }
+        }
+        return best;
+    }
+
+    function aggregateByType(bowlers) {
+        const res = { seam: null, spin: null };
+        for (const b of bowlers) {
+            const cat = b.category === 'seam' || b.category === 'spin' ? b.category : null;
+            if (!cat) continue;
+            res[cat] = res[cat] || { overs: 0, runs: 0, wk: 0 };
+            res[cat].overs += b.overs; res[cat].runs += b.runs; res[cat].wk += b.wickets;
+        }
+        for (const k in res) if (res[k]) res[k].econ = res[k].overs ? res[k].runs / res[k].overs : 0;
+        return res;
+    }
+
+    function reviewBatting(inn, out) {
+        if (!inn.battingPlayers.length) return;
+        const scored = inn.battingPlayers.filter(b => b.runs > 0);
+        const top = [...scored].sort((a, b) => b.runs - a.runs).slice(0, 3);
+        if (top.length) out.push(`batters: ${top.map(b => `${b.name} ${b.runs} (${b.balls})${b.isNotOut ? '*' : ''}`).join(', ')}`);
+        const played = inn.battingPlayers.filter(b => b.balls >= 10);
+        if (played.length >= 2) {
+            const fastest = [...played].sort((a, b) => b.sr - a.sr)[0];
+            const slowest = [...played].sort((a, b) => a.sr - b.sr)[0];
+            if (fastest !== slowest) out.push(`strike: ${fastest.name} raced @${fastest.sr.toFixed(0)} (${fastest.runs}/${fastest.balls}); ${slowest.name} held back @${slowest.sr.toFixed(0)} (${slowest.runs}/${slowest.balls})`);
+        }
+        const keeper = inn.battingPlayers.find(b => b.isKeeper);
+        if (keeper) out.push(`keeper: ${keeper.name} ${keeper.runs} (${keeper.balls})${keeper.isNotOut ? '*' : ''} @SR ${keeper.sr.toFixed(0)}`);
+        const col = detectCollapse(inn.fall);
+        if (col) out.push(`\u26A0 collapse: ${col.count} wkts for ${col.runs} runs (${col.span})`);
+    }
+
+    function reviewBowling(inn, out) {
+        if (!inn.bowlingPlayers.length) return;
+        const withW = inn.bowlingPlayers.filter(b => b.wickets > 0);
+        const best = withW.length ? [...withW].sort((a, b) => b.wickets - a.wickets || a.econ - b.econ)[0]
+            : (inn.bowlingPlayers.length ? [...inn.bowlingPlayers].sort((a, b) => a.econ - b.econ)[0] : null);
+        const leak = [...inn.bowlingPlayers].filter(b => b.overs >= 2).sort((a, b) => b.econ - a.econ)[0]
+            || [...inn.bowlingPlayers].sort((a, b) => b.econ - a.econ)[0];
+        if (best) out.push(`bowler: ${best.name} (${best.type || '?'}) ${best.wickets}/${best.runs} @${best.econ} in ${best.oversText} ov`);
+        if (leak && leak !== best && inn.rr != null && leak.econ > inn.rr) out.push(`\u26A0 leak: ${leak.name} (${leak.type || '?'}) ${leak.wickets}/${leak.runs} @${leak.econ} vs team RR ${inn.rr}`);
+        const agg = aggregateByType(inn.bowlingPlayers);
+        const parts = [];
+        if (agg.seam && agg.seam.overs > 0) parts.push(`seam ${agg.seam.overs.toFixed(1)}ov ${agg.seam.runs}/${agg.seam.wk} @${agg.seam.econ.toFixed(2)}`);
+        if (agg.spin && agg.spin.overs > 0) parts.push(`spin ${agg.spin.overs.toFixed(1)}ov ${agg.spin.runs}/${agg.spin.wk} @${agg.spin.econ.toFixed(2)}`);
+        if (parts.length) {
+            out.push(`split: ${parts.join(' \u00B7 ')}`);
+            if (agg.seam && agg.spin) {
+                const e = agg.spin.econ - agg.seam.econ;
+                if (Math.abs(e) >= 1.5) out.push(`${e < 0 ? 'spin' : 'seam'} notably cheaper (@${Math.abs(e).toFixed(2)} econ edge)`);
+            }
+        }
+    }
+
+    function reviewMatch(match) {
+        const out = [];
+        out.push(`${match.teams.join(' v ')} — ${match.result}`);
+        if (match.motm) out.push(`MoM: ${match.motm.split(',')[0].trim()}`);
+        match.innings.forEach((inn, i) => {
+            out.push('');
+            out.push(`\u25B8 ${inn.battingTeam} ${inn.runs}/${inn.wickets} (${inn.overs} ov, RR ${inn.rr}) — bowled by ${inn.bowlingTeam || '?'}`);
+            reviewBatting(inn, out);
+            reviewBowling(inn, out);
+        });
+        if (match.innings.length >= 2) {
+            const in1 = match.innings[0], in2 = match.innings[1];
+            const res = match.result || '';
+            if (res.toLowerCase().includes(in2.battingTeam.toLowerCase()) && /won/i.test(res) && in1.rr != null && in2.rr != null) {
+                out.push(`\u2713 ${in2.battingTeam} chased ${in1.runs} at RR ${in2.rr} (needed ${in1.rr}) — ${in2.rr >= in1.rr ? 'paced at/above the required rate' : 'paced under rate but wickets in hand'}`);
+            }
+        }
+        return out;
+    }
+
+    function renderMatchReview(matches) {
+        if (!matches || !matches.length) return '<div class="vj-text-xs vj-text-muted">Couldn\u2019t parse any matches \u2014 paste a full scorecard block (Result / Toss / two innings).</div>';
+        return matches.map(m => {
+            const lines = reviewMatch(m);
+            const colored = lines.map(l => {
+                let color = 'var(--vj-text-muted)';
+                if (/^\u2713/.test(l) || /bowler:|notably cheaper/.test(l)) color = 'var(--vj-green)';
+                else if (/collapse|leak/.test(l)) color = 'var(--vj-red)';
+                return `<div class="vj-text-xs" style="color:${color};line-height:1.5;">${escapeHtml(l)}</div>`;
+            }).join('');
+            return `<div style="border-top:1px solid var(--vj-border);margin-top:6px;padding-top:4px;">${colored}</div>`;
+        }).join('');
+    }
+
+    function createMatchReviewUI() {
+        if (document.getElementById('ftp-match-panel')) return;
+        const panel = document.createElement('div');
+        panel.id = 'ftp-match-panel';
+        panel.innerHTML = `
+            <div style="position:fixed;right:12px;bottom:12px;z-index:2147483646;width:370px;max-height:70vh;display:flex;flex-direction:column;background:var(--vj-surface);border:1px solid var(--vj-border);border-radius:12px;box-shadow:0 8px 24px rgba(0,0,0,.25);font:12px/1.5 system-ui;">
+              <div id="ftp-match-head" style="padding:8px 10px;background:var(--vj-surface2,#eef1f4);border-radius:12px 12px 0 0;cursor:move;font-weight:700;display:flex;justify-content:space-between;align-items:center;">
+                <span>\u{1F3C6} Match Review</span>
+                <button id="ftp-match-toggle" style="background:none;border:none;cursor:pointer;font-size:12px;">\u25BC</button>
+              </div>
+              <div id="ftp-match-body" style="padding:8px 10px;overflow:auto;">
+                <div class="vj-text-xs vj-text-muted" style="margin-bottom:4px;">Paste a scorecard block \u2014 get reasoning on batters, bowlers and tactics (chase pacing, seam vs spin, collapses).</div>
+                <textarea id="ftp-match-input" spellcheck="false" style="width:100%;height:96px;box-sizing:border-box;font:11px/1.4 monospace;">${escapeHtml('')}</textarea>
+                <button id="ftp-match-analyze" class="ftp-button ftp-button-primary" style="width:100%;margin-top:6px;">\u2699 Analyze</button>
+                <div id="ftp-match-output" style="margin-top:6px;"></div>
+              </div>
+            </div>`;
+        document.body.appendChild(panel);
+        addCommonStyles();
+        makeDraggable(panel, panel.querySelector('#ftp-match-head'));
+        panel.querySelector('#ftp-match-toggle').addEventListener('click', (e) => {
+            e.stopPropagation();
+            const body = panel.querySelector('#ftp-match-body');
+            const hidden = body.style.display === 'none';
+            body.style.display = hidden ? 'block' : 'none';
+            e.target.textContent = hidden ? '\u25BC' : '\u25B2';
+        });
+        panel.querySelector('#ftp-match-analyze').addEventListener('click', () => {
+            const input = panel.querySelector('#ftp-match-input');
+            panel.querySelector('#ftp-match-output').innerHTML = renderMatchReview(parseMatchScorecard(input.value));
+        });
+    }
+
     function recommendPitchForSquad(seamRating, spinRating, batRating) {
         // Based on Admin team's expert guide from FTP forums
         // Team strength categories: Batting, Seam (F/FM), Spin
@@ -9519,6 +9772,7 @@ table.ftp-table {
     async function init() {
         const pageType = detectPageType();
         console.log('[FTP Advisor] Page:', pageType);
+        createMatchReviewUI();
 
         // One-time cleanup: getOpponentTeamId()/extractOpponentTeamIdFromGame()
         // used to blindly treat "Home" as the opponent, which is wrong on a
