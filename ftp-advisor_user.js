@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         FTP Advisor
 // @namespace    http://tampermonkey.net/
-// @version      8.75
+// @version      8.76
 // @description  Tactical/scouting advisor for fromthepavilion.org (cricket sim): team, tactics, pitch, training, transfer market, youth and squad plan advice with projections. Full changelog: github.com/Jadax/ftp-advisor
 // @author       Tushant Sharma
 // @license      MIT
@@ -61,9 +61,10 @@
     //   OPPONENT SCOUTING:        getOpponentTeamId,
     //       extractOpponentTeamIdFromGame, fetchOpponentSquad,
     //       scrapeOpponentSquad, fetchUpcomingFixtures
-    //   MATCH REVIEW (v8.72):      parseMatchScorecard, parseMatchChunk,
-    //       reviewMatch, reviewBatting, reviewBowling, detectCollapse,
-    //       aggregateByType, renderMatchReview, createMatchReviewUI
+    //   MATCH DATA / SCOUTING FEED (v8.72, v8.75): parseMatchScorecard,
+    //       parseMatchChunk, parseScorecardFromHTMLDoc, createMatchPasteUI,
+    //       saveMatchesToHistory, loadMatchHistory, getPlayerHistoryStats,
+    //       getTeamHistoryStats, getPitchHistoryStats, buildPastedScoutingHtml
     //   PLAYER ADVISOR:           scrapePlayerDetailPage, updatePlayerAdvisor,
     //       comparePlayerToSquadPeers
     //   PER-PAGE UI:              updateSquadAdvisor, updateOrdersAdvisor,
@@ -5713,8 +5714,8 @@
     // Parses ONE innings <div> from a real scorecard.htm page — the div
     // contains two tables (batting stats, then bowling figures against
     // that innings). Mirrors parseMatchChunk's output shape exactly so
-    // reviewMatch()/reviewBatting()/reviewBowling() work unchanged
-    // whether the match came from a tab-paste or raw HTML.
+    // the history/scouting lookups work unchanged whether the match came
+    // from a tab-paste or raw HTML.
     function parseInningsDivFromHTML(div) {
         const tables = div.querySelectorAll('table.data.stats');
         if (tables.length < 1) return null;
@@ -5796,9 +5797,9 @@
     // Parses a real scorecard.htm page (raw HTML, e.g. pasted from
     // "view source" or a saved page) into the same {teams, result, toss,
     // motm, innings} shape parseMatchChunk() produces from the tab-
-    // delimited copy-paste text, so reviewMatch() works identically
-    // regardless of which format the user pasted. Real HTML is far more
-    // reliably structured than trying to reconstruct fake tab-delimited
+    // delimited copy-paste text, so the history/scouting lookups work
+    // identically regardless of which format the user pasted. Real HTML is
+    // far more reliably structured than trying to reconstruct fake tab-delimited
     // lines from it, so this parses the actual DOM directly via
     // DOMParser rather than converting HTML to text first.
     function parseScorecardFromHTMLDoc(doc) {
@@ -5872,108 +5873,6 @@
         }
         if (cur) chunks.push(cur);
         return chunks.map(parseMatchChunk).filter(Boolean);
-    }
-
-    // Largest cluster of consecutive wickets falling within 12 runs of each
-    // other (a wobble/collapse), reported as "N wkts for X runs".
-    function detectCollapse(fall) {
-        if (!fall || fall.length < 2) return null;
-        let best = null;
-        for (let i = 0; i < fall.length - 1; i++) {
-            let j = i;
-            while (j + 1 < fall.length && (fall[j + 1].score - fall[j].score) <= 12) j++;
-            const count = j - i + 1;
-            if (count >= 2) {
-                const runs = fall[j].score - fall[i].score;
-                if (!best || count > best.count || (count === best.count && runs < best.runs)) best = { count, runs, span: `${fall[i].over}-${fall[j].over} ov` };
-            }
-        }
-        return best;
-    }
-
-    function aggregateByType(bowlers) {
-        const res = { seam: null, spin: null };
-        for (const b of bowlers) {
-            const cat = b.category === 'seam' || b.category === 'spin' ? b.category : null;
-            if (!cat) continue;
-            res[cat] = res[cat] || { overs: 0, runs: 0, wk: 0 };
-            res[cat].overs += b.overs; res[cat].runs += b.runs; res[cat].wk += b.wickets;
-        }
-        for (const k in res) if (res[k]) res[k].econ = res[k].overs ? res[k].runs / res[k].overs : 0;
-        return res;
-    }
-
-    function reviewBatting(inn, out) {
-        if (!inn.battingPlayers.length) return;
-        const scored = inn.battingPlayers.filter(b => b.runs > 0);
-        const top = [...scored].sort((a, b) => b.runs - a.runs).slice(0, 3);
-        if (top.length) out.push(`batters: ${top.map(b => `${b.name} ${b.runs} (${b.balls})${b.isNotOut ? '*' : ''}`).join(', ')}`);
-        const played = inn.battingPlayers.filter(b => b.balls >= 10);
-        if (played.length >= 2) {
-            const fastest = [...played].sort((a, b) => b.sr - a.sr)[0];
-            const slowest = [...played].sort((a, b) => a.sr - b.sr)[0];
-            if (fastest !== slowest) out.push(`strike: ${fastest.name} raced @${fastest.sr.toFixed(0)} (${fastest.runs}/${fastest.balls}); ${slowest.name} held back @${slowest.sr.toFixed(0)} (${slowest.runs}/${slowest.balls})`);
-        }
-        const keeper = inn.battingPlayers.find(b => b.isKeeper);
-        if (keeper) out.push(`keeper: ${keeper.name} ${keeper.runs} (${keeper.balls})${keeper.isNotOut ? '*' : ''} @SR ${keeper.sr.toFixed(0)}`);
-        const col = detectCollapse(inn.fall);
-        if (col) out.push(`\u26A0 collapse: ${col.count} wkts for ${col.runs} runs (${col.span})`);
-    }
-
-    function reviewBowling(inn, out) {
-        if (!inn.bowlingPlayers.length) return;
-        const withW = inn.bowlingPlayers.filter(b => b.wickets > 0);
-        const best = withW.length ? [...withW].sort((a, b) => b.wickets - a.wickets || a.econ - b.econ)[0]
-            : (inn.bowlingPlayers.length ? [...inn.bowlingPlayers].sort((a, b) => a.econ - b.econ)[0] : null);
-        const leak = [...inn.bowlingPlayers].filter(b => b.overs >= 2).sort((a, b) => b.econ - a.econ)[0]
-            || [...inn.bowlingPlayers].sort((a, b) => b.econ - a.econ)[0];
-        if (best) out.push(`bowler: ${best.name} (${best.type || '?'}) ${best.wickets}/${best.runs} @${best.econ} in ${best.oversText} ov`);
-        if (leak && leak !== best && inn.rr != null && leak.econ > inn.rr) out.push(`\u26A0 leak: ${leak.name} (${leak.type || '?'}) ${leak.wickets}/${leak.runs} @${leak.econ} vs team RR ${inn.rr}`);
-        const agg = aggregateByType(inn.bowlingPlayers);
-        const parts = [];
-        if (agg.seam && agg.seam.overs > 0) parts.push(`seam ${agg.seam.overs.toFixed(1)}ov ${agg.seam.runs}/${agg.seam.wk} @${agg.seam.econ.toFixed(2)}`);
-        if (agg.spin && agg.spin.overs > 0) parts.push(`spin ${agg.spin.overs.toFixed(1)}ov ${agg.spin.runs}/${agg.spin.wk} @${agg.spin.econ.toFixed(2)}`);
-        if (parts.length) {
-            out.push(`split: ${parts.join(' \u00B7 ')}`);
-            if (agg.seam && agg.spin) {
-                const e = agg.spin.econ - agg.seam.econ;
-                if (Math.abs(e) >= 1.5) out.push(`${e < 0 ? 'spin' : 'seam'} notably cheaper (@${Math.abs(e).toFixed(2)} econ edge)`);
-            }
-        }
-    }
-
-    function reviewMatch(match) {
-        const out = [];
-        out.push(`${match.teams.join(' v ')} — ${match.result}`);
-        if (match.motm) out.push(`MoM: ${match.motm.split(',')[0].trim()}`);
-        match.innings.forEach((inn, i) => {
-            out.push('');
-            out.push(`\u25B8 ${inn.battingTeam} ${inn.runs}/${inn.wickets} (${inn.overs} ov, RR ${inn.rr}) — bowled by ${inn.bowlingTeam || '?'}`);
-            reviewBatting(inn, out);
-            reviewBowling(inn, out);
-        });
-        if (match.innings.length >= 2) {
-            const in1 = match.innings[0], in2 = match.innings[1];
-            const res = match.result || '';
-            const in2Won = res.toLowerCase().includes(in2.battingTeam.toLowerCase()) && /won/i.test(res);
-            const in1Won = res.toLowerCase().includes(in1.battingTeam.toLowerCase()) && /won/i.test(res);
-            if (in2Won && in1.rr != null && in2.rr != null) {
-                out.push(`\u2713 ${in2.battingTeam} chased ${in1.runs} at RR ${in2.rr} (needed ${in1.rr}) — ${in2.rr >= in1.rr ? 'paced at/above the required rate' : 'paced under rate but wickets in hand'}`);
-            } else if (in1Won) {
-                // Defended total / failed chase - previously produced NO
-                // pacing commentary at all (the only branch handled a
-                // successful chase). Most completed matches are this shape:
-                // the side batting second loses more often than it
-                // successfully chases a target down.
-                const shortfall = in1.runs - in2.runs;
-                if (in2.wickets >= 10) {
-                    out.push(`✗ ${in2.battingTeam} bowled out for ${in2.runs} in ${in2.overs} overs chasing ${in1.runs} (${shortfall} short) — ${in1.battingTeam} defended successfully`);
-                } else if (in1.rr != null && in2.rr != null) {
-                    out.push(`✗ ${in2.battingTeam} fell short at ${in2.runs}/${in2.wickets} (RR ${in2.rr} vs required ${in1.rr}) chasing ${in1.runs} — ran out of overs, ${in1.battingTeam} defended successfully`);
-                }
-            }
-        }
-        return out;
     }
 
     // ── Pasted-match history persistence + scouting lookups ──
@@ -6173,35 +6072,26 @@
         return '';
     }
 
-    function renderMatchReview(matches) {
-        if (!matches || !matches.length) return '<div class="vj-text-xs vj-text-muted">Couldn\u2019t parse any matches \u2014 paste a full scorecard block (Result / Toss / two innings).</div>';
-        return matches.map(m => {
-            const lines = reviewMatch(m);
-            const colored = lines.map(l => {
-                let color = 'var(--vj-text-muted)';
-                if (/^\u2713/.test(l) || /bowler:|notably cheaper/.test(l)) color = 'var(--vj-green)';
-                else if (/collapse|leak/.test(l)) color = 'var(--vj-red)';
-                return `<div class="vj-text-xs" style="color:${color};line-height:1.5;">${escapeHtml(l)}</div>`;
-            }).join('');
-            return `<div style="border-top:1px solid var(--vj-border);margin-top:6px;padding-top:4px;">${colored}</div>`;
-        }).join('');
-    }
-
-    function createMatchReviewUI() {
+    // A bare paste-and-save box — deliberately NOT a report. Pasting a match
+    // here only feeds the persisted history that Match Orders/Ground read
+    // from (buildPastedScoutingHtml/getPitchHistoryStats above); there is no
+    // on-screen analysis of the pasted match itself, per explicit user
+    // instruction ("the match review part is not needed").
+    function createMatchPasteUI() {
         if (document.getElementById('ftp-match-panel')) return;
         const panel = document.createElement('div');
         panel.id = 'ftp-match-panel';
         panel.innerHTML = `
-            <div style="position:fixed;right:12px;bottom:12px;z-index:2147483646;width:370px;max-height:70vh;display:flex;flex-direction:column;background:var(--vj-surface);border:1px solid var(--vj-border);border-radius:12px;box-shadow:0 8px 24px rgba(0,0,0,.25);font:12px/1.5 system-ui;">
+            <div style="position:fixed;right:12px;bottom:12px;z-index:2147483646;width:320px;background:var(--vj-surface);border:1px solid var(--vj-border);border-radius:12px;box-shadow:0 8px 24px rgba(0,0,0,.25);font:12px/1.5 system-ui;">
               <div id="ftp-match-head" style="padding:8px 10px;background:var(--vj-surface2,#eef1f4);border-radius:12px 12px 0 0;cursor:move;font-weight:700;display:flex;justify-content:space-between;align-items:center;">
-                <span>\u{1F3C6} Match Review</span>
-                <button id="ftp-match-toggle" style="background:none;border:none;cursor:pointer;font-size:12px;">\u25BC</button>
+                <span>\u{1F4CB} Match Data</span>
+                <button id="ftp-match-toggle" style="background:none;border:none;cursor:pointer;font-size:12px;">▼</button>
               </div>
-              <div id="ftp-match-body" style="padding:8px 10px;overflow:auto;">
-                <div class="vj-text-xs vj-text-muted" style="margin-bottom:4px;">Paste a scorecard block \u2014 get reasoning on batters, bowlers and tactics (chase pacing, seam vs spin, collapses).</div>
-                <textarea id="ftp-match-input" spellcheck="false" style="width:100%;height:96px;box-sizing:border-box;font:11px/1.4 monospace;">${escapeHtml('')}</textarea>
-                <button id="ftp-match-analyze" class="ftp-button ftp-button-primary" style="width:100%;margin-top:6px;">\u2699 Analyze</button>
-                <div id="ftp-match-output" style="margin-top:6px;"></div>
+              <div id="ftp-match-body" style="padding:8px 10px;">
+                <div class="vj-text-xs vj-text-muted" style="margin-bottom:4px;">Paste a completed scorecard (tab-copy or full page HTML) to feed real bowler/batter/pitch evidence into Match Orders and Ground.</div>
+                <textarea id="ftp-match-input" spellcheck="false" style="width:100%;height:72px;box-sizing:border-box;font:11px/1.4 monospace;"></textarea>
+                <button id="ftp-match-analyze" class="ftp-button ftp-button-primary" style="width:100%;margin-top:6px;">\u{1F4BE} Save</button>
+                <div id="ftp-match-output" class="vj-text-xs vj-text-muted" style="margin-top:6px;"></div>
               </div>
             </div>`;
         document.body.appendChild(panel);
@@ -6212,17 +6102,19 @@
             const body = panel.querySelector('#ftp-match-body');
             const hidden = body.style.display === 'none';
             body.style.display = hidden ? 'block' : 'none';
-            e.target.textContent = hidden ? '\u25BC' : '\u25B2';
+            e.target.textContent = hidden ? '▼' : '▲';
         });
         panel.querySelector('#ftp-match-analyze').addEventListener('click', () => {
             const input = panel.querySelector('#ftp-match-input');
             const matches = parseMatchScorecard(input.value);
-            // Persist so Match Orders/Ground can use this as real scouting
-            // evidence later — the review text below is a side effect, not
-            // the point.
+            const output = panel.querySelector('#ftp-match-output');
+            if (!matches.length) {
+                output.textContent = 'Couldn’t parse any matches — paste a full scorecard (Result/Toss + two innings, or the full scorecard.htm HTML).';
+                return;
+            }
             saveMatchesToHistory(matches);
-            panel.querySelector('#ftp-match-output').innerHTML = renderMatchReview(matches) +
-                (matches.length ? `<div class="vj-text-xs vj-text-muted" style="margin-top:4px;">Saved to match history (${loadMatchHistory().length} total) — will surface as scouting evidence on Match Orders when these players/teams come up.</div>` : '');
+            output.textContent = `Saved ${matches.length} match${matches.length > 1 ? 'es' : ''} (${loadMatchHistory().length} total in history) — will surface as scouting evidence on Match Orders/Ground when these players/teams/pitches come up.`;
+            input.value = '';
         });
     }
 
@@ -10166,7 +10058,7 @@ table.ftp-table {
     async function init() {
         const pageType = detectPageType();
         console.log('[FTP Advisor] Page:', pageType);
-        createMatchReviewUI();
+        createMatchPasteUI();
 
         // One-time cleanup: getOpponentTeamId()/extractOpponentTeamIdFromGame()
         // used to blindly treat "Home" as the opponent, which is wrong on a
