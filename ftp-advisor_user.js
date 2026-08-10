@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         FTP Advisor
 // @namespace    http://tampermonkey.net/
-// @version      8.77
+// @version      8.78
 // @description  Tactical/scouting advisor for fromthepavilion.org (cricket sim): team, tactics, pitch, training, transfer market, youth and squad plan advice with projections. Full changelog: github.com/Jadax/ftp-advisor
 // @author       Tushant Sharma
 // @license      MIT
@@ -4884,51 +4884,92 @@
 
             if (gParts && sParts) {
                 const gBefore = gParts.filter(p => p.side === 'before');
-                const gAfter = gParts.filter(p => p.side === 'after');
                 const sBefore = sParts.filter(p => p.side === 'before');
-                const sAfter = sParts.filter(p => p.side === 'after');
+                const gAfterBase = gParts.filter(p => p.side === 'after');
+                const sAfterBase = sParts.filter(p => p.side === 'after');
 
                 // Before-break spells first (alternating ends, preserving per-end
                 // order), then after-break spells — numbering is side-aware, so
                 // list order only affects which spell gets the lower over numbers
                 // on its own side, never which side.
-                const rebuilt = [];
-                for (let i = 0; i < Math.max(gBefore.length, sBefore.length); i++) {
-                    if (i < gBefore.length) rebuilt.push(gBefore[i]);
-                    if (i < sBefore.length) rebuilt.push(sBefore[i]);
-                }
-                for (let i = 0; i < Math.max(gAfter.length, sAfter.length); i++) {
-                    if (i < gAfter.length) rebuilt.push(gAfter[i]);
-                    if (i < sAfter.length) rebuilt.push(sAfter[i]);
-                }
+                const buildAndVerify = (gAfter, sAfter) => {
+                    const rebuilt = [];
+                    for (let i = 0; i < Math.max(gBefore.length, sBefore.length); i++) {
+                        if (i < gBefore.length) rebuilt.push(gBefore[i]);
+                        if (i < sBefore.length) rebuilt.push(sBefore[i]);
+                    }
+                    for (let i = 0; i < Math.max(gAfter.length, sAfter.length); i++) {
+                        if (i < gAfter.length) rebuilt.push(gAfter[i]);
+                        if (i < sAfter.length) rebuilt.push(sAfter[i]);
+                    }
+                    const candidate = rebuilt.slice();
+                    fixAdjacency(candidate);
+                    numberAndTactics(candidate, { breakOver });
+                    fixAdjacency(candidate);
+                    numberAndTactics(candidate, { breakOver });
 
-                const originalPlan = plan;
-                plan = rebuilt;
-                fixAdjacency(plan);
-                numberAndTactics(plan, { breakOver });
-                fixAdjacency(plan);
-                numberAndTactics(plan, { breakOver });
+                    // Verify the candidate is well-formed: no collisions,
+                    // nothing out of range, no bowler bowling consecutive
+                    // over numbers. `fixAdjacency` alone can't guarantee this
+                    // — it only reorders LIST position, but the drinks-break
+                    // rebuild numbers Gibson/Southern's after-side
+                    // independently via their own monotonic counters, so two
+                    // entries that are far apart in list order can still end
+                    // up on numerically adjacent real overs (e.g. Southern's
+                    // over 42 and Gibson's over 43 both landing on the same
+                    // bowler even though neither end alone has a problem —
+                    // a real case found via harness, not hypothetical).
+                    const overMap = new Map();
+                    let collides = false;
+                    for (const sp of candidate) {
+                        for (let o = sp.startOver; o <= sp.startOver + (sp.overs - 1) * 2; o += 2) {
+                            if (overMap.has(o)) collides = true;
+                            overMap.set(o, sp.player.id);
+                        }
+                    }
+                    const outOfRange = candidate.some(sp => sp.startOver < 1 || sp.startOver + (sp.overs - 1) * 2 > totalOvers);
+                    let adjacent = false;
+                    for (let o = 1; o < totalOvers; o++) {
+                        if (overMap.get(o) && overMap.get(o) === overMap.get(o + 1)) adjacent = true;
+                    }
+                    return { ok: !collides && !outOfRange && !adjacent, candidate };
+                };
 
-                // Safety net: verify the rebuilt plan is well-formed before
-                // trusting it — no collisions, nothing out of range, no bowler
-                // bowling consecutive over numbers. Fall back to the valid
-                // un-split plan if anything is off.
-                const overMap = new Map();
-                let collides = false;
-                for (const sp of plan) {
-                    for (let o = sp.startOver; o <= sp.startOver + (sp.overs - 1) * 2; o += 2) {
-                        if (overMap.has(o)) collides = true;
-                        overMap.set(o, sp.player.id);
+                // Reordering entries WITHIN one end's after-list only changes
+                // WHICH of that end's own sequential over-slots a bowler
+                // gets — never their total overs — so trying other orderings
+                // can't violate a per-bowler cap. Small lists (splittable
+                // spells per end are rare — 2-5 is typical), so a bounded,
+                // fully DETERMINISTIC permutation search (same input always
+                // produces the same output — no Math.random anywhere in
+                // this file, and that's deliberate, see the training-sim
+                // determinism note elsewhere) is cheap and far more likely
+                // to find a valid split than the single fixed interleave.
+                const permutations = (arr) => {
+                    if (arr.length <= 1) return [arr];
+                    const out = [];
+                    for (let i = 0; i < arr.length; i++) {
+                        const rest = arr.slice(0, i).concat(arr.slice(i + 1));
+                        for (const p of permutations(rest)) out.push([arr[i], ...p]);
+                    }
+                    return out;
+                };
+                const gPerms = gAfterBase.length <= 5 ? permutations(gAfterBase) : [gAfterBase];
+                const sPerms = sAfterBase.length <= 5 ? permutations(sAfterBase) : [sAfterBase];
+
+                let found = null;
+                outer:
+                for (const gp of gPerms) {
+                    for (const sp of sPerms) {
+                        const res = buildAndVerify(gp, sp);
+                        if (res.ok) { found = res.candidate; break outer; }
                     }
                 }
-                const outOfRange = plan.some(sp => sp.startOver < 1 || sp.startOver + (sp.overs - 1) * 2 > totalOvers);
-                let adjacent = false;
-                for (let o = 1; o < totalOvers; o++) {
-                    if (overMap.get(o) && overMap.get(o) === overMap.get(o + 1)) adjacent = true;
-                }
-                if (collides || outOfRange || adjacent) {
-                    console.warn('[FTP Advisor] Drinks-break rebuild failed verification — keeping the un-split allocation.');
-                    plan = originalPlan;
+
+                if (found) {
+                    plan = found;
+                } else {
+                    console.warn('[FTP Advisor] Drinks-break rebuild could not find a valid split after searching all end orderings — keeping the un-split allocation.');
                 }
             } else {
                 console.warn('[FTP Advisor] Drinks-break rest plan could not be balanced — keeping the un-split allocation.');
