@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         FTP Advisor
 // @namespace    http://tampermonkey.net/
-// @version      8.79
+// @version      8.80
 // @description  Tactical/scouting advisor for fromthepavilion.org (cricket sim): team, tactics, pitch, training, transfer market, youth and squad plan advice with projections. Full changelog: github.com/Jadax/ftp-advisor
 // @author       Tushant Sharma
 // @license      MIT
@@ -4802,14 +4802,26 @@
         fixAdjacency(plan);
         numberAndTactics(plan);
 
-        // ---- Rest across the drinks break (OD/YOD only) ----
+        // ---- Rest across the drinks break (all four formats) ----
         // Manual-confirmed mechanic: "Energy is partially replenished
         // during drinks breaks and during the change of innings"
-        // (rulespage=matchengine). Giving a bowler some overs before the
-        // halfway break and some after is a real rest window, instead of
-        // bowling their whole allocation in one continuous block. T20
-        // spells are short (max 4) and the manual treats the break as a
-        // minor factor there, so this pass is OD/YOD-only.
+        // (rulespage=matchengine) — the manual text has no format
+        // qualifier, so this applies to T20/Youth T20 exactly as much as
+        // OD/Youth OD. Giving a bowler some overs before the halfway break
+        // and some after is a real rest window, instead of bowling their
+        // whole allocation in one continuous block.
+        //
+        // v8.80 — previously OD/YOD-only (`!isT20` gate), on the reasoning
+        // that "T20 spells are short (max 4) and the manual treats the
+        // break as a minor factor there." That reasoning wasn't actually
+        // manual-sourced (a judgment call, not a quote) and the user
+        // pushed back on it directly. Mechanically nothing blocks it: T20's
+        // own `minPerSpell` is 1 (not 2), so a 4-over T20 spell can legally
+        // split into two 2-over halves around the over-10 halfway point of
+        // a 20-over innings, using the exact same partition/verification
+        // machinery already built for OD. Gate removed; the pass now runs
+        // for every format, with `breakOver = totalOvers / 2` naturally
+        // landing on over 10 for T20/YT20.
         //
         // v8.79 — a spell can only be split if BOTH resulting halves still
         // meet the manual-confirmed minimum spell length (`minPerSpell`,
@@ -4844,7 +4856,7 @@
         // bowler's total overs never changes, so per-bowler over limits
         // hold. If the budget can't be balanced exactly, the un-split plan
         // is kept (the display's no-rest warning covers the residual).
-        if (!isT20 && plan.length > 0) {
+        if (plan.length > 0) {
             const breakOver = totalOvers / 2;
 
             // Partition one end's spell list into before/after parts whose
@@ -5241,7 +5253,7 @@
         displayBattingOrder(battingOrder, opponentAnalysis, context);
 
         // Display bowling
-        displayBowling(bowling, opponentAnalysis, context.overs);
+        displayBowling(bowling, opponentAnalysis, context.overs, context.matchType);
         } catch (err) {
             console.error('[FTP Advisor] Error in updateOrdersAdvisor:', err);
             const ctx = document.getElementById('ftp-context');
@@ -5330,21 +5342,24 @@
         document.getElementById('ftp-batting').innerHTML = html;
     }
 
-    function displayBowling(bowlingSpells, opponentAnalysis, totalOvers) {
+    function displayBowling(bowlingSpells, opponentAnalysis, totalOvers, matchType) {
         let html = '';
+        const isT20 = matchType === 'T20' || matchType === 'YT20';
+        const minPerSpell = isT20 ? 1 : 2;
 
         // Rest-across-the-break check. Real user feedback, and manual-
         // confirmed mechanic: "Energy is partially replenished during
         // drinks breaks and during the change of innings" (rulespage=
-        // matchengine). Splitting a bowler's overs into a spell before
-        // the halfway-point break and another after gives them an actual
-        // rest window, instead of one continuous block. Since v8.53 the
-        // allocator ITSELF does this split (see allocateBowlingSpells()'s
-        // "Rest across the drinks break" pass), so this warning only fires
-        // when the split genuinely couldn't help — e.g. T20 (short spells,
-        // left alone on purpose) or a bowler who couldn't be split without
+        // matchengine) — the manual text has no format qualifier. Splitting
+        // a bowler's overs into a spell before the halfway-point break and
+        // another after gives them an actual rest window, instead of one
+        // continuous block. The allocator ITSELF does this split for every
+        // format since v8.80 (see allocateBowlingSpells()'s "Rest across
+        // the drinks break" pass), so this warning only fires when the
+        // split genuinely couldn't help — a bowler whose spell was too
+        // short to split at all, or one who couldn't be split without
         // breaking the over limits.
-        if (totalOvers && totalOvers < 40) {
+        if (totalOvers) {
             const breakOver = totalOvers / 2;
             const perBowler = {};
             bowlingSpells.forEach(s => {
@@ -5372,26 +5387,32 @@
                 }
                 b.total += s.overs;
             });
-            // The allocator now splits long all-before spells so the bowler
-            // also bowls after the break (real rest window), and applies the
-            // same treatment to low-endurance bowlers from 2 overs up. So a
-            // bowler still flagged here is a genuinely unavoidable edge case.
-            // "all AFTER" bowlers are NOT worth flagging — they're fresh
-            // death-overs bowlers who rested before bowling, which is the
-            // whole point. Only warn when a bowler's block is entirely
-            // BEFORE the break with no break-window recovery afterwards.
+            // v8.79/v8.80: the allocator's own split candidacy threshold is
+            // simply overs >= 2*minPerSpell (2 OD / 2 T20 — same number,
+            // different reason: minPerSpell is 1 for T20 so 2 overs is the
+            // floor either way) — there's no separate low-endurance
+            // carve-out any more (removed in v8.79; a 2-over spell split
+            // "50/50" for a low-endurance bowler used to mean two illegal
+            // 1-over spells). So a bowler still flagged here genuinely
+            // couldn't be split without violating minPerSpell or another
+            // hard constraint — a real, unavoidable edge case, not a gap in
+            // the allocator. "all AFTER" bowlers are NOT worth flagging —
+            // they're fresh death-overs bowlers who rested before bowling,
+            // which is the whole point. Only warn when a bowler's block is
+            // entirely BEFORE the break with no break-window recovery
+            // afterwards.
             const noRest = Object.values(perBowler).filter(b => {
-                const lowEnd = b.endurance <= (b.isYouth ? 4 : 8);
-                return (b.total >= 4 || (lowEnd && b.total >= 2)) && b.before > 0 && b.after === 0 && b.before === b.total;
+                return b.total >= 2 * minPerSpell && b.before > 0 && b.after === 0 && b.before === b.total;
             });
             if (noRest.length > 0) {
                 html += `<div class="ftp-alert warning" style="margin-bottom:6px;"><span>⚠</span><div><strong>No rest across the drinks break:</strong> ${noRest.map(b => `${b.name} (${b.total} overs, all ${b.before === 0 ? 'after' : 'before'})`).join(', ')} — these couldn't be split without breaking the over limits; if a break happens, they'll still get whatever recovery the game grants between their spells in other overs.</div></div>`;
-            }        }
-            // v8.61 explainer — the allocator bakes the low-endurance split in
-            // (see allocateBowlingSpells()'s lowEndurance() threshold), shown
-            // here as a one-line note so the resulting plan reads as intended
-            // rather than looking like arbitrary spell placement.
-            html += `<div class="vj-text-xs vj-text-muted vj-mb-4" style="text-align:center;">\u{1F6C0} Rest across the drinks break: low-endurance bowlers (youth Average or worse, senior Accomplished or worse) get their overs split ~50/50 around the halfway point — community guidance; longer spells are split for everyone.</div>`;
+            }
+            // v8.80 explainer — every format now gets the same treatment
+            // (T20/YT20 included since this version), shown as a one-line
+            // note so the resulting plan reads as intended rather than
+            // looking like arbitrary spell placement.
+            html += `<div class="vj-text-xs vj-text-muted vj-mb-4" style="text-align:center;">\u{1F6C0} Rest across the drinks break: bowlers with a long enough spell (${2 * minPerSpell}+ overs) get it split before/after the halfway point for a real recovery window — applies to every format.</div>`;
+        }
 
         // Endurance/freshness for the death overs (v8.41) — see
         // rankForDeathOvers() in allocateBowlingSpells(): the plan above
