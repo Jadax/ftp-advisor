@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         FTP Advisor
 // @namespace    http://tampermonkey.net/
-// @version      8.73
+// @version      8.74
 // @description  Tactical/scouting advisor for fromthepavilion.org (cricket sim): team, tactics, pitch, training, transfer market, youth and squad plan advice with projections. Full changelog: github.com/Jadax/ftp-advisor
 // @author       Tushant Sharma
 // @license      MIT
@@ -5689,11 +5689,155 @@
         return { teams: parseMatchTeams(chunk.header), result, toss, motm, innings };
     }
 
+    // Parses ONE innings <div> from a real scorecard.htm page — the div
+    // contains two tables (batting stats, then bowling figures against
+    // that innings). Mirrors parseMatchChunk's output shape exactly so
+    // reviewMatch()/reviewBatting()/reviewBowling() work unchanged
+    // whether the match came from a tab-paste or raw HTML.
+    function parseInningsDivFromHTML(div) {
+        const tables = div.querySelectorAll('table.data.stats');
+        if (tables.length < 1) return null;
+        const battingTable = tables[0];
+        const bowlingTable = tables[1];
+
+        const headerTh = battingTable.querySelector('thead th');
+        const battingTeam = headerTh ? headerTh.textContent.trim() : '';
+
+        const battingPlayers = [];
+        battingTable.querySelectorAll('tbody tr').forEach(tr => {
+            const tds = tr.querySelectorAll('td');
+            if (tds.length < 8) return; // DNB row (2 empty + 1 colspan placeholder)
+            const nameLink = tds[0].querySelector('a.player');
+            if (!nameLink) return;
+            const roleText = tds[0].textContent.replace(nameLink.textContent, '').trim();
+            const name = escapeHtml(nameLink.textContent.trim());
+            const dismissalText = (tds[1].textContent.trim() + ' ' + tds[2].textContent.trim()).trim();
+            const runs = parseInt(tds[3].textContent.trim(), 10);
+            if (isNaN(runs)) return;
+            battingPlayers.push({
+                name, dismissal: dismissalText,
+                runs, balls: parseInt(tds[4].textContent.trim(), 10),
+                fours: parseInt(tds[5].textContent.trim(), 10), sixes: parseInt(tds[6].textContent.trim(), 10),
+                sr: parseFloat(tds[7].textContent.trim()),
+                // "wk" as a token anywhere in the role suffix — matches
+                // both "(wk)" and combo roles like "(c,wk)" (see the
+                // matching fix in parseBattingRow for the tab-paste path).
+                isKeeper: /\bwk\b/i.test(roleText),
+                isNotOut: /not out/i.test(dismissalText)
+            });
+        });
+
+        // Extras/Total/Fall of wickets live in <tfoot> rows keyed by <th> label.
+        let wickets = 0, overs = '', runsTotal = 0, rr = null, fall = [];
+        battingTable.querySelectorAll('tfoot tr').forEach(tr => {
+            const th = tr.querySelector('th');
+            if (!th) return;
+            const label = th.textContent.trim();
+            if (/^Total:/i.test(label)) {
+                const rowText = Array.from(tr.querySelectorAll('td')).map(td => td.textContent.trim()).join(' ');
+                const m = rowText.match(/\((\d+)\s+wickets?,\s*([\d.]+)\s+overs?\)\s*(\d+)(?:\s*RR:\s*([\d.]+))?/i);
+                if (m) { wickets = +m[1]; overs = m[2]; runsTotal = +m[3]; rr = m[4] ? +m[4] : null; }
+            } else if (/^Fall of wickets:/i.test(label)) {
+                const rowText = Array.from(tr.querySelectorAll('td')).map(td => td.textContent).join(' ');
+                fall = (rowText.match(/\d+-\d+\s*\([^)]*\)/g) || []).map(it => {
+                    const m = it.match(/(\d+)-(\d+)\s*\(([^)]*?),?\s*([\d.]+?)\s*ov\)/i);
+                    return m ? { wk: +m[1], score: +m[2], over: m[4] } : null;
+                }).filter(Boolean);
+            }
+        });
+
+        const bowlingPlayers = [];
+        if (bowlingTable) {
+            bowlingTable.querySelectorAll('tbody tr').forEach(tr => {
+                const tds = tr.querySelectorAll('td');
+                if (tds.length < 6) return;
+                const nameLink = tds[0].querySelector('a.player');
+                if (!nameLink) return;
+                const typeSpan = tds[0].querySelector('span.bowlerType');
+                const typeMatch = typeSpan ? typeSpan.textContent.match(/\(([a-z]+)\)/i) : null;
+                const type = typeMatch ? typeMatch[1].toLowerCase() : '';
+                const name = escapeHtml(nameLink.textContent.trim());
+                const oversText = tds[1].textContent.trim();
+                bowlingPlayers.push({
+                    name, type, category: BOWLER_CATEGORY[type] || 'none',
+                    oversText, overs: oversToDecimal(oversText),
+                    maidens: parseInt(tds[2].textContent.trim(), 10), runs: parseInt(tds[3].textContent.trim(), 10),
+                    wickets: parseInt(tds[4].textContent.trim(), 10), econ: parseFloat(tds[5].textContent.trim()),
+                    noballs: parseInt((tds[6] && tds[6].textContent.trim()) || '0', 10),
+                    wides: parseInt((tds[7] && tds[7].textContent.trim()) || '0', 10)
+                });
+            });
+        }
+
+        return { battingTeam: escapeHtml(battingTeam), battingPlayers, bowlingPlayers, runs: runsTotal, wickets, overs, extras: '', fall, rr };
+    }
+
+    // Parses a real scorecard.htm page (raw HTML, e.g. pasted from
+    // "view source" or a saved page) into the same {teams, result, toss,
+    // motm, innings} shape parseMatchChunk() produces from the tab-
+    // delimited copy-paste text, so reviewMatch() works identically
+    // regardless of which format the user pasted. Real HTML is far more
+    // reliably structured than trying to reconstruct fake tab-delimited
+    // lines from it, so this parses the actual DOM directly via
+    // DOMParser rather than converting HTML to text first.
+    function parseScorecardFromHTMLDoc(doc) {
+        const h1 = doc.querySelector('#middle h1, h1');
+        const titleText = (h1 ? h1.textContent : (doc.querySelector('title') ? doc.querySelector('title').textContent : '')).trim();
+        const teams = parseMatchTeams(titleText);
+
+        let result = '', toss = '', motm = '';
+        doc.querySelectorAll('table.data tr').forEach(tr => {
+            const th = tr.querySelector('th');
+            const td = tr.querySelector('td');
+            if (!th || !td) return;
+            const label = th.textContent.trim();
+            if (/^Result:/i.test(label)) result = td.textContent.trim();
+            else if (/^Toss:/i.test(label)) toss = td.textContent.trim();
+            else if (/^Man of the match:/i.test(label)) motm = td.textContent.trim();
+        });
+
+        // Each innings is one of the plain (non-"marg-bottom"-table)
+        // wrapper <div>s inside #middle that contains a batting stats
+        // table — using this containment check (rather than a fixed
+        // selector) since the page has no dedicated innings wrapper class.
+        const innings = [];
+        const middle = doc.getElementById('middle') || doc;
+        middle.querySelectorAll(':scope > div').forEach(div => {
+            if (div.querySelector('table.data.stats.marg-bottom')) {
+                const parsed = parseInningsDivFromHTML(div);
+                if (parsed) innings.push(parsed);
+            }
+        });
+
+        if (innings.length >= 2) {
+            innings[0].bowlingTeam = innings[1].battingTeam;
+            innings[1].bowlingTeam = innings[0].battingTeam;
+        }
+        if (innings.length === 0) return null;
+        return { teams, result, toss, motm, innings };
+    }
+
     function parseMatchScorecard(text) {
+        const raw = String(text || '');
+        // HTML input (a real scorecard.htm page pasted, possibly several
+        // back to back) — detected by a real document boundary rather
+        // than a loose tag sniff, so a tab-pasted result that happens to
+        // mention an HTML-looking word isn't misrouted here.
+        if (/<html[\s>]/i.test(raw) && /<\/html\s*>/i.test(raw)) {
+            const docs = raw.match(/<html[\s\S]*?<\/html\s*>/gi) || [];
+            const parser = new DOMParser();
+            return docs.map(docHtml => {
+                try {
+                    const doc = parser.parseFromString(docHtml, 'text/html');
+                    return parseScorecardFromHTMLDoc(doc);
+                } catch (e) { return null; }
+            }).filter(Boolean);
+        }
+
         const chunks = [];
         let cur = null;
-        for (const raw of String(text || '').replace(/\r/g, '').split('\n')) {
-            const line = raw.trimEnd();
+        for (const line0 of raw.replace(/\r/g, '').split('\n')) {
+            const line = line0.trimEnd();
             const isHeader = /match\s+\d+\s*\(/i.test(line) || (/scorecard/i.test(line) && /\sv\s+/i.test(line));
             if (isHeader) { if (cur) chunks.push(cur); cur = { header: line, lines: [] }; }
             else if (cur) cur.lines.push(line);
