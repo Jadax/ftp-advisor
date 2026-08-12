@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         FTP Advisor
 // @namespace    http://tampermonkey.net/
-// @version      8.80
+// @version      8.81
 // @description  Tactical/scouting advisor for fromthepavilion.org (cricket sim): team, tactics, pitch, training, transfer market, youth and squad plan advice with projections. Full changelog: github.com/Jadax/ftp-advisor
 // @author       Tushant Sharma
 // @license      MIT
@@ -4412,6 +4412,30 @@
 
         function endTotal(spells) { return spells.reduce((s, x) => s + x.overs, 0); }
 
+        // v8.81 attempt #1 (reverted): tried removing fillEnd() entirely so
+        // fixEndTotal()'s smarter extend-existing-spell-first Strategy 1
+        // would run instead of fillEnd's simpler "always add a new spell"
+        // loop — motivated by a real user report of a bowler getting THREE
+        // separate spells (3+2+3) instead of a clean two-spell 5-before/3-
+        // after split. That removal broke a genuinely different case:
+        // fillEnd's one-shot "give the whole deficit to one new spell"
+        // approach never leaves a stuck partial remainder, but
+        // fixEndTotal's Strategy 1 (PARTIAL extension of an existing spell)
+        // can — e.g. taking 2 of a 3-over deficit via extension can strand
+        // exactly 1 over that's too small for any strategy to legally turn
+        // into a new spell (minPerSpell=2), even though a single untouched
+        // bowler could have absorbed the full 3-over deficit as one clean
+        // new spell. Confirmed via harness: an under-resourced 7-bowler OD
+        // lineup went from a full 25/25 allocation to a stuck 24/25 the
+        // moment fillEnd was removed. fillEnd is restored below. The
+        // ACTUAL fragmentation fix lives one layer up, in the drinks-break
+        // partitionSideSpells() rewrite (see its own v8.81 comment) — it
+        // now MERGES a bowler's spells on an end by player before deciding
+        // how to split across the break, so it produces at most 2 pieces
+        // per bowler regardless of how many fragments the base allocator
+        // (fillEnd + fixEndTotal, unchanged) happened to produce — the
+        // fragmentation source turned out not to matter once the layer
+        // that actually renders the before/after split normalizes it.
         function fillEnd(spells, target, endName) {
             let need = target - endTotal(spells);
             if (need <= 0) return;
@@ -4509,11 +4533,11 @@
             addSpellTo(gSpells, shared, Math.min(halfMax, perEnd), 'New ball', 'Gibson');
             addSpellTo(gSpells, midBowler, Math.min(maxPerSpell, perEnd - endTotal(gSpells)), 'Middle overs', 'Gibson');
             addSpellTo(gSpells, deathBowler, perEnd - endTotal(gSpells), 'Death overs', 'Gibson');
-            fillEnd(gSpells, perEnd, 'Gibson');
 
             addSpellTo(sSpells, bowlers[1], Math.min(maxPerSpell, perEnd), 'New ball', 'Southern');
             addSpellTo(sSpells, bowlers[4], Math.min(maxPerSpell, perEnd - endTotal(sSpells)), 'Middle overs', 'Southern');
             addSpellTo(sSpells, shared, perEnd - endTotal(sSpells), 'Death overs', 'Southern');
+            fillEnd(gSpells, perEnd, 'Gibson');
             fillEnd(sSpells, perEnd, 'Southern');
 
         } else if (nb >= 4) {
@@ -4522,22 +4546,22 @@
             addSpellTo(gSpells, bowlers[0], Math.min(halfMax, perEnd), 'New ball', 'Gibson');
             addSpellTo(gSpells, bowlers[2], Math.min(maxPerSpell, perEnd - endTotal(gSpells)), 'Middle overs', 'Gibson');
             addSpellTo(gSpells, bowlers[1], perEnd - endTotal(gSpells), 'Death overs', 'Gibson');
-            fillEnd(gSpells, perEnd, 'Gibson');
 
             addSpellTo(sSpells, bowlers[1], Math.min(halfMax, perEnd), 'New ball', 'Southern');
             addSpellTo(sSpells, bowlers[3], Math.min(maxPerSpell, perEnd - endTotal(sSpells)), 'Middle overs', 'Southern');
             addSpellTo(sSpells, bowlers[0], perEnd - endTotal(sSpells), 'Death overs', 'Southern');
+            fillEnd(gSpells, perEnd, 'Gibson');
             fillEnd(sSpells, perEnd, 'Southern');
 
         } else if (nb >= 3) {
             addSpellTo(gSpells, bowlers[0], Math.min(Math.floor(maxPerSpell / 2), perEnd), 'New ball', 'Gibson');
             addSpellTo(gSpells, bowlers[1], Math.min(Math.floor(maxPerSpell / 2), perEnd - endTotal(gSpells)), 'Middle overs', 'Gibson');
             addSpellTo(gSpells, bowlers[2], perEnd - endTotal(gSpells), 'Death overs', 'Gibson');
-            fillEnd(gSpells, perEnd, 'Gibson');
 
             addSpellTo(sSpells, bowlers[2], Math.min(Math.floor(maxPerSpell / 2), perEnd), 'New ball', 'Southern');
             addSpellTo(sSpells, bowlers[0], Math.min(Math.floor(maxPerSpell / 2), perEnd - endTotal(sSpells)), 'Middle overs', 'Southern');
             addSpellTo(sSpells, bowlers[1], perEnd - endTotal(sSpells), 'Death overs', 'Southern');
+            fillEnd(gSpells, perEnd, 'Gibson');
             fillEnd(sSpells, perEnd, 'Southern');
 
         } else {
@@ -4571,7 +4595,16 @@
                 if (deficit <= 0) break;
                 const capLeft = cap[spell.player.id] || 0;
                 if (capLeft <= 0) continue;
-                const canAdd = Math.min(deficit, capLeft, maxPerSpell - spell.overs);
+                // v8.81: also clamp to fatigueSpellCap, not just maxPerSpell —
+                // this is now the ONLY place that closes a same-end deficit
+                // by extending (fillEnd(), which used fatigueSpellCap but ran
+                // BEFORE this and could preempt it, was removed — see the
+                // fillEnd() removal note below). Without this clamp, a
+                // moderately/heavily fatigued bowler's spell could be
+                // extended past what their fatigue realistically allows in
+                // one continuous burst, purely because maxPerSpell alone
+                // permitted it.
+                const canAdd = Math.min(deficit, capLeft, maxPerSpell - spell.overs, fatigueSpellCap(spell.player) - spell.overs);
                 if (canAdd > 0) {
                     spell.overs += canAdd;
                     cap[spell.player.id] -= canAdd;
@@ -4861,18 +4894,46 @@
 
             // Partition one end's spell list into before/after parts whose
             // before-side total is exactly beforeTarget overs.
+            //
+            // v8.81 — operates on spells MERGED per bowler, not the base
+            // allocator's raw spell list. Real user report: a bowler with
+            // (say) 8 total overs on one end, who the base allocator had
+            // already split into two spells (6 + 2) purely because a single
+            // spell can't exceed maxPerSpell, ended up with a THIRD piece
+            // here — this pass didn't know about the bowler's other spell,
+            // so it independently decided the 6-over piece was itself
+            // "splittable" (>= 2*minPerSpell) and split IT too, producing a
+            // pointless 3-piece 3+2+3 shape when the bowler's existing 6/2
+            // spells (once placed on opposite sides of the break) already
+            // gave a real rest window with no extra fragmentation needed.
+            // Merging first means the split decision is made on the
+            // bowler's TRUE total, matching how a human would actually plan
+            // it: one continuous-as-possible block before the break, one
+            // after, using exactly as many pieces as maxPerSpell forces —
+            // never more.
             const partitionSideSpells = (endSpells, beforeTarget) => {
-                // A spell can only split if BOTH halves can still meet
-                // minPerSpell — anything shorter has to stay one continuous
-                // block (splitting a 2-over OD spell "50/50" would mean two
-                // 1-over spells, which the game doesn't allow at all).
-                const candidate = (sp) => sp.overs >= minPerSpell * 2;
-                const parts = endSpells.map(sp => {
-                    if (candidate(sp)) {
-                        const pre = Math.max(minPerSpell, Math.floor(sp.overs / 2));
-                        return { sp, before: pre, after: sp.overs - pre, candidate: true };
+                const merged = new Map(); // player.id -> { sp, total }
+                endSpells.forEach(sp => {
+                    const m = merged.get(sp.player.id);
+                    if (m) m.total += sp.overs;
+                    else merged.set(sp.player.id, { sp, total: sp.overs });
+                });
+                // A bowler's total can only split if BOTH halves can still
+                // meet minPerSpell — anything shorter has to stay one
+                // continuous block (splitting a 2-over OD spell "50/50"
+                // would mean two 1-over spells, which the game doesn't
+                // allow at all).
+                const candidate = (total) => total >= minPerSpell * 2;
+                const parts = Array.from(merged.values()).map(({ sp, total }) => {
+                    if (candidate(total)) {
+                        // Each half must also stay within maxPerSpell — always
+                        // true here since total <= maxPerBowler <= 2*maxPerSpell
+                        // for every format, so no half ever needs a further
+                        // 3-way split.
+                        const pre = Math.max(minPerSpell, Math.floor(total / 2));
+                        return { sp, before: pre, after: total - pre, candidate: true };
                     }
-                    return { sp, before: sp.overs, after: 0, candidate: false };
+                    return { sp, before: total, after: 0, candidate: false };
                 });
 
                 let delta = parts.reduce((s, p) => s + p.before, 0) - beforeTarget;
