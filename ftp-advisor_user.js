@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         FTP Advisor
 // @namespace    http://tampermonkey.net/
-// @version      8.81
+// @version      8.82
 // @description  Tactical/scouting advisor for fromthepavilion.org (cricket sim): team, tactics, pitch, training, transfer market, youth and squad plan advice with projections. Full changelog: github.com/Jadax/ftp-advisor
 // @author       Tushant Sharma
 // @license      MIT
@@ -39,8 +39,9 @@
     //       parseSummaryViewBlock, scrapeSummaryView, fetchSquadSummaryView,
     //       mergeTalentsIntoPlayers
     //   TRANSFER SCOUTING:        AGE_SCOUT_THRESHOLDS, checkScoutBenchmark,
-    //       evaluateTransferTarget, calculateRank, _mapTransferHeader,
-    //       parseTransferRow, fetchPlayerPageDetails, scrapeTransferResults
+    //       evaluateTransferTarget, calculateRank, assessSquadVariety,
+    //       _mapTransferHeader, parseTransferRow, fetchPlayerPageDetails,
+    //       scrapeTransferResults
     //   YOUTH DEVELOPMENT:        YOUTH_DEV_CURVE, evaluateYouthDevelopment,
     //       evaluateYouthRecruit, projectYouthToAge20
     //   TRAINING:                 AGE_TRAINING_MULTIPLIER,
@@ -2125,6 +2126,32 @@
         const wicketkeepers = seniors.filter(p => getPrimarySkillInfo(p).name === 'keeping');
         const allrounders = seniors.filter(p => (p.batting || 0) >= 7 && (p.bowling || 0) >= 7);
 
+        // Bowling-attack composition — official manual (rulespage=
+        // matchengine): "a balanced bowling attack including a mix of
+        // left and right handed spinners and seam bowlers will in general
+        // perform slightly better during a match." Counts EVERY senior
+        // with a real bowlerType (bowlerCategory !== 'none'), not just
+        // primary-role bowlers — a part-time bowling allrounder or keeper
+        // still contributes to the attack's actual variety on matchday.
+        // Consumed by assessSquadVariety() below (shared by both the
+        // youth and senior evaluateTransferTarget() branches, so this
+        // doesn't need computing twice).
+        const realBowlers = seniors.filter(p => p.bowlerCategory && p.bowlerCategory !== 'none');
+        const bowlerTypeCounts = {};
+        Object.keys(BOWLER_CATEGORY).forEach(t => { bowlerTypeCounts[t] = 0; });
+        realBowlers.forEach(p => { if (bowlerTypeCounts[p.bowlerType] !== undefined) bowlerTypeCounts[p.bowlerType]++; });
+        const seamBowlerCount = realBowlers.filter(p => p.bowlerCategory === 'seam').length;
+        const spinBowlerCount = realBowlers.filter(p => p.bowlerCategory === 'spin').length;
+        const leftArmBowlerCount = realBowlers.filter(p => (p.bowlerType || '').startsWith('l')).length;
+        const rightArmBowlerCount = realBowlers.filter(p => (p.bowlerType || '').startsWith('r')).length;
+        // Batting-handedness mix — same manual page: "Partnerships involving
+        // a left hand and right hand batter will cause a small penalty to
+        // be applied to the bowlers" (stated from the bowling side — i.e. a
+        // mixed-handedness lineup makes life harder for the OPPONENT'S
+        // bowlers, so it's a real asset for your own batting order).
+        const leftHandBatCount = seniors.filter(p => p.isLeftHanded).length;
+        const rightHandBatCount = seniors.length - leftHandBatCount;
+
         return {
             count: seniors.length,
             avgRating: Math.round(avg('rating')),
@@ -2155,7 +2182,102 @@
             keeperCount: wicketkeepers.length,
             avgBowlerBowling: bowlers.length > 0 ? Math.round(bowlers.reduce((s, p) => s + (p.bowling || 0), 0) / bowlers.length) : 0,
             avgBatterBatting: batters.length > 0 ? Math.round(batters.reduce((s, p) => s + (p.batting || 0), 0) / batters.length) : 0,
+            realBowlerCount: realBowlers.length,
+            bowlerTypeCounts,
+            seamBowlerCount,
+            spinBowlerCount,
+            leftArmBowlerCount,
+            rightArmBowlerCount,
+            leftHandBatCount,
+            rightHandBatCount,
         };
+    }
+
+    // Squad-variety assessment — official manual (rulespage=matchengine):
+    // "a balanced bowling attack including a mix of left and right handed
+    // spinners and seam bowlers will in general perform slightly better",
+    // and "partnerships involving a left hand and right hand batter [help
+    // against] the bowlers" (i.e. a mixed-handedness batting order is an
+    // asset). Explicit user request: transfer/youth-recruit evaluation
+    // should avoid recommending toward an unbalanced attack (e.g. all
+    // finger spin) or an all-one-handed batting order. Deliberately a
+    // SMALL nudge (max +/-1), same conservative-estimate philosophy as the
+    // unquantified triggered-talent bonuses elsewhere in this file — the
+    // manual says "slightly better", not "essential" — and deliberately
+    // separate from the existing "Premium bowler type" scoring a few lines
+    // below in evaluateTransferTarget() (fast/wrist-spin bowlers command a
+    // MARKET premium regardless of squad fit; this function is squad-FIT
+    // only, an orthogonal axis — a fast bowler can score well on both, or
+    // well on one and poorly on the other, e.g. a 4th fast bowler when the
+    // squad already has three). Shared by both the youth and senior
+    // evaluateTransferTarget() branches (and, via them, the youth-recruit
+    // evaluator) so the two can't independently drift like several other
+    // squad-comparison checks in this file already have.
+    function assessSquadVariety(player, squadStats) {
+        const result = { score: 0, strengths: [], warnings: [] };
+        if (!squadStats || squadStats.realBowlerCount === undefined) return result;
+
+        const category = player.bowlerCategory;
+        if (category === 'seam' || category === 'spin') {
+            const total = squadStats.realBowlerCount;
+            // Only worth commenting on once the squad has enough bowlers
+            // for "mix" to be a meaningful concept — a 1-2 bowler squad is
+            // still being built, not yet unbalanced.
+            if (total >= 3) {
+                const sameTypeCount = squadStats.bowlerTypeCounts[player.bowlerType] || 0;
+                const sameCategoryCount = category === 'seam' ? squadStats.seamBowlerCount : squadStats.spinBowlerCount;
+                const otherCategoryCount = category === 'seam' ? squadStats.spinBowlerCount : squadStats.seamBowlerCount;
+                // Overall seam/spin balance — the manual-cited mix.
+                if (otherCategoryCount === 0 && sameCategoryCount >= 2) {
+                    result.score -= 1;
+                    result.warnings.push(`Squad has ${sameCategoryCount} ${category} bowlers and zero ${category === 'seam' ? 'spin' : 'seam'} — adds to an already one-dimensional attack`);
+                } else if (otherCategoryCount === 0 || sameCategoryCount < otherCategoryCount) {
+                    result.score += 1;
+                    result.strengths.push(`${category === 'seam' ? 'Seam' : 'Spin'} — squad currently leans ${category === 'seam' ? 'spin' : 'seam'}-heavy, this adds balance`);
+                }
+                // Exact-type duplication (the user's literal example: "all
+                // finger spin or wrist spin") — same category, same arm/
+                // style, already 2+ of them.
+                if (sameTypeCount >= 2 && sameTypeCount >= Math.ceil(total / 2)) {
+                    result.score -= 1;
+                    result.warnings.push(`Already ${sameTypeCount} ${player.bowlerType.toUpperCase()} bowlers in the squad (of ${total} total) — limited variety, opponents can prepare for one style`);
+                }
+                // Arm-side balance within category, only flagged once the
+                // squad has enough bowlers of THIS category for it to mean
+                // anything (mirrors the seam/spin check's >=3 gate).
+                if (sameCategoryCount >= 2) {
+                    const isLeftArm = (player.bowlerType || '').startsWith('l');
+                    const sameArmCount = isLeftArm ? squadStats.leftArmBowlerCount : squadStats.rightArmBowlerCount;
+                    const otherArmCount = isLeftArm ? squadStats.rightArmBowlerCount : squadStats.leftArmBowlerCount;
+                    if (otherArmCount === 0 && sameArmCount >= 2) {
+                        result.score -= 1;
+                        result.warnings.push(`Squad's bowlers are all right/left-arm one-sided — no ${isLeftArm ? 'right' : 'left'}-arm option yet`);
+                    }
+                }
+            }
+        }
+
+        // Batting handedness — meaningful for anyone who actually bats
+        // (batting or keeping primary); a pure specialist bowler's batting
+        // handedness barely matters since they rarely face many balls.
+        const primaryName = getPrimarySkillInfo(player).name;
+        if (primaryName === 'batting' || primaryName === 'keeping') {
+            const total = squadStats.leftHandBatCount + squadStats.rightHandBatCount;
+            if (total >= 4) {
+                const isLeft = player.isLeftHanded;
+                const sameHandCount = isLeft ? squadStats.leftHandBatCount : squadStats.rightHandBatCount;
+                const otherHandCount = isLeft ? squadStats.rightHandBatCount : squadStats.leftHandBatCount;
+                if (otherHandCount === 0 && sameHandCount >= 4) {
+                    result.score -= 1;
+                    result.warnings.push(`Batting order is entirely ${isLeft ? 'left' : 'right'}-handed — a mixed order makes life harder for opposition bowlers`);
+                } else if (isLeft && sameHandCount < otherHandCount / 3) {
+                    result.score += 1;
+                    result.strengths.push('Left-handed — squad batting is heavily right-handed, this adds a real mix');
+                }
+            }
+        }
+
+        return result;
     }
 
     /**
@@ -2290,6 +2412,14 @@
                     warnings.push(`${t} present but primary role is ${primaryName} — mismatched, contributes nothing`);
                 }
             });
+
+            // Squad variety (bowler-type/handedness mix) — see
+            // assessSquadVariety()'s own doc comment for the manual quotes
+            // and reasoning. Shared with the senior branch below.
+            const variety = assessSquadVariety(player, squadStats);
+            score += variety.score;
+            strengths.push(...variety.strengths);
+            warnings.push(...variety.warnings);
 
             // "The base" — age-specific primary/technique/experience/
             // fielding minimums (rating for youth). HARD FILTER: must
@@ -2503,6 +2633,18 @@
             } else if ((player.keeping || 0) >= 6 && squadStats.keeperCount < 2) {
                 score += 1; strengths.push('Squad needs a backup wicketkeeper');
             }
+        }
+
+        // Squad variety (bowler-type/handedness mix) — see
+        // assessSquadVariety()'s own doc comment for the manual quotes and
+        // reasoning. Shared with the youth branch above; deliberately
+        // separate from the "Premium bowler type" market-value scoring
+        // just above (orthogonal axes — see that function's comment).
+        {
+            const variety = assessSquadVariety(player, squadStats);
+            score += variety.score;
+            strengths.push(...variety.strengths);
+            warnings.push(...variety.warnings);
         }
 
         // "The base" — age-specific primary/technique/experience/fielding
@@ -10083,7 +10225,17 @@ table.ftp-table {
 
         const cache = loadPlayerCache();
         const squadPlayers = cache ? cache.players : [];
-        const squadStats = computeSquadStats(squadPlayers);
+        // Exclude the player being VIEWED from their own squad comparison —
+        // scrapePlayerDetailPage() has no player id to match on, so name is
+        // the best available key. Matters more since v8.81's squad-variety
+        // check (assessSquadVariety, inside evaluateTransferTarget): without
+        // this, a player's own bowler type/handedness would count toward
+        // the "already have too many of this type" tally used to judge
+        // THEM, which is circular — of course a squad's only left-arm
+        // spinner shows up as "1 of 1" when they're counted in their own
+        // denominator.
+        const squadPlayersExcludingSelf = squadPlayers.filter(p => p.name !== player.name);
+        const squadStats = computeSquadStats(squadPlayersExcludingSelf);
         const isYouth = isYouthAge(player.age);
         const evalResult = evaluateTransferTarget(player, squadStats);
         const rank = calculateRank(player, squadStats);
