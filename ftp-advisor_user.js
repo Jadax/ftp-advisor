@@ -2482,7 +2482,6 @@
         }
 
         const belowMins = seniorMinChecks.filter(s => s.known && s.value < s.min);
-        const meetsAllMins = belowMins.length === 0;
 
         // ANY skill below minimum = filtered out (poor verdict)
         if (belowMins.length > 0) {
@@ -3582,33 +3581,8 @@
                     if (response.status !== 200) return reject(new Error(`HTTP ${response.status}`));
                     const parser = new DOMParser();
                     const doc = parser.parseFromString(response.responseText, 'text/html');
-                    // Same fix as getOpponentTeamId(): "Home" isn't always
-                    // the opponent — check both Home/Away and return
-                    // whichever isn't our own team. The old code returned
-                    // "Home" unconditionally, so a home fixture resolved
-                    // your own team as "the opponent".
-                    const allThs = doc.querySelectorAll('th');
-                    let homeId = null, awayId = null;
-                    for (const th of allThs) {
-                        const label = th.textContent.trim();
-                        if (label !== 'Home' && label !== 'Away') continue;
-                        const td = th.nextElementSibling;
-                        const link = td ? td.querySelector('a') : null;
-                        const match = link ? link.href.match(/teamId=(\d+)/) : null;
-                        if (!match) continue;
-                        if (label === 'Home') homeId = match[1];
-                        else awayId = match[1];
-                    }
-                    if (homeId && homeId !== String(TEAM_ID)) return resolve(homeId);
-                    if (awayId && awayId !== String(TEAM_ID)) return resolve(awayId);
-                    const teamLinks = doc.querySelectorAll('a[href*="teamId="]');
-                    for (const link of teamLinks) {
-                        const match = link.href.match(/teamId=(\d+)/);
-                        if (match && match[1] !== String(TEAM_ID)) {
-                            return resolve(match[1]);
-                        }
-                    }
-                    resolve(null);
+                    const opponentId = findOpponentTeamIdInDocument(doc);
+                    resolve(opponentId);
                 },
                 onerror: function(err) { reject(err); },
                 ontimeout: function() { reject(new Error('Timeout')); }
@@ -3678,11 +3652,6 @@
         if (level < 7) {
             rec.benefits.push('Community guidance: aim for Superior — from there you can train quality players without going bankrupt. Lavish+ is a long-term goal (top clubs run ~2500 supporters driving gate takings).');
         }
-
-        // Sponsorship revenue context (from wiki tables)
-        // Div 1 SOD=$120k, T20=$90k, YOD=$48k, YT20=$24k = $282k total
-        // Div 4 SOD=$60k, T20=$45k, YOD=$24k, YT20=$12k = $141k total
-        const sponsorTotal = financeInfo ? (financeInfo.sponsorshipRevenue || 0) : 0;
 
         // Decision logic
         if (level >= 8) {
@@ -3820,30 +3789,41 @@
         return context;
     }
 
-    // "Home" is NOT always the opponent — it's whichever team actually
-    // has home advantage for this fixture. Whenever YOUR team is playing
-    // at home, "Home" IS your own team, and blindly returning it as "the
-    // opponent" silently scouted and cached your own squad under the
-    // opponent-cache keys (real bug: opponent scouting reports showing
-    // your own team, e.g. Team 1173 appearing as "the opponent" for a
-    // home fixture). Check both Home and Away rows and return whichever
-    // one isn't your own TEAM_ID.
-    function getOpponentTeamId() {
-        const allElements = document.querySelectorAll('th');
-        let homeId = null, awayId = null;
-        for (const th of allElements) {
-            const label = th.textContent.trim();
-            if (label !== 'Home' && label !== 'Away') continue;
+    // Parse the fixture's Home/Away rows once. ID and name consumers
+    // must share this source so the opponent cannot differ by caller.
+    function parseFixtureTeams(doc) {
+        const teams = { home: null, away: null };
+        for (const th of doc.querySelectorAll('th')) {
+            const label = th.textContent.trim().toLowerCase();
+            if (label !== 'home' && label !== 'away') continue;
             const td = th.nextElementSibling;
             const link = td ? td.querySelector('a') : null;
             const match = link ? link.href.match(/teamId=(\d+)/) : null;
             if (!match) continue;
-            if (label === 'Home') homeId = match[1];
-            else awayId = match[1];
+            teams[label] = { id: match[1], name: link.textContent.trim() };
         }
-        if (homeId && homeId !== String(TEAM_ID)) return homeId;
-        if (awayId && awayId !== String(TEAM_ID)) return awayId;
+        return teams;
+    }
+
+    // "Home" is not always the opponent — it is whichever fixture team
+    // is not ours. This helper is shared by live and fetched documents.
+    function findOpponentTeamIdInDocument(doc) {
+        const teams = parseFixtureTeams(doc);
+        if (teams.home && teams.home.id !== String(TEAM_ID)) return teams.home.id;
+        if (teams.away && teams.away.id !== String(TEAM_ID)) return teams.away.id;
+
+        // Some fetched match pages expose team links without Home/Away
+        // table labels. Use the first non-self team link as a fallback.
+        const teamLinks = doc.querySelectorAll('a[href*="teamId="]');
+        for (const link of teamLinks) {
+            const match = link.href.match(/teamId=(\d+)/);
+            if (match && match[1] !== String(TEAM_ID)) return match[1];
+        }
         return null;
+    }
+
+    function getOpponentTeamId() {
+        return findOpponentTeamIdInDocument(document);
     }
 
     // ============================================================
@@ -4480,12 +4460,6 @@
         const maxPerSpell = isT20 ? maxPerBowler : Math.max(2, maxPerBowler - 2);
         const minPerSpell = isT20 ? 1 : 2;
         const perEnd = totalOvers / 2;
-
-        // Low-endurance classification for the rest-across-break pass below
-        // (experienced-player feedback: "Average or worse is low for youths,
-        // Accomplished or worse is low for seniors"). Endurance 4 = Average,
-        // 8 = Accomplished.
-        const lowEndurance = (p) => (p.endurance || 0) <= ((p.isYouth === true || (p.age || 0) < 21) ? 4 : 8);
 
         const pitchEffect = PITCH_EFFECTS[context.pitch] || PITCH_EFFECTS.Sporting;
         const weatherEffect = WEATHER_EFFECTS[context.weather] || WEATHER_EFFECTS.Sunny;
@@ -5439,7 +5413,6 @@
         const bowling = allocateBowlingSpells(lineup, context, opponentAnalysis);
 
         // Display toss
-        const tossColor = tossRec.decision === 'bat' ? 'green' : 'blue';
         const tossIcon = tossRec.decision === 'bat' ? '\u{1F3CF}' : '\u{1F3C3}';
         let dangerHtml = '';
         if (opponentAnalysis && opponentAnalysis.dangerousBowlerCount > 0) {
@@ -6350,25 +6323,11 @@
         };
     }
 
-    // Twin of getOpponentTeamId() — same Home/Away scan, but returns the
-    // opponent's NAME (the link's own text) instead of their ID, since
-    // pasted-match history is keyed by team name, not team ID.
+    // Opponent name uses the same parsed fixture teams as opponent ID.
     function getOpponentTeamName() {
-        const allElements = document.querySelectorAll('th');
-        let homeName = null, homeId = null, awayName = null, awayId = null;
-        for (const th of allElements) {
-            const label = th.textContent.trim();
-            if (label !== 'Home' && label !== 'Away') continue;
-            const td = th.nextElementSibling;
-            const link = td ? td.querySelector('a') : null;
-            if (!link) continue;
-            const match = link.href.match(/teamId=(\d+)/);
-            if (!match) continue;
-            if (label === 'Home') { homeId = match[1]; homeName = link.textContent.trim(); }
-            else { awayId = match[1]; awayName = link.textContent.trim(); }
-        }
-        if (homeId && homeId !== String(TEAM_ID)) return homeName;
-        if (awayId && awayId !== String(TEAM_ID)) return awayName;
+        const teams = parseFixtureTeams(document);
+        if (teams.home && teams.home.id !== String(TEAM_ID)) return teams.home.name;
+        if (teams.away && teams.away.id !== String(TEAM_ID)) return teams.away.name;
         return null;
     }
 
@@ -9431,13 +9390,6 @@ table.ftp-table {
         // Youth: wage varies hugely by age and skill level
         // Community data: 16yo avg=$1,000, 17yo capable=$2,100, 18yo reliable=$3,500, 19yo accomplished=$4,000, 20yo outstanding=$10,351
         const youthMaxPrice = Math.min(Math.round(funds * 0.05), 5000);
-        // Age-based youth wage caps (community-backed):
-        // 16yo: $2,000 (covers average/reasonable skills)
-        // 17yo: $3,000 (covers capable skills)
-        // 18yo: $5,000 (covers reliable skills)
-        // 19yo: $7,000 (covers accomplished skills)
-        // 20yo: $12,000 (covers expert/outstanding skills)
-        const YOUTH_WAGE_CAPS = { 16: 2000, 17: 3000, 18: 5000, 19: 7000, 20: 12000 };
         const youthMaxWage = Math.min(Math.round(weeklyIncome * 0.05), 12000);
 
         targetsEl.innerHTML = `<div class="ftp-info-box success">
