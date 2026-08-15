@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         FTP Advisor
 // @namespace    http://tampermonkey.net/
-// @version      8.83
+// @version      8.87
 // @description  Tactical/scouting advisor for fromthepavilion.org (cricket sim): team, tactics, pitch, training, transfer market, youth and squad plan advice with projections. Full changelog: github.com/Jadax/ftp-advisor
 // @author       Tushant Sharma
 // @license      MIT
@@ -3746,6 +3746,7 @@
             weather: 'Sunny',
             pitch: 'Sporting',
             matchType: 'OD',
+            matchTypeKnown: false,
             overs: 50,
             venue: 'Unknown',
             isYouthOnly: false,
@@ -3780,6 +3781,7 @@
                 context.venue = td.textContent.trim();
             } else if (thText.includes('League')) {
                 const leagueText = td.textContent.trim().toLowerCase();
+                context.matchTypeKnown = true;
                 if (leagueText.includes('youth twenty20') || leagueText.includes('youth t20')) {
                     context.matchType = 'YT20';
                     context.overs = 20;
@@ -4114,13 +4116,13 @@
             // Depends on team strength
             if (opponentAnalysis && opponentAnalysis.relativeStrength === 'weaker') {
                 decision = 'bat';
-                reason = 'Uneven pitch: Your batting is stronger. Bat first to create RRR pressure. Wicket-taking potential all innings.';
+                reason = 'Uneven pitch: Opponent is weaker overall. Bat first to create RRR pressure and make the chase difficult.';
             } else if (opponentAnalysis && opponentAnalysis.relativeStrength === 'stronger') {
                 decision = 'bowl';
-                reason = 'Uneven pitch: Your seamers are stronger. Bowl first to attack early. "Particularly destructive around drinks."';
+                reason = 'Uneven pitch: Opponent is stronger overall. Bowl first to attack early and create pressure around the drinks break.';
             } else {
                 decision = 'bat';
-                reason = 'Uneven pitch: Similar teams. Bat first to create RRR pressure. Good seamers get wickets all innings.';
+                reason = 'Uneven pitch: Teams are similar overall. Bat first to create RRR pressure; good seamers can take wickets throughout.';
             }
         } else if (pitch === 'Green') {
             decision = 'bowl';
@@ -5317,7 +5319,7 @@
         // Context display
         document.getElementById('ftp-context').innerHTML = `
             <div class="vj-flex vj-gap-6 vj-mb-4" style="flex-wrap:wrap;">
-                <span class="ftp-stat-badge blue">${context.matchType} \u00B7 ${context.overs}ov</span>
+                <span class="ftp-stat-badge blue">${context.matchType}${context.matchTypeKnown ? '' : ' (fallback)'} \u00B7 ${context.overs}ov</span>
                 <span class="ftp-stat-badge neutral">${context.pitch}</span>
                 <span class="ftp-stat-badge neutral">${context.weather}</span>
             </div>
@@ -5366,7 +5368,7 @@
                 hasAcademyInfo: false,
                 hasFinanceInfo: false,
                 hasOpponentData: !!opponentCache && opponentCache.players.length > 0,
-                matchTypeKnown: context.matchType !== 'Unknown',
+                matchTypeKnown: context.matchTypeKnown === true,
             });
             const ctxEl = document.getElementById('ftp-context');
             if (ctxEl) {
@@ -5443,8 +5445,8 @@
             const names = opponentAnalysis.dangerousBowlerNames.join(', ');
             const isLimitedOversT20 = context && (context.matchType === 'T20' || context.matchType === 'YT20');
             const dangerAdvice = isLimitedOversT20
-                ? 'These have triggered delivery talents (Yorker/Bouncer/Swing/etc). Keep the tail aggressive in T20 for scoring rate, but avoid exposing weak batters earlier than necessary.'
-                : 'These have triggered delivery talents (Yorker/Bouncer/Swing/etc). The recommended OD tactics set positions 8–11 defensively to preserve wickets through the threat.';
+                ? `These have triggered delivery talents (Yorker/Bouncer/Swing/etc). Keep the tail aggressive in ${context.matchType} for scoring rate, but avoid exposing weak batters earlier than necessary.`
+                : `These have triggered delivery talents (Yorker/Bouncer/Swing/etc). The recommended ${context.matchType} tactics set positions 8–11 defensively to preserve wickets through the threat.`;
             dangerHtml = `<div class="ftp-alert danger" style="margin:6px 0 0 0;"><span>\ud83d\udea8</span><div><strong>Opponent has ${opponentAnalysis.dangerousBowlerCount} dangerous bowler${opponentAnalysis.dangerousBowlerCount > 1 ? 's' : ''}:</strong> ${names} — ${dangerAdvice}</div></div>`;
         }
         if (opponentAnalysis && opponentAnalysis.inForm) {
@@ -5520,14 +5522,14 @@
         html += '</tbody></table>';
         const pitchSlow = context && ['Sticky', 'Crumbling', 'Slow'].includes(context.pitch);
         let tacticNote = isT20
-            ? 'N=Normal D=Defensive A=Aggressive \u00B7 T20: aggressive middle/death to maximise scoring rate'
-            : 'C = Captain \u00B7 WK = Wicketkeeper \u00B7 N=Normal D=Defensive A=Aggressive \u00B7 OD: anchor at #3, threat-aware tail';
+            ? `N=Normal D=Defensive A=Aggressive · ${context.matchType}: aggressive middle/death to maximise scoring rate`
+            : `C = Captain · WK = Wicketkeeper · N=Normal D=Defensive A=Aggressive · ${context.matchType}: anchor at #3, threat-aware tail`;
         // Experienced-player guidance: Normal aggression is perfectly fine —
         // aim for ~60%+ of the overs on Normal (e.g. 30 of 50) rather than
         // over-aggressing; the top order already does exactly that here.
         tacticNote += ' \u00B7 Guidance: keep ~60%+ of overs on Normal (30 of 50) — over-aggression rarely pays';
         if (opponentAnalysis && opponentAnalysis.dangerousBowlerCount > 0 && !isT20) {
-            tacticNote += ' \u00B7 Dangerous-bowler adjustment: OD positions 8–11 set Defensive';
+            tacticNote += ' \u00B7 Dangerous-bowler adjustment: ' + context.matchType + ' positions 8–11 set Defensive';
         }
         html += `<div class="vj-text-xs vj-text-muted vj-mt-4" style="text-align:center;">${tacticNote}</div>`;
 
