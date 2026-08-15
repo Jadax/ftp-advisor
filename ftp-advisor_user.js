@@ -17,6 +17,7 @@
 // @downloadURL  https://raw.githubusercontent.com/Jadax/ftp-advisor/main/ftp-advisor_user.js
 // @supportURL   https://github.com/Jadax/ftp-advisor/issues
 // ==/UserScript==
+// v8.87 release: unified OD/YOD/T20/YT20 tactics, dangerous-bowler batting protection, and visible format-fallback confidence.
 
 (function() {
     'use strict';
