@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         FTP Advisor
 // @namespace    http://tampermonkey.net/
-// @version      8.87
+// @version      8.88
 // @description  Tactical/scouting advisor for fromthepavilion.org (cricket sim): team, tactics, pitch, training, transfer market, youth and squad plan advice with projections. Full changelog: github.com/Jadax/ftp-advisor
 // @author       Tushant Sharma
 // @license      MIT
@@ -17,7 +17,7 @@
 // @downloadURL  https://raw.githubusercontent.com/Jadax/ftp-advisor/main/ftp-advisor_user.js
 // @supportURL   https://github.com/Jadax/ftp-advisor/issues
 // ==/UserScript==
-// v8.87 release: unified OD/YOD/T20/YT20 tactics, dangerous-bowler batting protection, and visible format-fallback confidence.
+// v8.88 release: unified tactics, removed dead declarations, and consolidated fixture opponent parsing.
 
 (function() {
     'use strict';
