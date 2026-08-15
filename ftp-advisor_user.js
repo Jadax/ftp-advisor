@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         FTP Advisor
 // @namespace    http://tampermonkey.net/
-// @version      8.82
+// @version      8.83
 // @description  Tactical/scouting advisor for fromthepavilion.org (cricket sim): team, tactics, pitch, training, transfer market, youth and squad plan advice with projections. Full changelog: github.com/Jadax/ftp-advisor
 // @author       Tushant Sharma
 // @license      MIT
@@ -4319,7 +4319,7 @@
     // penalises defensive batting in T20 (too slow to set a chaseable
     // total) and aggressive batting early in OD (risk losing wickets
     // before establishing a platform).
-    function recommendBattingOrder(lineup, context) {
+    function recommendBattingOrder(lineup, context, opponentAnalysis) {
         // Wiki: LH/RH partnerships cause bowler penalty → mix them
         // Opener pairs: try to pair LH + RH
         // Best batsman at #3 or #4 (anchor)
@@ -4328,6 +4328,7 @@
 
         const isT20 = context && (context.matchType === 'T20' || context.matchType === 'YT20');
         const isOD = context && (context.matchType === 'OD' || context.matchType === 'YOD');
+        const hasDangerousBowlers = (opponentAnalysis?.dangerousBowlerCount || 0) > 0;
 
         const hasTalent = (player, regex) => (player.talents || []).some(t => regex.test(t));
         const openerIds = new Set();
@@ -4425,19 +4426,28 @@
             if (!pick) break;
             const isBowler = pick.bowlerCategory !== 'none' || pick.bowling >= MIN_BOWLING_FOR_BOWLERS;
             // T20: everyone aggressive in death overs
-            // OD: bowlers Aggressive (slog), batters Normal (support the hitter)
-            const tactic = isT20 ? 5 : (isBowler ? 5 : 2);
+            // OD: bowlers Aggressive (slog), batters Normal; dangerous lower order is protected
+            // Against triggered delivery talents, protect the actual lower
+            // order in OD: surviving the dangerous spell is more valuable
+            // than asking #8 to #11 to slog. T20 keeps its death-over
+            // aggression because defensive batting there gives up too much
+            // scoring rate; the warning below explains that trade-off.
+            const protectLowerOrder = isOD && hasDangerousBowlers && pos >= 8;
+            const tactic = isT20 ? 5 : (protectLowerOrder ? 4 : (isBowler ? 5 : 2));
             ordered.push({ ...pick, position: pos, battingTactic: tactic });
             used.add(pick.id);
         }
 
-        // Position 9-11: Bowlers/sloggers (aggressive tactic)
-        // Both formats: Aggressive — tail-enders swing for the boundary
+        // Position 9-11: Bowlers/sloggers. Normally the tail swings for the
+        // boundary; in an OD against dangerous delivery talents, preserving
+        // wickets through the threat is the safer recommendation.
         remaining2 = sorted.filter(p => !used.has(p.id));
         while (ordered.length < 11 && remaining2.length > 0) {
             const p = remaining2.shift();
             if (!p) break;
-            ordered.push({ ...p, position: ordered.length + 1, battingTactic: 5 });
+            const position = ordered.length + 1;
+            const tactic = isOD && hasDangerousBowlers ? 4 : 5;
+            ordered.push({ ...p, position, battingTactic: tactic });
             used.add(p.id);
         }
 
@@ -5422,7 +5432,7 @@
         // Generate recommendations
         const tossRec = recommendTossDecision(context, opponentAnalysis);
         const lineup = recommendLineup(enrichedPlayers, context, opponentAnalysis);
-        const battingOrder = recommendBattingOrder(lineup, context);
+        const battingOrder = recommendBattingOrder(lineup, context, opponentAnalysis);
         const bowling = allocateBowlingSpells(lineup, context, opponentAnalysis);
 
         // Display toss
@@ -5431,7 +5441,11 @@
         let dangerHtml = '';
         if (opponentAnalysis && opponentAnalysis.dangerousBowlerCount > 0) {
             const names = opponentAnalysis.dangerousBowlerNames.join(', ');
-            dangerHtml = `<div class="ftp-alert danger" style="margin:6px 0 0 0;"><span>\ud83d\udea8</span><div><strong>Opponent has ${opponentAnalysis.dangerousBowlerCount} dangerous bowler${opponentAnalysis.dangerousBowlerCount > 1 ? 's' : ''}:</strong> ${names} — these have triggered delivery talents (Yorker/Bouncer/Swing/etc). Prepare your lower order defensively.</div></div>`;
+            const isLimitedOversT20 = context && (context.matchType === 'T20' || context.matchType === 'YT20');
+            const dangerAdvice = isLimitedOversT20
+                ? 'These have triggered delivery talents (Yorker/Bouncer/Swing/etc). Keep the tail aggressive in T20 for scoring rate, but avoid exposing weak batters earlier than necessary.'
+                : 'These have triggered delivery talents (Yorker/Bouncer/Swing/etc). The recommended OD tactics set positions 8–11 defensively to preserve wickets through the threat.';
+            dangerHtml = `<div class="ftp-alert danger" style="margin:6px 0 0 0;"><span>\ud83d\udea8</span><div><strong>Opponent has ${opponentAnalysis.dangerousBowlerCount} dangerous bowler${opponentAnalysis.dangerousBowlerCount > 1 ? 's' : ''}:</strong> ${names} — ${dangerAdvice}</div></div>`;
         }
         if (opponentAnalysis && opponentAnalysis.inForm) {
             dangerHtml += `<div class="ftp-alert warning" style="margin:4px 0 0 0;"><span>\u26A0</span><div>Opponent is in strong form (avg form ${(opponentAnalysis.avgForm || 0).toFixed(1)}/10). Expect aggressive play.</div></div>`;
@@ -5507,11 +5521,14 @@
         const pitchSlow = context && ['Sticky', 'Crumbling', 'Slow'].includes(context.pitch);
         let tacticNote = isT20
             ? 'N=Normal D=Defensive A=Aggressive \u00B7 T20: aggressive middle/death to maximise scoring rate'
-            : 'C = Captain \u00B7 WK = Wicketkeeper \u00B7 N=Normal D=Defensive A=Aggressive \u00B7 OD: anchor at #3, aggressive tail';
+            : 'C = Captain \u00B7 WK = Wicketkeeper \u00B7 N=Normal D=Defensive A=Aggressive \u00B7 OD: anchor at #3, threat-aware tail';
         // Experienced-player guidance: Normal aggression is perfectly fine —
         // aim for ~60%+ of the overs on Normal (e.g. 30 of 50) rather than
         // over-aggressing; the top order already does exactly that here.
         tacticNote += ' \u00B7 Guidance: keep ~60%+ of overs on Normal (30 of 50) — over-aggression rarely pays';
+        if (opponentAnalysis && opponentAnalysis.dangerousBowlerCount > 0 && !isT20) {
+            tacticNote += ' \u00B7 Dangerous-bowler adjustment: OD positions 8–11 set Defensive';
+        }
         html += `<div class="vj-text-xs vj-text-muted vj-mt-4" style="text-align:center;">${tacticNote}</div>`;
 
         // Slow pitches generate more dot balls, and Accumulator / Boundary
