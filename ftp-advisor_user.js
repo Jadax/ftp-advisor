@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         FTP Advisor
 // @namespace    http://tampermonkey.net/
-// @version      8.89
+// @version      8.90
 // @description  Tactical/scouting advisor for fromthepavilion.org (cricket sim): team, tactics, pitch, training, transfer market, youth and squad plan advice with projections. Full changelog: github.com/Jadax/ftp-advisor
 // @author       Tushant Sharma
 // @license      MIT
@@ -17,7 +17,7 @@
 // @downloadURL  https://raw.githubusercontent.com/Jadax/ftp-advisor/main/ftp-advisor_user.js
 // @supportURL   https://github.com/Jadax/ftp-advisor/issues
 // ==/UserScript==
-// v8.89 release: prevent duplicate players in XI and batting-order recommendations.
+// v8.90 release: prevent duplicate players in XI and batting-order recommendations.
 
 (function() {
     'use strict';
