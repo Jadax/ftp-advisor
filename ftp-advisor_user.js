@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         FTP Advisor
 // @namespace    http://tampermonkey.net/
-// @version      8.88
+// @version      8.89
 // @description  Tactical/scouting advisor for fromthepavilion.org (cricket sim): team, tactics, pitch, training, transfer market, youth and squad plan advice with projections. Full changelog: github.com/Jadax/ftp-advisor
 // @author       Tushant Sharma
 // @license      MIT
@@ -17,7 +17,7 @@
 // @downloadURL  https://raw.githubusercontent.com/Jadax/ftp-advisor/main/ftp-advisor_user.js
 // @supportURL   https://github.com/Jadax/ftp-advisor/issues
 // ==/UserScript==
-// v8.88 release: unified tactics, removed dead declarations, and consolidated fixture opponent parsing.
+// v8.89 release: prevent duplicate players in XI and batting-order recommendations.
 
 (function() {
     'use strict';
@@ -323,6 +323,28 @@
     // youth training (getYouthPrimarySkillName) and tactics
     // (_detectPlayerContext) — keeping only counts as primary once it's
     // at least Average(4) and actually their best discipline.
+    // Player rows should carry a stable numeric ID, but use a name/age
+    // fallback for partially scraped rows so no recommendation can render
+    // the same player twice when an ID is temporarily missing.
+    function getPlayerIdentity(player) {
+        if (!player) return null;
+        if (player.id !== undefined && player.id !== null && String(player.id) !== '') {
+            return 'id:' + player.id;
+        }
+        const name = String(player.name || '').trim().toLowerCase();
+        return name ? 'name:' + name + '|age:' + (player.age ?? '') : null;
+    }
+
+    function dedupePlayers(players) {
+        const seen = new Set();
+        return (players || []).filter(player => {
+            const identity = getPlayerIdentity(player);
+            if (identity === null) return true;
+            if (seen.has(identity)) return false;
+            seen.add(identity);
+            return true;
+        });
+    }
     function getPrimarySkillInfo(player) {
         const keeping = player.keeping || 0, batting = player.batting || 0, bowling = player.bowling || 0;
         if (keeping >= 4 && keeping >= batting && keeping >= bowling) return { value: keeping, name: 'keeping' };
@@ -4158,7 +4180,10 @@
     // ============================================================
     // LINEUP RECOMMENDATION (with LH/RH mixing + bowling variety)
     // ============================================================
-    function recommendLineup(availablePlayers, context, opponentAnalysis) {
+    function recommendLineup(availablePlayers, context, opponentAnalysis) {        // Keep every downstream selector on a unique candidate set. This is
+        // a hard invariant: the XI and batting order cannot contain a player
+        // twice, even if a page/cache scrape briefly duplicates a row.
+        availablePlayers = dedupePlayers(availablePlayers);
         const pitchEffect = PITCH_EFFECTS[context.pitch] || PITCH_EFFECTS.Sporting;
         const weatherEffect = WEATHER_EFFECTS[context.weather] || WEATHER_EFFECTS.Sunny;
         const isT20 = context.matchType === 'T20' || context.matchType === 'YT20';
@@ -4291,7 +4316,7 @@
             used.add(p.id);
         }
 
-        return lineup;
+        return dedupePlayers(lineup).slice(0, 11);
     }
 
     // ============================================================
@@ -4303,6 +4328,7 @@
     // total) and aggressive batting early in OD (risk losing wickets
     // before establishing a platform).
     function recommendBattingOrder(lineup, context, opponentAnalysis) {
+        lineup = dedupePlayers(lineup);
         // Wiki: LH/RH partnerships cause bowler penalty → mix them
         // Opener pairs: try to pair LH + RH
         // Best batsman at #3 or #4 (anchor)
@@ -4394,7 +4420,7 @@
         while (ordered.length < 8 && remaining2.length > 0) {
             const pos = ordered.length + 1;
             let pick;
-            if (keeper && pos === 6) {
+            if (keeper && pos === 6 && !used.has(keeper.id)) {
                 pick = keeper;
                 remaining2 = remaining2.filter(p => p.id !== keeper.id);
             } else {
@@ -4434,7 +4460,7 @@
             used.add(p.id);
         }
 
-        return ordered;
+        return dedupePlayers(ordered).map((player, index) => ({ ...player, position: index + 1 }));
     }
 
     // ============================================================
