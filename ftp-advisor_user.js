@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         FTP Advisor
 // @namespace    http://tampermonkey.net/
-// @version      8.91
+// @version      8.92
 // @description  Tactical/scouting advisor for fromthepavilion.org (cricket sim): team, tactics, pitch, training, transfer market, youth and squad plan advice with projections. Full changelog: github.com/Jadax/ftp-advisor
 // @author       Tushant Sharma
 // @license      MIT
@@ -3293,7 +3293,14 @@
                 const wageMatch = text.match(/^\$([\d,]+)/);
                 if (ageMatch) {
                     const val = parseInt(ageMatch[1], 10);
-                    if (val >= 16 && val <= 50 && age === 99) age = val;
+                    // Route through parseGameAge like every other age scrape
+                    // (v8.64 convention): this used to store the bare integer
+                    // year, a second age convention that disagreed with the
+                    // decimal the rest of the file uses — harmless for the
+                    // >=21 floor checks (same displayed year), but any future
+                    // consumer (formatAgeDisplay, week-aware reads) would
+                    // have read a 20y14w opponent as 20y1w.
+                    if (val >= 16 && val <= 50 && age === 99) age = parseGameAge(text);
                 } else if (wageMatch) {
                     wage = parseInt(wageMatch[1].replace(/,/g, ''), 10) || 0;
                 }
@@ -5700,10 +5707,14 @@
         // 16#3 spell — overs 16,18,20 — entered as Northern 17#3, which
         // covers 17,19,21 → over 20 unassigned), so the display must both
         // prove the plan tiles and make transcription unambiguous.
+        // v8.92: the spells TABLE below is the single entry reference (it
+        // carries End + 1st Over + # + the exact Covers list per row) — an
+        // earlier separate pair of per-end summary cards repeated the same
+        // spells above it, which read as a second place to enter from.
         if (totalOvers) {
             const coverage = validateSpellCoverage(bowlingSpells, totalOvers);
             if (coverage.ok) {
-                html += `<div class="vj-text-xs" style="color:var(--vj-green);border:1px solid var(--vj-green);border-radius:8px;padding:4px 8px;margin-bottom:6px;text-align:center;">\u2713 Covers all ${totalOvers} overs exactly \u2014 copy each end's spells below top-to-bottom into the game's MATCHING end column.</div>`;
+                html += `<div class="vj-text-xs" style="color:var(--vj-green);border:1px solid var(--vj-green);border-radius:8px;padding:4px 8px;margin-bottom:6px;text-align:center;">\u2713 Covers all ${totalOvers} overs exactly \u2014 ends ALTERNATE overs: for each row below enter the bowler in the game's MATCHING end column, 1st Over = the Over column, # = the Ovs column (the Covers column lists the exact overs each spell fills).</div>`;
             } else {
                 const bits = [];
                 if (coverage.gaps.length) bits.push(`NOT assigned: over ${coverage.gaps.join(', ')}`);
@@ -5712,34 +5723,6 @@
                 html += `<div class="ftp-alert warning" style="margin-bottom:6px;"><span>\u26A0</span><div><strong>Invalid spell plan \u2014 the game will reject this:</strong> ${bits.join(' \u00B7 ')}. This is a bug in the allocation, not your entry \u2014 please report it.</div></div>`;
             }
         }
-
-        // Per-end entry blocks (v8.82) — mirror the game's own two-column
-        // Bowling Orders UI 1:1. The flat over-ordered table below is
-        // correct but reads as a single sequence; when consecutive rows
-        // share an end (rows 4-5 both Southern, rows 6-7 both Gibson in
-        // the reported case) it was easy to keep filling the game's slots
-        // top-to-bottom and land a spell on the wrong end. These blocks
-        // group by end in slot order with the exact overs each spell
-        // covers, so entry is mechanical: type what you see into the
-        // matching column.
-        const endNames = ['Gibson', 'Southern'];
-        const spellsByEnd = { Gibson: [], Southern: [] };
-        bowlingSpells.forEach(s => { if (s && s.player) spellsByEnd[s.end || 'Gibson'].push(s); });
-        endNames.forEach(e => spellsByEnd[e].sort((a, b) => a.startOver - b.startOver));
-        html += '<div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:6px;">';
-        endNames.forEach((e, ei) => {
-            html += `<div style="flex:1;min-width:175px;border:1px solid var(--vj-border);border-radius:8px;padding:6px 8px;">`;
-            html += `<div class="vj-text-xs vj-fw-700" style="margin-bottom:3px;">${ei === 0 ? '\u25B6' : '\u25C0'} ${e} End <span class="vj-text-muted vj-text-xs">(${ei === 0 ? 'odd' : 'even'} overs)</span></div>`;
-            if (spellsByEnd[e].length === 0) {
-                html += `<div class="vj-text-xs vj-text-muted">No spells.</div>`;
-            } else {
-                spellsByEnd[e].forEach((s, i) => {
-                    html += `<div class="vj-text-xs" style="line-height:1.5;margin-bottom:3px;border-bottom:1px dashed var(--vj-border);padding-bottom:2px;"><span class="vj-fw-700">${i + 1}) ${s.player.name}</span><br>1st Over: <span class="vj-fw-700">${s.startOver}</span> \u00B7 # <span class="vj-fw-700">${s.overs}</span><br><span class="vj-text-muted">covers overs ${expandSpellOvers(s).join(', ')}</span></div>`;
-                });
-            }
-            html += '</div>';
-        });
-        html += '</div>';
 
         html += '<table class="ftp-table"><thead><tr><th>#</th><th>End</th><th>Over</th><th>Bowler</th><th>Bowl</th><th>Ovs</th><th>Tac</th><th>Covers</th><th>Phase</th></tr></thead><tbody>';
         bowlingSpells.forEach((spell, index) => {
@@ -6055,7 +6038,16 @@
         if (cells.length < 6) return null;
         const n = cells.length;
         return {
-            name: cells[0].trim(),
+            // SECURITY: same parse-level escape as every other name parser
+            // (see escapeHtml). These names come from pasted scorecards —
+            // including raw scorecard.htm copies full of OTHER users' players
+            // — and are interpolated into innerHTML by
+            // buildPastedScoutingHtml on every later Match Orders visit.
+            // Escaping here also keeps history names comparable with squad
+            // names (which are escaped at their own parse), so the
+            // cross-reference in getPlayerHistoryStats matches for names
+            // containing &/'/</> instead of silently missing them.
+            name: escapeHtml(cells[0].trim()),
             dismissal: cells.slice(1, n - 5).join(' ').trim(),
             runs: parseInt(cells[n - 5], 10), balls: parseInt(cells[n - 4], 10),
             fours: parseInt(cells[n - 3], 10), sixes: parseInt(cells[n - 2], 10),
@@ -6076,7 +6068,10 @@
         const tm = name.match(/\(([^)]+)\)/);
         const type = tm ? tm[1] : '';
         return {
-            name: name.replace(/\s*\([^)]*\)/, '').trim(),
+            // SECURITY: parse-level escape, same as parseBattingRow above —
+            // this name is rendered into innerHTML by
+            // buildPastedScoutingHtml's "Bowlers to watch" line.
+            name: escapeHtml(name.replace(/\s*\([^)]*\)/, '').trim()),
             type, category: BOWLER_CATEGORY[type] || 'none',
             oversText: cells[1], overs: oversToDecimal(cells[1]),
             maidens: parseInt(cells[2], 10), runs: parseInt(cells[3], 10),
