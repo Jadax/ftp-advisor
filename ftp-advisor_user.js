@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         FTP Advisor
 // @namespace    http://tampermonkey.net/
-// @version      8.90
+// @version      8.91
 // @description  Tactical/scouting advisor for fromthepavilion.org (cricket sim): team, tactics, pitch, training, transfer market, youth and squad plan advice with projections. Full changelog: github.com/Jadax/ftp-advisor
 // @author       Tushant Sharma
 // @license      MIT
@@ -5564,6 +5564,42 @@
         document.getElementById('ftp-batting').innerHTML = html;
     }
 
+    // FTP's two ends ALTERNATE overs: a spell entered as "1st Over: 16,
+    // # 3" on an end bowls overs 16, 18, 20 — NOT 16-17-18 contiguously.
+    // Every reasoning about spell placement (rest splits, death overs,
+    // coverage) must expand through this +2 step, never assume contiguous
+    // blocks. Shared by the coverage validator and the display.
+    function expandSpellOvers(spell) {
+        const overs = [];
+        const start = spell && spell.startOver;
+        if (!start || !(spell.overs > 0)) return overs;
+        for (let i = 0; i < spell.overs; i++) overs.push(start + i * 2);
+        return overs;
+    }
+
+    // Hard guarantee that a spell plan actually tiles the innings: every
+    // over 1..totalOvers covered EXACTLY once, no spell running past the
+    // end of the innings. This is what the game itself enforces ("Over 20
+    // has not been assigned") — a plan that fails here will be rejected by
+    // the match-orders form no matter how good the reasoning behind it was.
+    // Returns { ok, gaps[], doubles[], overflow[] }.
+    function validateSpellCoverage(bowlingSpells, totalOvers) {
+        const counts = {};
+        const overflow = [];
+        (bowlingSpells || []).forEach(s => {
+            expandSpellOvers(s).forEach(o => {
+                if (o > totalOvers) { overflow.push({ bowler: s.player ? s.player.name : '?', over: o }); return; }
+                counts[o] = (counts[o] || 0) + 1;
+            });
+        });
+        const gaps = [], doubles = [];
+        for (let o = 1; o <= totalOvers; o++) {
+            if (!counts[o]) gaps.push(o);
+            else if (counts[o] > 1) doubles.push(o);
+        }
+        return { ok: gaps.length === 0 && doubles.length === 0 && overflow.length === 0, gaps, doubles, overflow };
+    }
+
     function displayBowling(bowlingSpells, opponentAnalysis, totalOvers, matchType) {
         let html = '';
         const isT20 = matchType === 'T20' || matchType === 'YT20';
@@ -5656,7 +5692,56 @@
             html += `<div class="vj-text-xs vj-text-muted vj-mb-4" style="text-align:center;">Bowling variety: ${varietyParts.join(' + ')}</div>`;
         }
 
-        html += '<table class="ftp-table"><thead><tr><th>#</th><th>End</th><th>Over</th><th>Bowler</th><th>Bowl</th><th>Ovs</th><th>Tac</th><th>Phase</th></tr></thead><tbody>';
+        // COVERAGE CHECK (v8.82) — the hard gate. The game rejects the
+        // whole sheet unless every over is assigned exactly once ("Please
+        // check that all overs have been allocated to a bowler. Over 20
+        // has not been assigned"). A real user report had a VALID advisor
+        // plan mis-transcribed into the game's per-end slots (a Southern
+        // 16#3 spell — overs 16,18,20 — entered as Northern 17#3, which
+        // covers 17,19,21 → over 20 unassigned), so the display must both
+        // prove the plan tiles and make transcription unambiguous.
+        if (totalOvers) {
+            const coverage = validateSpellCoverage(bowlingSpells, totalOvers);
+            if (coverage.ok) {
+                html += `<div class="vj-text-xs" style="color:var(--vj-green);border:1px solid var(--vj-green);border-radius:8px;padding:4px 8px;margin-bottom:6px;text-align:center;">\u2713 Covers all ${totalOvers} overs exactly \u2014 copy each end's spells below top-to-bottom into the game's MATCHING end column.</div>`;
+            } else {
+                const bits = [];
+                if (coverage.gaps.length) bits.push(`NOT assigned: over ${coverage.gaps.join(', ')}`);
+                if (coverage.doubles.length) bits.push(`assigned TWICE: over ${coverage.doubles.join(', ')}`);
+                if (coverage.overflow.length) bits.push(`runs past the innings end: ${coverage.overflow.map(o => `${o.bowler} over ${o.over}`).join(', ')}`);
+                html += `<div class="ftp-alert warning" style="margin-bottom:6px;"><span>\u26A0</span><div><strong>Invalid spell plan \u2014 the game will reject this:</strong> ${bits.join(' \u00B7 ')}. This is a bug in the allocation, not your entry \u2014 please report it.</div></div>`;
+            }
+        }
+
+        // Per-end entry blocks (v8.82) — mirror the game's own two-column
+        // Bowling Orders UI 1:1. The flat over-ordered table below is
+        // correct but reads as a single sequence; when consecutive rows
+        // share an end (rows 4-5 both Southern, rows 6-7 both Gibson in
+        // the reported case) it was easy to keep filling the game's slots
+        // top-to-bottom and land a spell on the wrong end. These blocks
+        // group by end in slot order with the exact overs each spell
+        // covers, so entry is mechanical: type what you see into the
+        // matching column.
+        const endNames = ['Gibson', 'Southern'];
+        const spellsByEnd = { Gibson: [], Southern: [] };
+        bowlingSpells.forEach(s => { if (s && s.player) spellsByEnd[s.end || 'Gibson'].push(s); });
+        endNames.forEach(e => spellsByEnd[e].sort((a, b) => a.startOver - b.startOver));
+        html += '<div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:6px;">';
+        endNames.forEach((e, ei) => {
+            html += `<div style="flex:1;min-width:175px;border:1px solid var(--vj-border);border-radius:8px;padding:6px 8px;">`;
+            html += `<div class="vj-text-xs vj-fw-700" style="margin-bottom:3px;">${ei === 0 ? '\u25B6' : '\u25C0'} ${e} End <span class="vj-text-muted vj-text-xs">(${ei === 0 ? 'odd' : 'even'} overs)</span></div>`;
+            if (spellsByEnd[e].length === 0) {
+                html += `<div class="vj-text-xs vj-text-muted">No spells.</div>`;
+            } else {
+                spellsByEnd[e].forEach((s, i) => {
+                    html += `<div class="vj-text-xs" style="line-height:1.5;margin-bottom:3px;border-bottom:1px dashed var(--vj-border);padding-bottom:2px;"><span class="vj-fw-700">${i + 1}) ${s.player.name}</span><br>1st Over: <span class="vj-fw-700">${s.startOver}</span> \u00B7 # <span class="vj-fw-700">${s.overs}</span><br><span class="vj-text-muted">covers overs ${expandSpellOvers(s).join(', ')}</span></div>`;
+                });
+            }
+            html += '</div>';
+        });
+        html += '</div>';
+
+        html += '<table class="ftp-table"><thead><tr><th>#</th><th>End</th><th>Over</th><th>Bowler</th><th>Bowl</th><th>Ovs</th><th>Tac</th><th>Covers</th><th>Phase</th></tr></thead><tbody>';
         bowlingSpells.forEach((spell, index) => {
             if (!spell || !spell.player) return;
             const end = spell.end || (index % 2 === 0 ? 'Gibson' : 'Southern');
@@ -5672,6 +5757,7 @@
                 <td>${bowlLabel}</td>
                 <td style="font-weight:700;">${spell.overs}</td>
                 <td><span class="${tacClass}">${tacLabel}</span></td>
+                <td><span class="vj-text-xs vj-text-muted">${expandSpellOvers(spell).join(', ')}</span></td>
                 <td><span class="vj-text-xs">${phaseIcon} ${spell.phase}</span></td>
             </tr>`;
         });
