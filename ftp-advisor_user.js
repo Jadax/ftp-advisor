@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         FTP Advisor
 // @namespace    http://tampermonkey.net/
-// @version      8.92
+// @version      8.93
 // @description  Tactical/scouting advisor for fromthepavilion.org (cricket sim): team, tactics, pitch, training, transfer market, youth and squad plan advice with projections. Full changelog: github.com/Jadax/ftp-advisor
 // @author       Tushant Sharma
 // @license      MIT
@@ -3740,6 +3740,33 @@
     // ============================================================
     // MATCH CONTEXT (pitch, weather, match type)
     // ============================================================
+// The orders page declares its own match settings in inline script
+    // vars (`var _oversPerEnd = 20.0;`) plus the overs grids — this is
+    // authoritative for ANY match length, including friendly comps whose
+    // League label ("WCSL2", etc.) carries no format word and would
+    // otherwise fall through to the 50-over OD default.
+    function scrapeMatchOrderSettings() {
+        const settings = { oversPerEnd: null, minSpellLength: null, maxSpellLength: null };
+        try {
+            for (const s of document.querySelectorAll('script')) {
+                const t = s.textContent || '';
+                const oe = t.match(/\b_oversPerEnd\s*=\s*([\d.]+)/);
+                if (oe) { const v = parseFloat(oe[1]); if (v > 0) settings.oversPerEnd = v; }
+                const mn = t.match(/\b_minSpellLength\s*=\s*([\d.]+)/);
+                if (mn) { const v = parseInt(mn[1], 10); if (v >= 1) settings.minSpellLength = v; }
+                const mx = t.match(/\b_maxSpellLength\s*=\s*([\d.]+)/);
+                if (mx) { const v = parseInt(mx[1], 10); if (v >= 1) settings.maxSpellLength = v; }
+            }
+            if (!(settings.oversPerEnd > 0)) {
+                const even = document.querySelector('#bowlingEndEven .oversEven');
+                const odd = document.querySelector('#bowlingEndOdd .oversOdd');
+                const perEnd = Math.max(even ? even.children.length : 0, odd ? odd.children.length : 0);
+                if (perEnd > 0) settings.oversPerEnd = perEnd;
+            }
+        } catch (e) { /* keep defaults; settings are a refinement, not load-bearing */ }
+        return settings;
+    }
+
     function scrapeMatchContext() {
         const context = {
             weather: 'Sunny',
@@ -3750,7 +3777,10 @@
             venue: 'Unknown',
             isYouthOnly: false,
             maxAge: 99,
-            isHome: null
+            isHome: null,
+            oversFromDoc: false,
+            minSpellLength: 0,
+            maxSpellLength: 0
         };
 
         // Find weather, pitch, league from the match details table
@@ -3811,9 +3841,31 @@
                         // (less reliable but handles cases where the link format differs)
                         context.isHome = null; // unknown
                     }
-                }
+}
             }
         });
+
+        // The game's own orders-page settings beat league-text inference:
+        // friendly comps have no format word in their League cell, so the
+        // branch above would default a 40-over comp to OD/50 and the whole
+        // plan would run off the end of the innings. Overs per end * 2 is
+        // the real total; min/max spell lengths override the per-format
+        // tables in allocateBowlingSpells() (e.g. a 40-over senior comp
+        // still caps a bowler at 8, not the Senior OD 10).
+        const orderSettings = scrapeMatchOrderSettings();
+        if (orderSettings.oversPerEnd > 0) {
+            context.overs = Math.round(orderSettings.oversPerEnd * 2);
+            context.oversFromDoc = true;
+            if (orderSettings.minSpellLength > 0) context.minSpellLength = orderSettings.minSpellLength;
+            if (orderSettings.maxSpellLength > 0) context.maxSpellLength = orderSettings.maxSpellLength;
+            if (!context.matchTypeKnown) {
+                // Overs-only inference for comps with no format word in
+                // their League label: 20/40/50 are the only standard
+                // lengths; 40 maps to the YOD cap table (8) which matches
+                // the game's own _maxSpellLength on such pages.
+                context.matchType = context.overs === 20 ? 'T20' : context.overs === 40 ? 'YOD' : 'OD';
+            }
+        }
 
         return context;
     }
@@ -4488,10 +4540,16 @@
         // below is a heuristic margin (never hand a bowler their entire
         // match quota in one continuous burst), kept proportionate to each
         // format's real per-bowler max rather than a flat 8.
-        const MAX_OVERS_PER_BOWLER = { OD: 10, YOD: 8, T20: 4, YT20: 4 };
-        const maxPerBowler = MAX_OVERS_PER_BOWLER[context.matchType] || (isT20 ? 4 : 10);
+const MAX_OVERS_PER_BOWLER = { OD: 10, YOD: 8, T20: 4, YT20: 4 };
+        // When the orders page declared its own limits
+        // (scrapeMatchOrderSettings), they win over the format table — a
+        // 40-over friendly comp still allows only 8 overs per bowler even
+        // though its League label carries no "youth" word.
+        const maxPerBowler = context.maxSpellLength > 0
+            ? context.maxSpellLength
+            : (MAX_OVERS_PER_BOWLER[context.matchType] || (isT20 ? 4 : 10));
         const maxPerSpell = isT20 ? maxPerBowler : Math.max(2, maxPerBowler - 2);
-        const minPerSpell = isT20 ? 1 : 2;
+        const minPerSpell = context.minSpellLength > 0 ? context.minSpellLength : (isT20 ? 1 : 2);
         const perEnd = totalOvers / 2;
 
         const pitchEffect = PITCH_EFFECTS[context.pitch] || PITCH_EFFECTS.Sporting;
@@ -5327,7 +5385,7 @@
         // Context display
         document.getElementById('ftp-context').innerHTML = `
             <div class="vj-flex vj-gap-6 vj-mb-4" style="flex-wrap:wrap;">
-                <span class="ftp-stat-badge blue">${context.matchType}${context.matchTypeKnown ? '' : ' (fallback)'} \u00B7 ${context.overs}ov</span>
+                <span class="ftp-stat-badge blue">${context.matchType}${context.matchTypeKnown ? '' : (context.oversFromDoc ? '' : ' (fallback)')} \u00B7 ${context.overs}ov${context.oversFromDoc ? ' \u00B7 from page' : ''}</span>
                 <span class="ftp-stat-badge neutral">${context.pitch}</span>
                 <span class="ftp-stat-badge neutral">${context.weather}</span>
             </div>
