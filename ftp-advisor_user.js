@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         FTP Advisor
 // @namespace    http://tampermonkey.net/
-// @version      8.93
+// @version      8.94
 // @description  Tactical/scouting advisor for fromthepavilion.org (cricket sim): team, tactics, pitch, training, transfer market, youth and squad plan advice with projections. Full changelog: github.com/Jadax/ftp-advisor
 // @author       Tushant Sharma
 // @license      MIT
@@ -7411,17 +7411,26 @@ table.ftp-table {
         'keeperbatting': { skills: ['keeping', 'batting', 'technique', 'fielding', 'endurance'], gains: ['K: +primary keeping', 'B: +secondary batting', 'T: +technique', 'F: +fielding', 'E: +endurance'], bestFor: 'Wicketkeeper-batsmen' }
     };
 
-    // ============================================================
+// ============================================================
     // TRAINING BASE RATES — weekly skill-point gain (out of 1000
     // points = 1 full skill level), at Minimal Academy (ACADEMY_SPEED
     // index 0), 100% training, no talents — from the "Base Level
     // Training" table in the user's FTP_Training model
-    // (Refs!I26:Q37). Cross-checked against that table's own per-row
-    // SUM total column. Baseline age in the source is 19 for most
-    // programs, 23-27 for Fitness/Strength (per its footnote) — not
-    // separately corrected for here; folded into the age-multiplier
-    // curve below like everything else.
-    // estimateWeeklyTrainingGain() rescales these against
+    // (Refs!I26:Q37), cross-checked against that table's per-row SUM
+    // total column. NOTE the Fitness/Strength rows there are
+    // TRANSPOSED versus the game: the official manual
+    // (rules.htm?rulespage=training) lists "Fitness | Endurance,
+    // power" and "Strength | Power, endurance", and the workbook's own
+    // DB tab (DB!AK598:AL608 neighbours) simulates exactly that —
+    // Fitness trains Endurance 200/wk at base, Strength trains Power
+    // 190/wk at base (200/70 vs 65/190 in Refs = a pure row swap).
+    // Both totals (255/270) survive the swap, so the old SUM check
+    // couldn't catch it. Refs is the one-in-two-lines transposed tab;
+    // the game manual + DB model agree with the values below.
+    // Baseline age in the source is 19 for most programs, 23-27 for
+    // Fitness/Strength (per its footnote) — not separately corrected
+    // for here; folded into the age-multiplier curve like everything
+    // else. estimateWeeklyTrainingGain() rescales these against
     // ACADEMY_SPEED[0] (minimal = 1.0x, the reference point these
     // base rates were measured at), so they combine correctly with
     // that multiplier instead of double-counting the academy effect.
@@ -7435,8 +7444,8 @@ table.ftp-table {
         keeping:       { endurance: 25, technique: 55, keeping: 160, fielding: 40 },
         keeperbatting: { endurance: 25, batting: 60, technique: 55, keeping: 80, fielding: 30 },
         fielding:      { endurance: 25, technique: 30, fielding: 220 },
-        fitness:       { endurance: 65, power: 190 },
-        strength:      { endurance: 200, power: 70 },
+        fitness:       { endurance: 200, power: 70 },
+        strength:      { endurance: 65, power: 190 },
         rest:          {}
     };
 
@@ -7752,8 +7761,8 @@ table.ftp-table {
                     : behindRow.label.includes('Fielding') ? 'fielding'
                     : behindRow.label.includes('Endurance') ? 'fitness' : null;
                 if (skillKey) {
-                    const progMap = { batting: 'batting', bowling: 'bowling', keeping: 'keeperbatting',
-                        technique: isBowler ? 'bowlingtech' : 'battingtech', fielding: 'fielding', fitness: 'fitness' };
+const progMap = { batting: 'batting', bowling: 'bowling', keeping: 'keeperbatting',
+                        technique: isBowler ? 'bowlingtech' : isKeeper ? 'keeperbatting' : 'battingtech', fielding: 'fielding', fitness: 'fitness' };
                     const skillLabelClean = behindRow.label.replace(/\s*\(.*\)/, '');
                     setProgram(progMap[skillKey] || 'batting',
                         `Youth development curve: ${skillLabelClean} is ${skillLabel(behindRow.value)} — behind the age-${player.age} target of ${skillLabel(behindRow.min)}. Training this skill now to keep pace with the development curve.`, 'high');
@@ -7828,7 +7837,7 @@ table.ftp-table {
             return;
         }
 
-        // Experienced-player training schedule (real community input, same
+// Experienced-player training schedule (real community input, same
         // source as the v8.7 youth staging order): 1) fielding to Reliable
         // in youth (done above), 2) primary/tech to ~21, 3) a SECOND
         // fielding stage to Spectacular (11) or Exceptional (12) — the
@@ -7837,10 +7846,12 @@ table.ftp-table {
         // get 11, 4) primary/tech to ~25, 5) Strength and Endurance each to
         // Exceptional by ~29, then free choice. Gated on the primary skill
         // being at least Reliable so a late-blooming weak primary isn't
-        // starved while fielding climbs.
+        // starved while fielding climbs, and on age < 25 so stage 3 can't
+        // pre-empt stage 5: from 25 it's "mainly strength" (community),
+        // the fielding/primary window is the early-to-mid 20s.
         const isPaceOrWrist = ['rf', 'lf', 'rfm', 'lfm', 'rws', 'lws'].includes(player.bowlerType || '');
         const fieldingTier = isPaceOrWrist ? 11 : 12;
-        if (player.fielding < fieldingTier && primarySkill >= 7) {
+        if (age < 25 && player.fielding < fieldingTier && primarySkill >= 7) {
             setProgram('fielding', `Age ${age}: Fielding second stage — ${skillLabel(player.fielding)} → ${skillLabel(fieldingTier)}. ${isPaceOrWrist ? 'Spectacular is the target for pace/wrist bowlers.' : 'Exceptional — batsmen, medium bowlers and finger spinners field most.'} Community schedule: primary to ~21, fielding to ${skillLabel(fieldingTier)}, primary to ~25, then strength/endurance.`, 'medium');
             return;
         }
