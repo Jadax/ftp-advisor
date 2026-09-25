@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         FTP Advisor
 // @namespace    http://tampermonkey.net/
-// @version      8.94
+// @version      8.95
 // @description  Tactical/scouting advisor for fromthepavilion.org (cricket sim): team, tactics, pitch, training, transfer market, youth and squad plan advice with projections. Full changelog: github.com/Jadax/ftp-advisor
 // @author       Tushant Sharma
 // @license      MIT
@@ -4910,6 +4910,70 @@ const MAX_OVERS_PER_BOWLER = { OD: 10, YOD: 8, T20: 4, YT20: 4 };
                 }
             }
 
+            // Strategy 2.75: still deficit — extend an EXISTING spell while
+            // keeping the per-bowler cap and maxPerSpell, but relaxing the
+            // FATIGUE burst heuristic. Priority matter: two things here are
+            // hard game rules (the per-bowler over cap — the game rejects
+            // the orders with "assigned more than the maximum N overs" —
+            // and never a spell below minPerSpell), while maxPerSpell and
+            // fatigueSpellCap are advisory margins WE added. A 1-over
+            // remainder cannot open a new spell (Strategy 2/2.5 need >=2)
+            // and Strategy 1's fatigue clamp can return canAdd<=0 even when
+            // the bowler still has real cap room — the only other option is
+            // Strategy 3's over-cap extension, i.e. a hard-rules violation
+            // triggered by a soft heuristic. Real report: a full-strength
+            // 6-bowler OD squad (60 overs of cap for 50) produced an 11-over
+            // bowler because a 1-over Southern deficit found no fatigue-legal
+            // extension. Well-resourced squads must never reach Strategy 3.
+            if (deficit > 0) {
+                for (const spell of spells) {
+                    if (deficit <= 0) break;
+                    const capLeft = cap[spell.player.id] || 0;
+                    if (capLeft <= 0) continue;
+                    const canAdd = Math.min(deficit, capLeft, maxPerSpell - spell.overs);
+                    if (canAdd > 0) {
+                        spell.overs += canAdd;
+                        cap[spell.player.id] -= canAdd;
+                        deficit -= canAdd;
+                    }
+                }
+            }
+
+            // Strategy 2.9: deficit SMALLER than minPerSpell. Strategies
+            // 2/2.5 structurally can't close it (their new spell needs
+            // >= minPerSpell) and Strategy 2.75 can't either when every
+            // spell on this end is at cap or maxPerSpell — yet a fully
+            // fresh bowler may still sit at full cap room, because nobody
+            // can legally bowl a 1-over remainder. Pre-8.95 that stranded
+            // remainder fell straight through to Strategy 3's over-cap
+            // extension (instrumented real case: 7-bowler OD, page cap 8,
+            // both ends pushed +1 onto bowlers at exactly 8 while bowl6
+            // had bowled nothing at all). Borrow k = minPerSpell - deficit
+            // overs from an existing spell (it stays >= minPerSpell and
+            // gets its overs back on the cap tracker) and open a fresh
+            // minPerSpell spell for a bowler with the room: net change to
+            // the end total is exactly -deficit, min-spell and per-bowler
+            // caps hold on every side, so well-resourced squads never
+            // reach Strategy 3. Inert for T20 (minPerSpell 1 < any
+            // positive deficit) and for genuinely capped-out squads
+            // (no roomy spell or no bowler with cap room -> Strategy 3's
+            // documented under-resourced backstop still applies).
+            if (deficit > 0 && deficit < minPerSpell) {
+                const k = minPerSpell - deficit;
+                const fresh = bowlers.find(b => (cap[b.id] || 0) === maxPerBowler) || bowlers.find(b => (cap[b.id] || 0) >= minPerSpell);
+                let src = null;
+                for (const sp of spells) {
+                    if (sp.overs >= minPerSpell + k && (!src || sp.overs > src.overs)) src = sp;
+                }
+                if (fresh && src) {
+                    src.overs -= k;
+                    cap[src.player.id] += k;
+                    spells.push({ player: fresh, overs: minPerSpell, phase: 'Death overs', end: endName });
+                    cap[fresh.id] -= minPerSpell;
+                    deficit = 0;
+                }
+            }
+
             // Strategy 3: absolute last resort — if STILL deficit (every
             // eligible bowler is genuinely capped out, e.g. a squad with
             // too few bowling options for this format), extend any spell
@@ -4917,7 +4981,14 @@ const MAX_OVERS_PER_BOWLER = { OD: 10, YOD: 8, T20: 4, YT20: 4 };
             // only trigger when there really is no legal allocation left.
             if (deficit > 0) {
                 const before = deficit;
-                for (const spell of spells) {
+                // Absorb the overage on the LEAST-loaded bowler who still
+                // has spell room, not blindly the first spell in the list —
+                // keeps the documented under-resourced overrun (<=2) on the
+                // bowler with the most actual headroom.
+                const totals = {};
+                spells.forEach(s => { totals[s.player.id] = (totals[s.player.id] || 0) + s.overs; });
+                const ordered = [...spells].sort((a, b) => totals[a.player.id] - totals[b.player.id]);
+                for (const spell of ordered) {
                     if (deficit <= 0) break;
                     const canAdd = Math.min(deficit, maxPerSpell - spell.overs);
                     if (canAdd > 0) {
@@ -4962,36 +5033,100 @@ const MAX_OVERS_PER_BOWLER = { OD: 10, YOD: 8, T20: 4, YT20: 4 };
         // has to produce a valid spell LIST — numbering/adjacency stay here so
         // the rebuild can't accidentally introduce collisions or end/parity
         // mismatches).
-        function fixAdjacency(list) {
-            // Fix adjacency violations: no bowler may bowl consecutive overs.
-            // Run multiple passes since a swap can introduce new violations.
-            // Manual-confirmed per-bowler max overs (rules.htm?rulespage=
-            // competitions): Senior OD 10, Senior T20 4, Youth OD 8, Youth T20
-            // 4 — see MAX_OVERS_PER_BOWLER above. No consecutive overs is also
-            // manual-confirmed (rulespage=matchorders).
-            for (let pass = 0; pass < 3; pass++) {
-                let fixed = false;
-                for (let i = 1; i < list.length; i++) {
-                    if (list[i].player.id === list[i - 1].player.id) {
-                        let swapped = false;
-                        for (let j = i + 1; j < list.length; j++) {
-                            const prevId = i >= 2 ? list[i - 2].player.id : null;
-                            if (list[j].player.id !== list[i - 1].player.id && list[j].player.id !== prevId) {
-                                const nextId = j + 1 < list.length ? list[j + 1].player.id : null;
-                                if (list[i - 1].player.id !== nextId) {
-                                    [list[i], list[j]] = [list[j], list[i]];
-                                    swapped = true;
-                                    fixed = true;
-                                    break;
-                                }
-                            }
-                        }
-                        if (!swapped) {
-                            console.warn(`[FTP Advisor] Adjacency violation: ${list[i].player.name} bowls consecutive overs at slot ${i}`);
-                        }
+        function fixAdjacency(list, opts) {
+            // No bowler may bowl consecutive overs — manual-confirmed
+            // (rulespage=matchorders); per-bowler over limits likewise
+            // (rulespage=competitions), see MAX_OVERS_PER_BOWLER above.
+            //
+            // Over-BASED repair (8.95). The pre-8.95 version compared LIST
+            // neighbours only, which is sound only while the list is a strict
+            // Gibson/Southern alternation — but its own cross-end swaps (and
+            // the tail when one end has more spells) break that alignment, so
+            // a clash like Southern over 16 sitting numerically between
+            // Gibson 15 and 17 was invisible in list order: the "repair" was
+            // a numbering no-op that hid the clash and the plan shipped with
+            // one bowler owning four straight overs (real 11-bowler OD case;
+            // the same blind spot is why the drinks rebuild needed its own
+            // over-level verify). So repair here mirrors numberAndTactics'
+            // over assignment in a dry run, counts real (o, o+1)
+            // same-bowler pairs, and relocates one spell of the clashing
+            // pair (either end) until the count hits zero. Relocation moves
+            // whole spells inside their own numbering sequence, so caps,
+            // coverage, min-spell and per-end totals are untouched; fixed
+            // candidate order + seen-set + pass cap keep it deterministic
+            // and terminating.
+            const breakOver = opts && opts.breakOver;
+            const numberRun = arr => {
+                const counters = {
+                    Gibson: { next: 1, before: 1, after: breakOver != null ? (breakOver % 2 === 0 ? breakOver + 1 : breakOver + 2) : null },
+                    Southern: { next: 2, before: 2, after: breakOver != null ? (breakOver % 2 === 0 ? breakOver + 2 : breakOver + 1) : null }
+                };
+                const om = new Map();
+                for (const sp of arr) {
+                    let start;
+                    if (breakOver != null) {
+                        const side = sp.side === 'after' ? 'after' : 'before';
+                        start = counters[sp.end][side];
+                        counters[sp.end][side] += sp.overs * 2;
+                    } else {
+                        start = counters[sp.end].next;
+                        counters[sp.end].next += sp.overs * 2;
                     }
+                    for (let k = 0; k < sp.overs; k++) om.set(start + 2 * k, sp);
                 }
-                if (!fixed) break;
+                return om;
+            };
+            const countClashes = arr => {
+                const om = numberRun(arr);
+                let c = 0;
+                for (const [o, sp] of om) {
+                    const nx = om.get(o + 1);
+                    if (nx && nx.player.id === sp.player.id) c++;
+                }
+                return c;
+            };
+            const firstClash = om => {
+                for (const [o, sp] of om) {
+                    const nx = om.get(o + 1);
+                    if (nx && nx.player.id === sp.player.id) return { over: o, sp, nx };
+                }
+                return null;
+            };
+            let clash = firstClash(numberRun(list));
+            if (!clash) return;
+            const rank = new Map(list.map((sp, i) => [sp, i]));
+            const sig = arr => arr.map(sp => rank.get(sp)).join(',');
+            const seen = new Set([sig(list)]);
+            const passCap = list.length * 2 + 6;
+            let curN = countClashes(list);
+            for (let pass = 0; pass < passCap && clash; pass++) {
+                const anchors = [clash.sp, clash.nx];
+                let best = null, bestN = curN, plateau = null;
+                for (const anchor of anchors) {
+                    const from = list.indexOf(anchor);
+                    for (let ins = 0; ins < list.length; ins++) {
+                        if (ins === from) continue;
+                        const trial = list.slice();
+                        trial.splice(from, 1);
+                        trial.splice(ins, 0, anchor);
+                        const s = sig(trial);
+                        if (seen.has(s)) continue;
+                        const cn = countClashes(trial);
+                        if (cn < bestN) { bestN = cn; best = trial; if (bestN === 0) break; }
+                        else if (plateau === null && cn === curN) plateau = trial;
+                    }
+                    if (best && bestN === 0) break;
+                }
+                const move = best || plateau;
+                if (!move) {
+                    console.warn(`[FTP Advisor] Adjacency violation: ${clash.sp.player.name} bowls consecutive overs at over ${clash.over + 1}`);
+                    break;
+                }
+                seen.add(sig(move));
+                list.length = 0;
+                for (const sp of move) list.push(sp);
+                curN = countClashes(list);
+                clash = firstClash(numberRun(list));
             }
         }
 
@@ -5246,9 +5381,9 @@ const MAX_OVERS_PER_BOWLER = { OD: 10, YOD: 8, T20: 4, YT20: 4 };
                         if (i < sAfter.length) rebuilt.push(sAfter[i]);
                     }
                     const candidate = rebuilt.slice();
-                    fixAdjacency(candidate);
+                    fixAdjacency(candidate, { breakOver });
                     numberAndTactics(candidate, { breakOver });
-                    fixAdjacency(candidate);
+                    fixAdjacency(candidate, { breakOver });
                     numberAndTactics(candidate, { breakOver });
 
                     // Verify the candidate is well-formed: no collisions,
