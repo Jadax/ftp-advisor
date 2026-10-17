@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         FTP Advisor
 // @namespace    http://tampermonkey.net/
-// @version      8.97
+// @version      8.98
 // @description  Tactical/scouting advisor for fromthepavilion.org (cricket sim): team, tactics, pitch, training, transfer market, youth and squad plan advice with projections. Full changelog: github.com/Jadax/ftp-advisor
 // @author       Tushant Sharma
 // @license      MIT
@@ -4018,9 +4018,10 @@
         // NOTE: Seam/Spin Specialist do NOT belong here. Official manual:
         // "performs better than normal when BATTING against seam/spin
         // bowlers" — a batting matchup talent, not a bonus to the
-        // player's own bowling. Previously misapplied here; moved to
-        // calculateBattingScore(), conditioned on the opponent's actual
-        // bowling mix (opponentAnalysis.seamerCount/spinnerCount).
+        // player's own bowling. Previously misapplied here; applied in
+        // recommendLineup() (batting-order scoring), conditioned on the
+        // opponent's actual bowling mix (opponentAnalysis.seamerCount/
+        // spinnerCount).
         // Skilled bowling: more impactful in T20
         if (hasTalent(/skilled.*bowling/i)) score += isT20 ? 7 : 5;
 
