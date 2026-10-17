@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         FTP Advisor
 // @namespace    http://tampermonkey.net/
-// @version      8.96
+// @version      8.97
 // @description  Tactical/scouting advisor for fromthepavilion.org (cricket sim): team, tactics, pitch, training, transfer market, youth and squad plan advice with projections. Full changelog: github.com/Jadax/ftp-advisor
 // @author       Tushant Sharma
 // @license      MIT
@@ -5910,7 +5910,7 @@ const MAX_OVERS_PER_BOWLER = { OD: 10, YOD: 8, T20: 4, YT20: 4 };
         if (totalOvers) {
             const coverage = validateSpellCoverage(bowlingSpells, totalOvers);
             if (coverage.ok) {
-                html += `<div class="vj-text-xs" style="color:var(--vj-green);border:1px solid var(--vj-green);border-radius:8px;padding:4px 8px;margin-bottom:6px;text-align:center;">\u2713 Covers all ${totalOvers} overs exactly \u2014 ends ALTERNATE overs: for each row below enter the bowler in the game's MATCHING end column, 1st Over = the Over column, # = the Ovs column (the Covers column lists the exact overs each spell fills).</div>`;
+                html += `<div class="vj-text-xs" style="color:var(--vj-green);border:1px solid var(--vj-green);border-radius:8px;padding:4px 8px;margin-bottom:6px;text-align:center;">\u2713 Covers all ${totalOvers} overs exactly \u2014 ends ALTERNATE overs: for each card below enter the bowler in the game's MATCHING end column, then fill the two boxes exactly as shown (1st Over: N \u00B7 #: K \u2014 that spell covers the listed overs).</div>`;
             } else {
                 const bits = [];
                 if (coverage.gaps.length) bits.push(`NOT assigned: over ${coverage.gaps.join(', ')}`);
@@ -5920,7 +5920,12 @@ const MAX_OVERS_PER_BOWLER = { OD: 10, YOD: 8, T20: 4, YT20: 4 };
             }
         }
 
-        html += '<table class="ftp-table"><thead><tr><th>#</th><th>End</th><th>Over</th><th>Bowler</th><th>Bowl</th><th>Ovs</th><th>Tac</th><th>Covers</th><th>Phase</th></tr></thead><tbody>';
+        // v8.97: per-spell CARDS replace the 9-column table — at 360px the
+        // old table forced horizontal scrolling, and the transcription
+        // fields the game's own form asks for (end select + 1st Over +
+        // #) are all the user needs per spell, with skill/covers/phase
+        // on the second line.
+        html += '<div class="ftp-spell-list">';
         bowlingSpells.forEach((spell, index) => {
             if (!spell || !spell.player) return;
             const end = spell.end || (index % 2 === 0 ? 'Gibson' : 'Southern');
@@ -5928,19 +5933,19 @@ const MAX_OVERS_PER_BOWLER = { OD: 10, YOD: 8, T20: 4, YT20: 4 };
             const tacClass = 'ftp-tactic-' + tacLabel;
             const bowlLabel = skillLabel(spell.player.bowling).slice(0,3);
             const phaseIcon = spell.phase === 'New ball' ? '\u{1F535}' : spell.phase === 'Death overs' ? '\u{1F534}' : '\u26AA';
-            html += `<tr>
-                <td style="font-weight:700;">${index + 1}</td>
-                <td><span class="vj-text-xs" style="font-weight:600;">${end === 'Gibson' ? '\u25B6' : '\u25C0'} ${end}</span></td>
-                <td>${spell.startOver}</td>
-                <td style="font-weight:600;">${spell.player.name}</td>
-                <td>${bowlLabel}</td>
-                <td style="font-weight:700;">${spell.overs}</td>
-                <td><span class="${tacClass}">${tacLabel}</span></td>
-                <td><span class="vj-text-xs vj-text-muted">${expandSpellOvers(spell).join(', ')}</span></td>
-                <td><span class="vj-text-xs">${phaseIcon} ${spell.phase}</span></td>
-            </tr>`;
+            html += `<div class="ftp-spell ${end === 'Gibson' ? 'gibson' : 'southern'}">
+                <div class="ftp-spell-main">
+                    <div class="ftp-spell-line1">
+                        <span class="vj-fw-700">${index + 1}</span>
+                        <span class="ftp-spell-end ${end === 'Gibson' ? 'gibson' : 'southern'}">${end === 'Gibson' ? '\u25B6' : '\u25C0'} ${end}</span>
+                        <span class="ftp-spell-inputs">1st Over: ${spell.startOver} \u00B7 #: ${spell.overs}</span>
+                        <span class="${tacClass}">${tacLabel}</span>
+                    </div>
+                    <div class="ftp-spell-line2"><strong>${spell.player.name}</strong> \u00B7 ${bowlLabel} \u00B7 overs ${expandSpellOvers(spell).join(', ')} \u00B7 ${phaseIcon} ${spell.phase}</div>
+                </div>
+            </div>`;
         });
-        html += '</tbody></table>';
+        html += '</div>';
         document.getElementById('ftp-bowling').innerHTML = html;
     }
 
@@ -7131,6 +7136,25 @@ table.ftp-table {
 .ftp-tactic-N { background: var(--vj-blue-bg); color: var(--vj-blue); }
 .ftp-tactic-D { background: var(--vj-amber-bg); color: var(--vj-amber); }
 .ftp-tactic-A { background: var(--vj-red-bg); color: var(--vj-red); }
+
+/* Spell cards (orders page) — width-safe replacement for the 9-column table */
+.ftp-spell-list { display: flex; flex-direction: column; gap: 4px; }
+.ftp-spell {
+  background: var(--vj-card); border: 1px solid var(--vj-border);
+  border-left: 3px solid var(--vj-border); border-radius: var(--vj-radius-sm);
+  padding: 5px 8px; transition: all var(--vj-transition);
+}
+.ftp-spell:hover { box-shadow: var(--vj-shadow); }
+.ftp-spell.gibson { border-left-color: var(--vj-blue); }
+.ftp-spell.southern { border-left-color: var(--vj-amber); }
+.ftp-spell-main { min-width: 0; }
+.ftp-spell-line1 { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; font-size: 11px; }
+.ftp-spell-end { font-weight: 700; font-size: 10px; padding: 1px 6px; border-radius: 8px; white-space: nowrap; }
+.ftp-spell-end.gibson { background: var(--vj-blue-bg); color: var(--vj-blue); }
+.ftp-spell-end.southern { background: var(--vj-amber-bg); color: var(--vj-amber); }
+.ftp-spell-inputs { font-weight: 700; font-variant-numeric: tabular-nums; color: var(--vj-text); }
+.ftp-spell-line2 { font-size: 10.5px; color: var(--vj-text-secondary); margin-top: 2px; line-height: 1.4; }
+.ftp-spell-line2 strong { color: var(--vj-text); }
 
 /* Stat badges */
 .ftp-stat-badge {
