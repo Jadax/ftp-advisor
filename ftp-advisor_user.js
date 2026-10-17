@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         FTP Advisor
 // @namespace    http://tampermonkey.net/
-// @version      8.95
+// @version      8.96
 // @description  Tactical/scouting advisor for fromthepavilion.org (cricket sim): team, tactics, pitch, training, transfer market, youth and squad plan advice with projections. Full changelog: github.com/Jadax/ftp-advisor
 // @author       Tushant Sharma
 // @license      MIT
@@ -4647,7 +4647,10 @@ const MAX_OVERS_PER_BOWLER = { OD: 10, YOD: 8, T20: 4, YT20: 4 };
         // bowler could have absorbed the full 3-over deficit as one clean
         // new spell. Confirmed via harness: an under-resourced 7-bowler OD
         // lineup went from a full 25/25 allocation to a stuck 24/25 the
-        // moment fillEnd was removed. fillEnd is restored below. The
+        // moment fillEnd was removed. (Since v8.95's Strategy 2.9, that
+        // kind of stranded remainder does get closed — but fillEnd's
+        // one-shot fill still produces the cleaner spell shape (no partial
+        // extensions at all), so the restore stands.) The
         // ACTUAL fragmentation fix lives one layer up, in the drinks-break
         // partitionSideSpells() rewrite (see its own v8.81 comment) — it
         // now MERGES a bowler's spells on an end by player before deciding
@@ -5501,7 +5504,7 @@ const MAX_OVERS_PER_BOWLER = { OD: 10, YOD: 8, T20: 4, YT20: 4 };
                 { id: 'ftp-load-opponent-section', label: 'Opponent', icon: '\u{1F50D}', iconColor: 'purple',
                   content: '<button id="ftp-load-opponent" class="ftp-button ftp-button-primary" style="width:100%;">Load Opponent Squad</button>' }
             ],
-            footer: 'FTP Advisor v7.0 \u00B7 Drag to move'
+            footer: advisorFooterText()
         });
     }
 
@@ -6959,7 +6962,13 @@ const MAX_OVERS_PER_BOWLER = { OD: 10, YOD: 8, T20: 4, YT20: 4 };
     // ============================================================
     // DESIGN SYSTEM — v7.0
     // ============================================================
+    let _commonStylesAdded = false;
     function addCommonStyles() {
+        // GM_addStyle does not dedupe: every createPanel() re-render used to
+        // stack another full copy of the stylesheet, bloating the page over
+        // long sessions. A flag keeps it once-per-load.
+        if (_commonStylesAdded) return;
+        _commonStylesAdded = true;
         GM_addStyle(`
 :root {
   /* Warmed the whole neutral scale off cool blue-grey toward a soft
@@ -6991,19 +7000,23 @@ const MAX_OVERS_PER_BOWLER = { OD: 10, YOD: 8, T20: 4, YT20: 4 };
 
 /* Panel */
 #ftp-advisor-panel {
-  position: fixed; top: 50px; right: 20px; width: 440px; max-height: 88vh;
-  background: var(--vj-surface); border-radius: var(--vj-radius);
-  box-shadow: var(--vj-shadow-lg), 0 0 0 1px rgba(0,0,0,0.04);
+  position: fixed; top: 50px; right: 20px; width: 360px; max-width: calc(100vw - 24px);
+  max-height: 88vh;
+  background: var(--vj-surface); border: 1px solid var(--vj-border); border-radius: var(--vj-radius);
+  box-shadow: var(--vj-shadow-lg);
   z-index: 999999; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
   font-size: 13px; color: var(--vj-text); display: flex; flex-direction: column;
   overflow: hidden;
   animation: vjPanelIn 0.22s cubic-bezier(0.16,1,0.3,1);
 }
+/* Collapsed = a floating title bar: content + footer hidden, panel shrinks
+   to the header's intrinsic width so it stops covering the game page. */
+#ftp-advisor-panel.collapsed { width: auto; max-height: none; }
 @keyframes vjPanelIn { from { opacity:0; transform:translateY(-8px) scale(0.98); } to { opacity:1; transform:translateY(0) scale(1); } }
 
 /* Header */
 #ftp-advisor-header {
-  padding: 14px 18px; cursor: move; user-select: none;
+  padding: 11px 14px; cursor: move; user-select: none;
   background: linear-gradient(135deg, var(--vj-navy) 0%, var(--vj-navy-mid) 100%);
   color: #fff; display: flex; justify-content: space-between; align-items: center;
   position: relative; flex-shrink: 0;
@@ -7013,7 +7026,7 @@ const MAX_OVERS_PER_BOWLER = { OD: 10, YOD: 8, T20: 4, YT20: 4 };
   height: 2px; background: linear-gradient(90deg, transparent, var(--vj-gold), transparent);
 }
 #ftp-advisor-header h3 {
-  margin: 0; font-size: 13.5px; font-weight: 700; letter-spacing: 0.8px;
+  margin: 0; font-size: 12.5px; font-weight: 700; letter-spacing: 0.8px;
   text-transform: uppercase; display: flex; align-items: center; gap: 8px;
 }
 #ftp-advisor-header button {
@@ -7028,7 +7041,7 @@ const MAX_OVERS_PER_BOWLER = { OD: 10, YOD: 8, T20: 4, YT20: 4 };
 
 /* Content */
 #ftp-advisor-content {
-  padding: 14px 16px; overflow-y: auto; flex: 1; background: var(--vj-card);
+  padding: 10px 12px; overflow-y: auto; flex: 1; background: var(--vj-card);
   line-height: 1.5;
 }
 #ftp-advisor-content::-webkit-scrollbar { width: 6px; }
@@ -7037,14 +7050,14 @@ const MAX_OVERS_PER_BOWLER = { OD: 10, YOD: 8, T20: 4, YT20: 4 };
 #ftp-advisor-content::-webkit-scrollbar-thumb:hover { background: var(--vj-text-muted); }
 
 /* Section */
-.ftp-section { margin-bottom: 0; padding: 12px 16px; border-bottom: 1px solid var(--vj-border-light); }
+.ftp-section { margin-bottom: 0; padding: 10px 12px; border-bottom: 1px solid var(--vj-border-light); }
 .ftp-section:last-child { border-bottom: none; }
 .ftp-section h4 {
   margin: 0 0 8px 0; color: var(--vj-text); font-size: 11.5px;
   font-weight: 700; text-transform: uppercase; letter-spacing: 1px;
   display: flex; align-items: center; gap: 7px;
 }
-details.ftp-collapsible { margin-bottom: 0; padding: 12px 16px; border-bottom: 1px solid var(--vj-border-light); list-style: none; }
+details.ftp-collapsible { margin-bottom: 0; padding: 10px 12px; border-bottom: 1px solid var(--vj-border-light); list-style: none; }
 details.ftp-collapsible:last-child { border-bottom: none; }
 details.ftp-collapsible[open] { padding-bottom: 12px; }
 details.ftp-collapsible summary { cursor: pointer; padding: 4px 0; list-style: none; display: flex; align-items: center; gap: 4px; }
@@ -7226,6 +7239,17 @@ table.ftp-table {
         `);
     }
 
+    // Version label for panel footers — read from @version via GM_info so
+    // a version bump can never resurrect the stale hardcoded "v7.0" label.
+    function advisorFooterText() {
+        try {
+            if (typeof GM_info !== 'undefined' && GM_info && GM_info.script && GM_info.script.version) {
+                return `FTP Advisor v${GM_info.script.version} \u00B7 Drag to move`;
+            }
+        } catch (e) { /* GM unavailable */ }
+        return 'FTP Advisor \u00B7 Drag to move';
+    }
+
     // ============================================================
     // GENERIC PANEL BUILDER
     // Creates the standard panel shell (header + scrollable content)
@@ -7277,15 +7301,29 @@ table.ftp-table {
         const header = panel.querySelector('#ftp-advisor-header');
         if (header) makeDraggable(panel, header);
 
-        // Auto-attach collapse/expand toggle if button id "ftp-toggle" was declared
+        // Collapse toggle: hides content + footer and shrinks the panel to
+        // its header ("floating bar") so the game page underneath is fully
+        // usable. State persists across pages via a GM key — re-renders
+        // restore it instead of snapping back open.
         const toggleBtn = panel.querySelector('#ftp-toggle');
         if (toggleBtn) {
+            const applyCollapsed = (collapsed) => {
+                const content = panel.querySelector('#ftp-advisor-content');
+                const footerEl = panel.querySelector('#ftp-advisor-footer');
+                panel.classList.toggle('collapsed', collapsed);
+                if (content) content.style.display = collapsed ? 'none' : 'block';
+                if (footerEl) footerEl.style.display = collapsed ? 'none' : '';
+                toggleBtn.textContent = collapsed ? '\u25BC' : '\u25B2';
+                toggleBtn.title = collapsed ? 'Expand' : 'Collapse';
+            };
+            let collapsed = false;
+            try { collapsed = GM_getValue('ftp_panel_collapsed', '0') === '1'; } catch (e) { /* GM unavailable */ }
+            applyCollapsed(collapsed);
             toggleBtn.addEventListener('click', (e) => {
                 e.stopPropagation();
-                const content = panel.querySelector('#ftp-advisor-content');
-                const isHidden = content.style.display === 'none';
-                content.style.display = isHidden ? 'block' : 'none';
-                toggleBtn.textContent = isHidden ? '\u25BC' : '\u25B2';
+                collapsed = !collapsed;
+                applyCollapsed(collapsed);
+                try { GM_setValue('ftp_panel_collapsed', collapsed ? '1' : '0'); } catch (err) { /* GM unavailable */ }
             });
         }
 
