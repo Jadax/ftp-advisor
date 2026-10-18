@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         FTP Advisor
 // @namespace    http://tampermonkey.net/
-// @version      8.98
+// @version      8.99
 // @description  Tactical/scouting advisor for fromthepavilion.org (cricket sim): team, tactics, pitch, training, transfer market, youth and squad plan advice with projections. Full changelog: github.com/Jadax/ftp-advisor
 // @author       Tushant Sharma
 // @license      MIT
@@ -1812,9 +1812,34 @@
         };
     }
 
+    // v8.99: ALL background page fetches share the logged-in session, and
+    // every caller below used to fire in parallel (getAllData's squad +
+    // academy + finance + ground + fixtures burst, the transfer-page
+    // player-detail fan-out). A parallel burst of same-origin requests was
+    // the most plausible script-linked driver of the user's intermittent
+    // session drops — every call site is a background GET, so nothing
+    // depends on requests arriving concurrently. Serialize through one
+    // chain with a spacing gap: one request at a time, ~300ms apart.
+    // Timing-only wrapper — the caller's own resolve/reject semantics are
+    // untouched (its handlers run exactly as before).
+    let _netChain = Promise.resolve();
+    function _queuedRequest(opts) {
+        const run = () => new Promise(runResolve => {
+            setTimeout(() => {
+                const wind = (orig) => (arg) => { runResolve(null); if (orig) orig(arg); };
+                opts.onload = wind(opts.onload);
+                opts.onerror = wind(opts.onerror);
+                opts.ontimeout = wind(opts.ontimeout);
+                GM_xmlhttpRequest(opts);
+            }, 300);
+        });
+        _netChain = _netChain.then(run, run);
+        return _netChain;
+    }
+
     function fetchSquadFromPage(url) {
         return new Promise((resolve, reject) => {
-            GM_xmlhttpRequest({
+            _queuedRequest({
                 method: 'GET',
                 url: url,
                 timeout: 15000,
@@ -1979,7 +2004,7 @@
     // visits purely from network flakiness, not real squad/opponent changes.
     function fetchSquadSummaryView(url, _isRetry) {
         return new Promise((resolve) => {
-            GM_xmlhttpRequest({
+            _queuedRequest({
                 method: 'GET',
                 url: url,
                 timeout: 15000,
@@ -2032,7 +2057,7 @@
 
     function fetchAcademyFromPage(url) {
         return new Promise((resolve, reject) => {
-            GM_xmlhttpRequest({
+            _queuedRequest({
                 method: 'GET',
                 url: url,
                 timeout: 15000,
@@ -2989,7 +3014,7 @@
 
     function fetchFinanceFromPage(url) {
         return new Promise((resolve, reject) => {
-            GM_xmlhttpRequest({
+            _queuedRequest({
                 method: 'GET',
                 url: url,
                 timeout: 15000,
@@ -3010,7 +3035,7 @@
 
     function fetchGroundFromPage(url) {
         return new Promise((resolve, reject) => {
-            GM_xmlhttpRequest({
+            _queuedRequest({
                 method: 'GET',
                 url: url,
                 timeout: 15000,
@@ -3429,7 +3454,7 @@
     //   </table></div>
     function fetchPlayerPageDetails(playerId) {
         return new Promise((resolve) => {
-            GM_xmlhttpRequest({
+            _queuedRequest({
                 method: 'GET',
                 url: `https://www.fromthepavilion.org/player.htm?playerId=${playerId}`,
                 timeout: 10000,
@@ -3602,7 +3627,7 @@
     // Extract opponent teamId from a game.htm page by fetching it
     function extractOpponentTeamIdFromGame(gameUrl) {
         return new Promise((resolve, reject) => {
-            GM_xmlhttpRequest({
+            _queuedRequest({
                 method: 'GET',
                 url: gameUrl,
                 timeout: 15000,
@@ -5644,15 +5669,12 @@ const MAX_OVERS_PER_BOWLER = { OD: 10, YOD: 8, T20: 4, YT20: 4 };
 
         // Display toss
         const tossIcon = tossRec.decision === 'bat' ? '\u{1F3CF}' : '\u{1F3C3}';
+        // v8.99: dangerous-bowler names are deliberately NOT rendered —
+        // the user asked for the advise to be applied internally. The
+        // dangerousBowlerCount still drives recommendLineup/recommendBattingOrder's
+        // tail protection (positions 8-11 Defensive in OD) and the keep-
+        // aggressive-in-T20 logic, which is where it belongs.
         let dangerHtml = '';
-        if (opponentAnalysis && opponentAnalysis.dangerousBowlerCount > 0) {
-            const names = opponentAnalysis.dangerousBowlerNames.join(', ');
-            const isLimitedOversT20 = context && (context.matchType === 'T20' || context.matchType === 'YT20');
-            const dangerAdvice = isLimitedOversT20
-                ? `These have triggered delivery talents (Yorker/Bouncer/Swing/etc). Keep the tail aggressive in ${context.matchType} for scoring rate, but avoid exposing weak batters earlier than necessary.`
-                : `These have triggered delivery talents (Yorker/Bouncer/Swing/etc). The recommended ${context.matchType} tactics set positions 8–11 defensively to preserve wickets through the threat.`;
-            dangerHtml = `<div class="ftp-alert danger" style="margin:6px 0 0 0;"><span>\ud83d\udea8</span><div><strong>Opponent has ${opponentAnalysis.dangerousBowlerCount} dangerous bowler${opponentAnalysis.dangerousBowlerCount > 1 ? 's' : ''}:</strong> ${names} — ${dangerAdvice}</div></div>`;
-        }
         if (opponentAnalysis && opponentAnalysis.inForm) {
             dangerHtml += `<div class="ftp-alert warning" style="margin:4px 0 0 0;"><span>\u26A0</span><div>Opponent is in strong form (avg form ${(opponentAnalysis.avgForm || 0).toFixed(1)}/10). Expect aggressive play.</div></div>`;
         }
@@ -5687,26 +5709,11 @@ const MAX_OVERS_PER_BOWLER = { OD: 10, YOD: 8, T20: 4, YT20: 4 };
     function displayBattingOrder(battingOrder, opponentAnalysis, context) {
         const isT20 = context && (context.matchType === 'T20' || context.matchType === 'YT20');
 
-        // Opponent bowling composition — what our batters are facing
-        let oppBowlingHtml = '';
-        if (opponentAnalysis) {
-            const parts = [];
-            parts.push(`<strong>${opponentAnalysis.seamerCount} seam</strong>, <strong>${opponentAnalysis.spinnerCount} spin</strong>`);
-            if (opponentAnalysis.dangerousBowlerCount > 0) {
-                parts.push(`${opponentAnalysis.dangerousBowlerCount} dangerous (${opponentAnalysis.dangerousBowlerNames.join(', ')})`);
-            }
-            if (opponentAnalysis.keyBowler) {
-                parts.push(`Key: ${opponentAnalysis.keyBowler.name} (exp ${opponentAnalysis.keyBowler.experience})`);
-            }
-            const tacticTip = opponentAnalysis.seamerCount > opponentAnalysis.spinnerCount
-                ? 'More seam attack — LH batters get variety advantage; Seam Specialist talent triggers more.'
-                : opponentAnalysis.spinnerCount > opponentAnalysis.seamerCount
-                ? 'More spin attack — RH batters get variety advantage; Spin Specialist talent triggers more.'
-                : 'Balanced attack — no specific matchup edge.';
-            oppBowlingHtml = `<div class="ftp-alert info" style="margin-bottom:6px;"><span>\u{1F3CF}</span><div><strong>Opponent bowling:</strong> ${parts.join(' \u00B7 ')}<div class="vj-text-xs vj-mt-4">${tacticTip}</div></div></div>`;
-        }
-
-        let html = oppBowlingHtml;
+        // v8.99: the opponent-bowling composition box is deliberately NOT
+        // rendered (internal-use only) — the batter-vs-attack matchup is
+        // already applied inside recommendBattingOrder's LH/RH variety
+        // scoring and recommendLineup's Seam/Spin Specialist gates.
+        let html = '';
         html += '<table class="ftp-table"><thead><tr><th>#</th><th>Player</th><th>Bat</th><th>Form</th><th>L/R</th><th>Tac</th></tr></thead><tbody>';
         battingOrder.forEach(p => {
             const captainMark = p.isCaptain ? ' <span class="ftp-stat-badge amber" style="font-size:9px;padding:1px 5px;">C</span>' : '';
@@ -5732,9 +5739,6 @@ const MAX_OVERS_PER_BOWLER = { OD: 10, YOD: 8, T20: 4, YT20: 4 };
         // aim for ~60%+ of the overs on Normal (e.g. 30 of 50) rather than
         // over-aggressing; the top order already does exactly that here.
         tacticNote += ' \u00B7 Guidance: keep ~60%+ of overs on Normal (30 of 50) — over-aggression rarely pays';
-        if (opponentAnalysis && opponentAnalysis.dangerousBowlerCount > 0 && !isT20) {
-            tacticNote += ' \u00B7 Dangerous-bowler adjustment: ' + context.matchType + ' positions 8–11 set Defensive';
-        }
         html += `<div class="vj-text-xs vj-text-muted vj-mt-4" style="text-align:center;">${tacticNote}</div>`;
 
         // Slow pitches generate more dot balls, and Accumulator / Boundary
@@ -5869,22 +5873,11 @@ const MAX_OVERS_PER_BOWLER = { OD: 10, YOD: 8, T20: 4, YT20: 4 };
             if (noRest.length > 0) {
                 html += `<div class="ftp-alert warning" style="margin-bottom:6px;"><span>⚠</span><div><strong>No rest across the drinks break:</strong> ${noRest.map(b => `${b.name} (${b.total} overs, all ${b.before === 0 ? 'after' : 'before'})`).join(', ')} — these couldn't be split without breaking the over limits; if a break happens, they'll still get whatever recovery the game grants between their spells in other overs.</div></div>`;
             }
-            // v8.80 explainer — every format now gets the same treatment
-            // (T20/YT20 included since this version), shown as a one-line
-            // note so the resulting plan reads as intended rather than
-            // looking like arbitrary spell placement.
-            html += `<div class="vj-text-xs vj-text-muted vj-mb-4" style="text-align:center;">\u{1F6C0} Rest across the drinks break: bowlers with a long enough spell (${2 * minPerSpell}+ overs) get it split before/after the halfway point for a real recovery window — applies to every format.</div>`;
+            // v8.99: the old perpetual one-liners (drinks-break splitting /
+            // death-overs freshness) were removed per user request — both
+            // behaviors are baked into the allocation itself (see
+            // allocateBowlingSpells()) and need no rendering.
         }
-
-        // Endurance/freshness for the death overs (v8.41) — see
-        // rankForDeathOvers() in allocateBowlingSpells(): the plan above
-        // already leans toward a fresher, higher-endurance bowler for the
-        // closing spells where possible, since a bowler still firing at
-        // full effort late in the innings troubles the tail more than one
-        // who's been ground down by an earlier long spell. Shown here as
-        // a one-line explainer, not a separate recommendation, since it's
-        // baked into the allocation itself rather than a manual choice.
-        html += `<div class="vj-text-xs vj-text-muted vj-mb-4" style="text-align:center;">\u{1F4A8} Death-overs bowler selection favors freshness/endurance among close options — a sharp bowler against the tail beats a tired one with marginally better figures.</div>`;
 
         // Spell variety summary
         const seamerSpells = bowlingSpells.filter(s => s && s.player && s.player.bowlerCategory === 'seam');
@@ -5924,27 +5917,37 @@ const MAX_OVERS_PER_BOWLER = { OD: 10, YOD: 8, T20: 4, YT20: 4 };
         // v8.97: per-spell CARDS replace the 9-column table — at 360px the
         // old table forced horizontal scrolling, and the transcription
         // fields the game's own form asks for (end select + 1st Over +
-        // #) are all the user needs per spell, with skill/covers/phase
-        // on the second line.
+        // #) are all the user needs per spell, with skill/covers on the
+        // second line.
+        // v8.99: cards are GROUPED BY END — all Gibson spells in 1st-over
+        // order, then all Southern — instead of one interleaved list in
+        // bowling order, which was hard to track against the game's two
+        // end columns. The phase label/icon is not rendered (internal
+        // allocation detail only).
         html += '<div class="ftp-spell-list">';
-        bowlingSpells.forEach((spell, index) => {
-            if (!spell || !spell.player) return;
-            const end = spell.end || (index % 2 === 0 ? 'Gibson' : 'Southern');
-            const tacLabel = spell.tactic === 1 ? 'A' : spell.tactic === 3 ? 'D' : 'N';
-            const tacClass = 'ftp-tactic-' + tacLabel;
-            const bowlLabel = skillLabel(spell.player.bowling).slice(0,3);
-            const phaseIcon = spell.phase === 'New ball' ? '\u{1F535}' : spell.phase === 'Death overs' ? '\u{1F534}' : '\u26AA';
-            html += `<div class="ftp-spell ${end === 'Gibson' ? 'gibson' : 'southern'}">
-                <div class="ftp-spell-main">
-                    <div class="ftp-spell-line1">
-                        <span class="vj-fw-700">${index + 1}</span>
-                        <span class="ftp-spell-end ${end === 'Gibson' ? 'gibson' : 'southern'}">${end === 'Gibson' ? '\u25B6' : '\u25C0'} ${end}</span>
-                        <span class="ftp-spell-inputs">1st Over: ${spell.startOver} \u00B7 #: ${spell.overs}</span>
-                        <span class="${tacClass}">${tacLabel}</span>
+        ['Gibson', 'Southern'].forEach(end => {
+            const endSpells = bowlingSpells
+                .map((spell, index) => ({ spell, index }))
+                .filter(x => x.spell && x.spell.player &&
+                    (x.spell.end || (x.index % 2 === 0 ? 'Gibson' : 'Southern')) === end)
+                .sort((a, b) => (a.spell.startOver || 0) - (b.spell.startOver || 0));
+            if (endSpells.length === 0) return;
+            html += `<div class="ftp-spell-end-heading ${end === 'Gibson' ? 'gibson' : 'southern'}">${end === 'Gibson' ? '\u25B6' : '\u25C0'} ${end} end</div>`;
+            endSpells.forEach(({ spell }) => {
+                const tacLabel = spell.tactic === 1 ? 'A' : spell.tactic === 3 ? 'D' : 'N';
+                const tacClass = 'ftp-tactic-' + tacLabel;
+                const bowlLabel = skillLabel(spell.player.bowling).slice(0,3);
+                html += `<div class="ftp-spell ${end === 'Gibson' ? 'gibson' : 'southern'}">
+                    <div class="ftp-spell-main">
+                        <div class="ftp-spell-line1">
+                            <span class="ftp-spell-end ${end === 'Gibson' ? 'gibson' : 'southern'}">${end === 'Gibson' ? '\u25B6' : '\u25C0'} ${end}</span>
+                            <span class="ftp-spell-inputs">1st Over: ${spell.startOver} \u00B7 #: ${spell.overs}</span>
+                            <span class="${tacClass}">${tacLabel}</span>
+                        </div>
+                        <div class="ftp-spell-line2"><strong>${spell.player.name}</strong> \u00B7 ${bowlLabel} \u00B7 overs ${expandSpellOvers(spell).join(', ')}</div>
                     </div>
-                    <div class="ftp-spell-line2"><strong>${spell.player.name}</strong> \u00B7 ${bowlLabel} \u00B7 overs ${expandSpellOvers(spell).join(', ')} \u00B7 ${phaseIcon} ${spell.phase}</div>
-                </div>
-            </div>`;
+                </div>`;
+            });
         });
         html += '</div>';
         document.getElementById('ftp-bowling').innerHTML = html;
@@ -6804,7 +6807,7 @@ const MAX_OVERS_PER_BOWLER = { OD: 10, YOD: 8, T20: 4, YT20: 4 };
     // matches with format (T20/OD/YT20/YOD) so training can adapt.
     function fetchUpcomingFixtures() {
         return new Promise((resolve) => {
-            GM_xmlhttpRequest({
+            _queuedRequest({
                 method: 'GET',
                 url: `https://www.fromthepavilion.org/teamfixtures.htm?teamId=${TEAM_ID}#curr`,
                 timeout: 10000,
@@ -7156,6 +7159,9 @@ table.ftp-table {
 .ftp-spell-inputs { font-weight: 700; font-variant-numeric: tabular-nums; color: var(--vj-text); }
 .ftp-spell-line2 { font-size: 10.5px; color: var(--vj-text-secondary); margin-top: 2px; line-height: 1.4; }
 .ftp-spell-line2 strong { color: var(--vj-text); }
+.ftp-spell-end-heading { font-weight: 700; font-size: 10.5px; padding: 2px 8px; border-radius: 8px; display: inline-block; margin: 2px 0; }
+.ftp-spell-end-heading.gibson { background: var(--vj-blue-bg); color: var(--vj-blue); }
+.ftp-spell-end-heading.southern { background: var(--vj-amber-bg); color: var(--vj-amber); }
 
 /* Stat badges */
 .ftp-stat-badge {
@@ -9217,7 +9223,7 @@ const progMap = { batting: 'batting', bowling: 'bowling', keeping: 'keeperbattin
 
     function fetchClubFromPage(url) {
         return new Promise((resolve, reject) => {
-            GM_xmlhttpRequest({
+            _queuedRequest({
                 method: 'GET',
                 url: url,
                 timeout: 15000,
@@ -10192,7 +10198,7 @@ const progMap = { batting: 'batting', bowling: 'bowling', keeping: 'keeperbattin
         if (scoutEl) {
             scoutEl.innerHTML = '<div class="vj-text-xs vj-text-muted">Loading next fixture...</div>';
             // Fetch teamfixtures page to find the next upcoming match
-            GM_xmlhttpRequest({
+            _queuedRequest({
                 method: 'GET',
                 url: `https://www.fromthepavilion.org/teamfixtures.htm?teamId=${TEAM_ID}#curr`,
                 timeout: 15000,
@@ -10399,6 +10405,29 @@ const progMap = { batting: 'batting', bowling: 'bowling', keeping: 'keeperbattin
             const btn = document.getElementById('ftp-refresh');
             if (btn) btn.addEventListener('click', async () => { await fetchAllData({ force: true }); updateFn(); });
         }, 300);
+    }
+
+    // v8.99: page-UI dispatcher with one retry. Every per-page branch
+    // starts with createXUI() -> createPanel(); if anything in the branch
+    // throws before the panel is attached (odd markup, transient DOM
+    // race), the user got NO advisor panel at all until the next
+    // navigation. createPanel() removes an existing #ftp-advisor-panel
+    // first, so the retry is safe even if the first run half-completed —
+    // but it's skipped when the panel DID appear, so a failure inside the
+    // already-error-guarded update* functions can't cause double renders.
+    function _runPageUI(pageType, fn) {
+        try {
+            fn();
+        } catch (e) {
+            console.error('[FTP Advisor] Page UI failed, retrying in 1.5s:', e);
+            setTimeout(() => {
+                try {
+                    if (!document.getElementById('ftp-advisor-panel')) fn();
+                } catch (e2) {
+                    console.error('[FTP Advisor] Page UI retry failed:', e2);
+                }
+            }, 1500);
+        }
     }
 
     // ============================================================
@@ -10741,12 +10770,18 @@ const progMap = { batting: 'batting', bowling: 'bowling', keeping: 'keeperbattin
         // it was cluttering every page before this.
         if (pageType === 'matches') createMatchPasteUI();
 
-        // One-time cleanup: getOpponentTeamId()/extractOpponentTeamIdFromGame()
-        // used to blindly treat "Home" as the opponent, which is wrong on a
-        // home fixture — could have cached your own squad under the
-        // opponent-cache keys, keyed by your own TEAM_ID. That stale entry
-        // would keep showing up in opponent scouting forever otherwise.
-        if (TEAM_ID) cleanupOpponentCache(TEAM_ID);
+        // v8.99: everything before the page UI is now failure-isolated —
+        // a scrape/cleanup/refresh throw here used to abort init() before
+        // the below dispatch, so the panel intermittently never appeared
+        // (the user-visible "tool missing on login"). Advice from cache is
+        // better than no panel.
+        try {
+            // One-time cleanup: getOpponentTeamId()/extractOpponentTeamIdFromGame()
+            // used to blindly treat "Home" as the opponent, which is wrong on a
+            // home fixture — could have cached your own squad under the
+            // opponent-cache keys, keyed by your own TEAM_ID. That stale entry
+            // would keep showing up in opponent scouting forever otherwise.
+            if (TEAM_ID) cleanupOpponentCache(TEAM_ID);
 
         // --- SCRAPE CURRENT PAGE DATA (if on a data page) ---
         // Whether this actually helps depends on which real-time re-fetch
@@ -10831,8 +10866,10 @@ const progMap = { batting: 'batting', bowling: 'bowling', keeping: 'keeperbattin
                 else if (pageType === 'player') updatePlayerAdvisor();
             }).catch(e => console.warn('[FTP Advisor] Background refresh failed:', e));
         }
+        } catch (e1) { console.error('[FTP Advisor] Init scrape/refresh failed (advisor continues on cached data):', e1); }
 
         // --- PAGE-Specific UI ---
+        _runPageUI(pageType, () => {
         if (pageType === 'orders') {
             createOrdersUI();
             updateOrdersAdvisor();
@@ -10908,6 +10945,7 @@ const progMap = { batting: 'batting', bowling: 'bowling', keeping: 'keeperbattin
             updatePlayerAdvisor();
             _attachRefreshBtn(updatePlayerAdvisor);
         }
+        });
     }
 
     if (document.readyState === 'loading') {
