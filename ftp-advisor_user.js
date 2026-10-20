@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         FTP Advisor
 // @namespace    http://tampermonkey.net/
-// @version      8.99
+// @version      8.100
 // @description  Tactical/scouting advisor for fromthepavilion.org (cricket sim): team, tactics, pitch, training, transfer market, youth and squad plan advice with projections. Full changelog: github.com/Jadax/ftp-advisor
 // @author       Tushant Sharma
 // @license      MIT
@@ -3810,12 +3810,14 @@
 
         // Find weather, pitch, league from the match details table
         const allThs = document.querySelectorAll('th');
+        let foundPitchRow = false, foundWeatherRow = false;
         allThs.forEach(th => {
             const thText = th.textContent.trim();
             const td = th.nextElementSibling;
             if (!td) return;
 
             if (thText.includes('Weather')) {
+                foundWeatherRow = true;
                 const popuphelp = td.querySelector('.popuphelp');
                 if (popuphelp) {
                     const title = popuphelp.getAttribute('title') || '';
@@ -3824,6 +3826,7 @@
                     context.weather = td.textContent.trim();
                 }
             } else if (thText.includes('Pitch')) {
+                foundPitchRow = true;
                 const popuphelp = td.querySelector('.popuphelp');
                 if (popuphelp) {
                     const title = popuphelp.getAttribute('title') || '';
@@ -3869,6 +3872,26 @@
 }
             }
         });
+
+        // Home-match fallback: if the orders page carries no Pitch/Weather
+        // rows at all, don't silently advise against Sporting/Sunny — your
+        // OWN ground (the ground page sets the pitch you control for home
+        // fixtures) is the correct source. Cached as (pitch, weather) by
+        // scrapeGroundPage(); away matches are deliberately excluded since
+        // your ground cache says nothing about the opponent's pitch.
+        if ((!foundPitchRow || !foundWeatherRow) && context.isHome === true) {
+            const ground = loadGroundCache();
+            if (ground) {
+                if (!foundPitchRow && ground.pitch && PITCH_EFFECTS[ground.pitch]) {
+                    context.pitch = ground.pitch;
+                    context.pitchFromCache = true;
+                }
+                if (!foundWeatherRow && ground.weather && WEATHER_EFFECTS[ground.weather]) {
+                    context.weather = ground.weather;
+                    context.weatherFromCache = true;
+                }
+            }
+        }
 
         // The game's own orders-page settings beat league-text inference:
         // friendly comps have no format word in their League cell, so the
@@ -5550,8 +5573,8 @@ const MAX_OVERS_PER_BOWLER = { OD: 10, YOD: 8, T20: 4, YT20: 4 };
         document.getElementById('ftp-context').innerHTML = `
             <div class="vj-flex vj-gap-6 vj-mb-4" style="flex-wrap:wrap;">
                 <span class="ftp-stat-badge blue">${context.matchType}${context.matchTypeKnown ? '' : (context.oversFromDoc ? '' : ' (fallback)')} \u00B7 ${context.overs}ov${context.oversFromDoc ? ' \u00B7 from page' : ''}</span>
-                <span class="ftp-stat-badge neutral">${context.pitch}</span>
-                <span class="ftp-stat-badge neutral">${context.weather}</span>
+                <span class="ftp-stat-badge neutral">${context.pitch}${context.pitchFromCache ? ' \u00B7 from your ground' : ''}</span>
+                <span class="ftp-stat-badge neutral">${context.weather}${context.weatherFromCache ? ' \u00B7 from your ground' : ''}</span>
             </div>
             <div class="ftp-stat-row"><span class="ftp-stat-label">Venue</span><span class="ftp-stat-value">${context.venue}</span></div>
             <div class="ftp-stat-row"><span class="ftp-stat-label">Pitch favours</span><span class="ftp-stat-value">${pitchEffect.favor}</span></div>
