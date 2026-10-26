@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         FTP Advisor
 // @namespace    http://tampermonkey.net/
-// @version      8.100
+// @version      8.101
 // @description  Tactical/scouting advisor for fromthepavilion.org (cricket sim): team, tactics, pitch, training, transfer market, youth and squad plan advice with projections. Full changelog: github.com/Jadax/ftp-advisor
 // @author       Tushant Sharma
 // @license      MIT
@@ -66,7 +66,8 @@
     //   MATCH DATA / SCOUTING FEED (v8.72, v8.75): parseMatchScorecard,
     //       parseMatchChunk, parseScorecardFromHTMLDoc, createMatchPasteUI,
     //       saveMatchesToHistory, loadMatchHistory, getPlayerHistoryStats,
-    //       getTeamHistoryStats, getPitchHistoryStats, buildPastedScoutingHtml
+    //       getTeamHistoryStats, getConditionsHistoryStats, playerNameKey,
+    //       parseMatchCommentary, buildPastedScoutingHtml
     //   PLAYER ADVISOR:           scrapePlayerDetailPage, updatePlayerAdvisor,
     //       comparePlayerToSquadPeers
     //   PER-PAGE UI:              updateSquadAdvisor, updateOrdersAdvisor,
@@ -403,13 +404,32 @@
         if (BOWLING_RELEVANT_TALENTS.test(talentText)) return primaryName === 'bowling';
         return true; // generic, or handled by its own dedicated gate elsewhere
     }
-    // Talent count for scoring contexts that just need "how many talents
-    // actually matter here" (calculateRank, computePlayerValueSkillSum) —
-    // a mismatched role-specific talent doesn't count, matching the
-    // reasoning above.
-    function countAlignedTalents(player) {
+    // Sturdy (faster fatigue recovery) is worth most at two points in a
+    // career (user/community data): young, when you pump club matches into
+    // him (a Sturdy bat played 39 club matches at 20 — all 28 youth plus
+    // senior T20/OD/cup), and 28+, when normal recovery falls just short of
+    // sustaining all 28 senior matches in a heavy role (top-order bat, WK,
+    // captain). In between it's a modest perk. Every other talent weighs 1.
+    function talentWeight(talentText, age) {
+        if (/sturdy/i.test(talentText)) {
+            const y = ageYears(age || 0);
+            return (y <= 20 || y >= 28) ? 1.5 : 0.75;
+        }
+        return 1;
+    }
+    function sturdyNote(age) {
+        const y = ageYears(age || 0);
+        if (y <= 20) return 'Sturdy — recovers fatigue faster: can play youth AND senior matches every week (more matches = more experience)';
+        if (y >= 28) return 'Sturdy — at 28+ normal recovery falls just short of a full senior season; Sturdy keeps him available for every match';
+        return 'Sturdy — recovers fatigue faster (a modest perk at this age; peaks young and 28+)';
+    }
+    // Weighted count of talents that actually matter for THIS player
+    // (calculateRank, computeOverallRating) — a mismatched role-specific
+    // talent counts 0, see isTalentRoleAligned(); Sturdy via talentWeight().
+    function alignedTalentWeight(player) {
         const primaryName = getPrimarySkillInfo(player).name;
-        return (player.talents || []).filter(t => isTalentRoleAligned(t, primaryName)).length;
+        return (player.talents || []).filter(t => isTalentRoleAligned(t, primaryName))
+            .reduce((sum, t) => sum + talentWeight(t, player.age), 0);
     }
 
     /**
@@ -868,7 +888,11 @@
         qualityRef = (opts.seniorCeiling && opts.seniorCeiling.ceiling != null)
             ? opts.seniorCeiling.ceiling
             : computePlayerCeiling(player, opts.academySpeed, opts.squadContext, 25).ceiling;
-        const qualityScore = Math.max(0, Math.min(55, qualityRef));
+        // Linear to full marks at a 70 skill-sum. The old 1:1 mapping capped
+        // at 55 while real to-25 projections run ~40-65: a Reliable 17yo
+        // (60) and an Average one (55) both maxed out, so the dominant term
+        // stopped separating exactly the youth the user is buying.
+        const qualityScore = Math.max(0, Math.min(55, qualityRef * 55 / 70));
 
         // 2) Age/trajectory factor (0-10) — ONE continuous lifecycle curve
         //    for EVERY age (v8.65). The old two-curve split (youth declining
@@ -899,7 +923,7 @@
             const support = ((player.endurance||0) + (player.technique||0)) / 2;
             distScore = 4 + Math.min(6, ((player.bowling||0) - 5) + (support - 4) * 0.5);
         } else if (role === 'keeping') {
-            const support = (player.batting||0); // keepers must bat (keeperBattingMin logic)
+            // keepers must bat too (keeperBattingMin logic)
             distScore = 4 + Math.min(6, ((player.keeping||0) - 4) + (((player.batting||0) - 4) * 0.5));
         }
         distScore = Math.max(0, Math.min(10, distScore));
@@ -913,8 +937,11 @@
         let valueScore = 0;
         const vpk = computePlayerValuePerK(player);
         if (vpk != null) {
-            // vpk ~ 5-15 typical; map to 0-15
-            valueScore = Math.max(0, Math.min(15, (vpk - 3) * 1.5));
+            // Real skill-sum per $1k of weekly wage runs ~12-40 (an Expert
+            // senior on $2,000 is ~24; a premium senior ~15; cheap youth
+            // 25-40). The old (vpk-3)*1.5 maxed out at 13, i.e. for every
+            // real player — the term carried no information. 10 -> 0, 35 -> 15.
+            valueScore = Math.max(0, Math.min(15, (vpk - 10) * 0.6));
         } else {
             valueScore = 6; // wage unknown — neutral, don't punish
         }
@@ -922,7 +949,7 @@
         // 5) Talent bonus (0-5) — role-aligned talents add real upside
         //    already counted in skill-sum, but reward a meaningful talent
         //    set explicitly here.
-        const talentScore = Math.min(5, countAlignedTalents(player) * 1.5);
+        const talentScore = Math.min(5, alignedTalentWeight(player) * 1.5);
 
         // ONE weight set for EVERY age (v8.65). The old youth weights
         // (1.0/1.2/0.6/0.4/0.8) discounted a youth's dist/value/talent
@@ -939,8 +966,18 @@
         // candidate. A curve-meeting youth can now legitimately outrank an
         // older senior, which is the whole point of the projection.
         let score, label;
-        score = qualityScore * 1.0 + ageScore * 1.2 + distScore * 0.8 + valueScore * 0.8 + talentScore * 1.0;
+        // Wage value x0.4: a tiebreak between near-equal players, not a skill
+        // tier (at x0.8 a Spectacular bat on $3.5k tied an Expert on $2k).
+        score = qualityScore * 1.0 + ageScore * 1.2 + distScore * 0.8 + valueScore * 0.4 + talentScore * 1.0;
         score = Math.max(0, Math.min(100, score));
+        // Shown as the badge tooltip — the user buys on this number alone,
+        // so every point must be traceable to its term.
+        const f1 = v => (Math.round(v * 10) / 10).toString();
+        breakdown.push(`Quality (skill-sum projected to 25) ${f1(qualityScore)}/55`);
+        breakdown.push(`Age ${f1(ageScore)}/10 x1.2 = ${f1(ageScore * 1.2)}`);
+        breakdown.push(`${roleLabel} skill shape ${f1(distScore)}/10 x0.8 = ${f1(distScore * 0.8)}`);
+        breakdown.push(vpk != null ? `Wage value ${f1(valueScore)}/15 x0.4 = ${f1(valueScore * 0.4)}` : `Wage value unknown (neutral ${f1(valueScore * 0.4)})`);
+        breakdown.push(`Role-useful talents ${f1(talentScore)}/5`);
         label = score >= 75 ? 'elite' : score >= 55 ? 'strong' : score >= 35 ? 'reasonable' : 'pass';
 
         return {
@@ -982,15 +1019,32 @@
     // is available for those tiers.
     // EXPERIENCE_MULTIPLIER: full 0-15 range, matches SKILL_MAP.
     //
-    // A Fatigue curve also exists in the sheet (1.00 down to 0.45) but
-    // is NOT included here: the sheet has 12 distinct fatigue rows
-    // ("rested" AND "rest" as separate levels, 1.00 vs 0.98) while
-    // FATIGUE_MAP treats "rested"/"rest" as the same level (10) — an
-    // unresolved mismatch. Get clarification before adding it rather
-    // than guessing an index mapping that could silently corrupt
-    // allocateBowlingSpells' fatigue-aware logic.
+    // FATIGUE_MULTIPLIER: the same sheet's Fatigue column, mapped BY NAME
+    // onto FATIGUE_MAP's indices (0 = clinically dead .. 10 = rested).
+    // The sheet's extra "rest 0.98" row is not a game level — the manual's
+    // Levels page lists exactly 11 (rested..clinically dead) and the squad
+    // grid abbreviates rested as "rest" — so it is skipped, not indexed.
+    // Replaces the old additive `+ fatigue * 0.3`, which moved a score by
+    // ~7% between rested and exhausted while the manual says fatigue has
+    // "a major effect ... performance will drop markedly"; a Listless
+    // captain/opener and an Exhausted bowler both made a reported XI.
     // ============================================================
     const FORM_MULTIPLIER = [0.70, 0.73, 0.76, 0.79, 0.82, 0.85, 0.88, 0.91, 0.94, 0.97, 1.00];
+    const FATIGUE_MULTIPLIER = [0.45, 0.45, 0.52, 0.59, 0.66, 0.73, 0.80, 0.86, 0.91, 0.95, 1.00];
+    function fatigueMultiplier(player) {
+        const idx = Math.min(10, Math.max(0, Math.round(player.fatigue ?? 10)));
+        return FATIGUE_MULTIPLIER[idx];
+    }
+    // Manual (Players: Skills): technique "is combined with the primary
+    // skills of batting, bowling and keeping" and governs CONSISTENCY — a
+    // high primary with low technique won't play to potential. So it
+    // scales the primary rather than adding to it: the old additive
+    // `primary*3 + technique*k` let a Dreadful bowler with Reliable
+    // technique outrank the squad's best Reasonable spinner. Balanced
+    // players (technique ~ primary) land on the same scale as before.
+    function techniqueScaledPrimary(primary, technique) {
+        return (primary || 0) * (3 + 0.2 * (technique || 0));
+    }
     const EXPERIENCE_MULTIPLIER = [1.00, 1.06, 1.11, 1.16, 1.19, 1.22, 1.25, 1.28, 1.31, 1.33, 1.35, 1.36, 1.37, 1.38, 1.39, 1.40];
 
     // ============================================================
@@ -1036,7 +1090,7 @@
     // PITCH & WEATHER EFFECTS (from actual ground page descriptions)
     // ============================================================
     const PITCH_EFFECTS = {
-        'Sticky': { seam: 1.3, spin: 1.3, bat: 0.6, paceBonus: 1.3, favor: 'bowlers', desc: 'Heavily favours ALL bowlers' },
+        'Sticky': { seam: 1.3, spin: 1.3, bat: 0.6, paceBonus: 1.0, favor: 'bowlers', desc: 'Heavily favours ALL bowlers' },
         'Uneven': { seam: 1.3, spin: 0.9, bat: 0.7, paceBonus: 1.3, favor: 'seam', desc: 'Favours seam (fast/fast-medium)' },
         'Green': { seam: 1.2, spin: 0.8, bat: 0.85, paceBonus: 1.0, favor: 'seam', desc: 'Favours medium seam, slight disadvantage to spin' },
         'Hard': { seam: 1.0, spin: 0.7, bat: 1.3, paceBonus: 1.1, favor: 'batting', desc: 'Favours batters, fast bowlers get bounce' },
@@ -2425,7 +2479,7 @@
             if (hasTalent(/gifted.*endurance/i)) { score += 1; strengths.push('Gifted (Endurance) — trains endurance faster'); }
             if (hasTalent(/gifted.*power/i) && battingRelevant) { score += 1; strengths.push('Gifted (Power) — trains power faster'); }
             if (hasTalent(/natural leader/i)) { score += 1; strengths.push('Natural Leader — captaincy bonus'); }
-            if (hasTalent(/sturdy/i)) { score += 1; strengths.push('Sturdy — recovers from fatigue faster'); }
+            if (hasTalent(/sturdy/i)) { score += talentWeight('Sturdy', player.age); strengths.push(sturdyNote(player.age)); }
 
             // Role-specific talents (immediate value even for youth)
             if (hasTalent(/new ball bowler/i) && primaryName === 'bowling') { score += 1; strengths.push('New Ball Bowler — opens bowling'); }
@@ -2608,7 +2662,7 @@
         if (hasTalent(/skilled.*technique/i)) { score += 1; strengths.push('Skilled (Technique) — bonus during matches'); }
         if (hasTalent(/skilled.*power/i) && battingRelevant) { score += 1; strengths.push('Skilled (Power) — bonus during matches'); }
         if (hasTalent(/natural leader/i)) { score += 1; strengths.push('Natural Leader — captaincy bonus during matches'); }
-        if (hasTalent(/sturdy/i)) { score += 1; strengths.push('Sturdy — recovers from fatigue faster'); }
+        if (hasTalent(/sturdy/i)) { score += talentWeight('Sturdy', player.age); strengths.push(sturdyNote(player.age)); }
 
         // Role-specific talents
         if (hasTalent(/new ball bowler/i) && primaryName === 'bowling') {
@@ -2774,8 +2828,8 @@
         // A "Skilled (Bowling)" talent on a specialist batsman rarely
         // triggers and shouldn't rank him the same as a batsman whose
         // talents actually match what he's picked for — see
-        // isTalentRoleAligned()/countAlignedTalents().
-        const talentScore = Math.min(1, countAlignedTalents(player) * 0.25);
+        // isTalentRoleAligned()/alignedTalentWeight().
+        const talentScore = Math.min(1, alignedTalentWeight(player) * 0.25);
 
         // 5. Squad fit (0-0.5 points)
         let fitScore = 0;
@@ -3839,6 +3893,10 @@
             } else if (thText.includes('League')) {
                 const leagueText = td.textContent.trim().toLowerCase();
                 context.matchTypeKnown = true;
+                // Manual (Friendly Matches): "all players are assumed to be at
+                // 'rested' fatigue in friendly matches" for all match-engine
+                // calculations. Keyword only; absent it, league behaviour.
+                if (leagueText.includes('friendly')) context.isFriendly = true;
                 if (leagueText.includes('youth twenty20') || leagueText.includes('youth t20')) {
                     context.matchType = 'YT20';
                     context.overs = 20;
@@ -3958,65 +4016,64 @@
     // ============================================================
     // SCORING FUNCTIONS
     // ============================================================
+    // Shape shared by both scores: every ADDITIVE term (skill core, T20
+    // power, flat talent bonuses) is summed first, THEN every multiplier
+    // (talent ×, form/experience/fatigue curves, pitch/weather, home) is
+    // applied once. Adding flat bonuses after the multipliers made them
+    // dominate on extreme days — Sticky×Humid scales the core to ~20%, so
+    // a +4.5 T20 power bonus outweighed a whole batting tier.
     function calculateBattingScore(player, pitchEffect, weatherEffect, isT20, isYouth, isHome) {
-        // Form and Experience use multiplicative curves from the FTP_Training
-        // workbook's Form-Exp tab (real game data), not flat additive weights.
-        // Form index clamped at 10 (Outstanding) — the source sheet has no data
-        // above Outstanding; don't extrapolate.
-        const formIdx = Math.min(10, Math.max(0, player.form || 0));
-        const expIdx = Math.min(15, Math.max(0, player.experience || 0));
-        const formMult = FORM_MULTIPLIER[formIdx] || 1.0;
-        const expMult = EXPERIENCE_MULTIPLIER[expIdx] || 1.0;
-        let score = (player.batting * 3) + (player.technique * 2) + (player.power * 1.5) +
-                    (player.fatigue * 0.3);
-        score *= formMult * expMult;
-        score *= pitchEffect.bat;
-        // weatherEffect.bat: direct batting modifier (Hot=0.9, Humid=1.1, etc.)
-        // weatherEffect.fatigue: fatigue drain proxy — (2 - fatigue)/2 reduces
-        // score proportionally to how much weather accelerates tiredness.
-        if (weatherEffect.bat) score *= weatherEffect.bat;
-        score *= (2 - weatherEffect.fatigue) / 2;
-        // Home advantage: pitch control (you choose the pitch type) + crowd
-        // support. Small but real — official manual confirms home team gets
-        // 2/3 gate revenue and pitch choice. ~3% bonus is conservative.
-        if (isHome === true) score *= 1.03;
-        if (isT20) score += player.power * 1.5;
-
-        // Talent bonuses — format-aware
         const talents = player.talents || [];
         const hasTalent = (regex) => talents.some(t => regex.test(t));
 
-        // Opener: more valuable in OD (longer innings), slightly less in T20
-        if (hasTalent(/^opener$/i)) score *= isT20 ? 1.10 : 1.15;
-        // Finisher: more valuable in T20 (death overs matter more)
-        if (hasTalent(/finisher/i)) score *= isT20 ? 1.15 : 1.10;
+        let core = techniqueScaledPrimary(player.batting, player.technique) + (player.power * 1.5);
+        if (isT20) core += player.power * 1.5;
         // Skilled batting: flat bonus, more impactful in T20
-        if (hasTalent(/skilled.*batting/i)) score += isT20 ? 7 : 5;
+        if (hasTalent(/skilled.*batting/i)) core += isT20 ? 7 : 5;
         // Skilled power: only useful in T20
-        if (hasTalent(/skilled.*power/i) && isT20) score += 5;
-
+        if (hasTalent(/skilled.*power/i) && isT20) core += 5;
         // Triggered batting talents — official manual confirms these
         // exist ("more likely to turn a dot ball into a single/two" /
         // "...into a four or six") but doesn't quantify the effect.
         // Small flat bonus per talent, more valuable in T20 where
         // strike rate matters more than in a longer format — same
         // conservative-estimate reasoning as the bowling triggered
-        // talents above, better than continuing to ignore them.
-        if (hasTalent(/accumulator/i)) score += isT20 ? 3 : 2;
-        if (hasTalent(/boundary hitter/i)) score += isT20 ? 4 : 2.5;
+        // talents, better than continuing to ignore them.
+        if (hasTalent(/accumulator/i)) core += isT20 ? 3 : 2;
+        if (hasTalent(/boundary hitter/i)) core += isT20 ? 4 : 2.5;
 
+        let mult = 1;
+        // Opener: more valuable in OD (longer innings), slightly less in T20
+        if (hasTalent(/^opener$/i)) mult *= isT20 ? 1.10 : 1.15;
+        // Finisher: more valuable in T20 (death overs matter more)
+        if (hasTalent(/finisher/i)) mult *= isT20 ? 1.15 : 1.10;
         // Youth bonus: training talents suggest higher ceiling
         if (isYouth) {
-            if (hasTalent(/prodigy/i)) score *= 1.10;
-            if (hasTalent(/gifted.*batting/i)) score *= 1.05;
+            if (hasTalent(/prodigy/i)) mult *= 1.10;
+            if (hasTalent(/gifted.*batting/i)) mult *= 1.05;
         }
-
-        return score;
+        // Form and Experience use multiplicative curves from the FTP_Training
+        // workbook's Form-Exp tab (real game data). Form index clamped at
+        // 10 (Outstanding) — the source sheet has no data above it.
+        const formIdx = Math.min(10, Math.max(0, player.form || 0));
+        const expIdx = Math.min(15, Math.max(0, player.experience || 0));
+        mult *= (FORM_MULTIPLIER[formIdx] || 1.0) * (EXPERIENCE_MULTIPLIER[expIdx] || 1.0) * fatigueMultiplier(player);
+        mult *= pitchEffect.bat;
+        // weatherEffect.bat: direct batting modifier; weatherEffect.fatigue:
+        // drain proxy — (2 - fatigue)/2 shrinks the score as weather
+        // accelerates tiredness.
+        if (weatherEffect.bat) mult *= weatherEffect.bat;
+        mult *= (2 - weatherEffect.fatigue) / 2;
+        // Home advantage: pitch control + crowd support. ~3% is conservative.
+        if (isHome === true) mult *= 1.03;
+        return core * mult;
     }
 
     function calculateBowlingScore(player, pitchEffect, weatherEffect, isT20, isYouth, isHome) {
         const category = player.bowlerCategory;
         const isDesignatedBowler = category !== 'none';
+        const talents = player.talents || [];
+        const hasTalent = (regex) => talents.some(t => regex.test(t));
         let pitchMod, weatherMod;
         if (category === 'spin') {
             pitchMod = pitchEffect.spin;
@@ -4028,76 +4085,58 @@
             pitchMod = (pitchEffect.seam + pitchEffect.spin) / 2;
             weatherMod = (weatherEffect.seam + weatherEffect.spin) / 2;
         }
-        // Form and Experience use multiplicative curves (same as batting),
-        // not flat additive weights. Form index clamped at 10.
-        const formIdx = Math.min(10, Math.max(0, player.form || 0));
-        const expIdx = Math.min(15, Math.max(0, player.experience || 0));
-        const formMult = FORM_MULTIPLIER[formIdx] || 1.0;
-        const expMult = EXPERIENCE_MULTIPLIER[expIdx] || 1.0;
-        let score = (player.bowling * 3) + (player.technique * 1.5) + (player.endurance * 1) +
-                    (player.fatigue * 0.3);
-        score *= formMult * expMult;
-        score *= pitchMod * weatherMod;
-        // Home advantage: pitch familiarity + crowd support
-        if (isHome === true) score *= 1.03;
-        if (category === 'seam') score *= 1.1;
-        if (!isDesignatedBowler) score *= 0.75;
 
-        // Pace bonus — pitches like Sticky/Uneven/Hard give raw pace an
-        // extra edge (bounce, movement) on top of the seam/spin split
-        // above. Genuinely fast bowlers (rf/lf, pace 5) get the full
-        // benefit; fast-medium (rfm/lfm, pace 4) get most of it; medium
-        // (rm/lm, pace 3) get proportionally less. Community consensus:
-        // fast bowlers are the premium (and priciest) bowling type —
-        // this is where that premium actually pays off on the field.
-        if (category === 'seam' && pitchEffect.paceBonus) {
-            const paceWeight = (player.bowlerPace || 3) / 5;
-            score *= (1 + (pitchEffect.paceBonus - 1) * paceWeight);
-        }
-
-        // Talent bonuses — format-aware
-        const talents = player.talents || [];
-        const hasTalent = (regex) => talents.some(t => regex.test(t));
-
-        // New Ball Bowler: more valuable in OD (new ball matters more in longer format)
-        if (hasTalent(/new ball bowler/i)) score *= isT20 ? 1.10 : 1.15;
-        // Old Ball Bowler: more valuable in T20 (death overs are critical)
-        if (hasTalent(/old ball bowler/i)) score *= isT20 ? 1.15 : 1.10;
+        // Endurance is the bowler's energy pool (manual: the bowler loses the
+        // most energy per over) — it matters less when the format caps a
+        // bowler at 4 overs than at 8-10.
+        let core = techniqueScaledPrimary(player.bowling, player.technique) + (player.endurance * (isT20 ? 0.5 : 1));
         // NOTE: Seam/Spin Specialist do NOT belong here. Official manual:
         // "performs better than normal when BATTING against seam/spin
-        // bowlers" — a batting matchup talent, not a bonus to the
-        // player's own bowling. Previously misapplied here; applied in
-        // recommendLineup() (batting-order scoring), conditioned on the
-        // opponent's actual bowling mix (opponentAnalysis.seamerCount/
-        // spinnerCount).
+        // bowlers" — a batting matchup talent, applied in recommendLineup()
+        // against the opponent's actual bowling mix.
         // Skilled bowling: more impactful in T20
-        if (hasTalent(/skilled.*bowling/i)) score += isT20 ? 7 : 5;
-
+        if (hasTalent(/skilled.*bowling/i)) core += isT20 ? 7 : 5;
         // Triggered delivery talents (Wrongun/Flipper/Swing/Bouncer/
         // Yorker/Slower Ball/Arm Ball/Doosra) — official manual confirms
-        // each exists and is real ("particularly skilled at bowling a
-        // ...") but does NOT quantify the in-match effect size. Previously
-        // ignored entirely, which is worse than a conservative estimate —
-        // applying a small flat bonus per matching talent (roughly half
-        // of the quantified Skilled bonus, reflecting real-but-narrower/
-        // situational value) rather than continuing to treat them as
-        // invisible to scoring.
+        // each exists ("particularly skilled at bowling a ...") but does
+        // NOT quantify the effect: a small flat bonus per matching talent
+        // (roughly half the quantified Skilled bonus).
         const TRIGGERED_BOWLING_TALENTS = /wrongun|flipper|swing|bouncer|yorker|slower ball|arm ball|doosra/i;
         const triggeredBowlingCount = talents.filter(t => TRIGGERED_BOWLING_TALENTS.test(t)).length;
-        if (triggeredBowlingCount > 0) score += triggeredBowlingCount * (isT20 ? 3.5 : 2.5);
+        if (triggeredBowlingCount > 0) core += triggeredBowlingCount * (isT20 ? 3.5 : 2.5);
 
+        let mult = 1;
+        // New Ball Bowler: more valuable in OD (new ball matters more in longer format)
+        if (hasTalent(/new ball bowler/i)) mult *= isT20 ? 1.10 : 1.15;
+        // Old Ball Bowler: more valuable in T20 (death overs are critical)
+        if (hasTalent(/old ball bowler/i)) mult *= isT20 ? 1.15 : 1.10;
         // Youth bonus: training talents suggest higher ceiling
         if (isYouth) {
-            if (hasTalent(/prodigy/i)) score *= 1.10;
-            if (hasTalent(/gifted.*bowling/i)) score *= 1.05;
+            if (hasTalent(/prodigy/i)) mult *= 1.10;
+            if (hasTalent(/gifted.*bowling/i)) mult *= 1.05;
         }
-
-        return score;
+        const formIdx = Math.min(10, Math.max(0, player.form || 0));
+        const expIdx = Math.min(15, Math.max(0, player.experience || 0));
+        mult *= (FORM_MULTIPLIER[formIdx] || 1.0) * (EXPERIENCE_MULTIPLIER[expIdx] || 1.0) * fatigueMultiplier(player);
+        mult *= pitchMod * weatherMod;
+        // Home advantage: pitch familiarity + crowd support
+        if (isHome === true) mult *= 1.03;
+        if (category === 'seam') mult *= 1.1;
+        if (!isDesignatedBowler) mult *= 0.75;
+        // Pace bonus — pitches like Uneven/Hard give raw pace an extra edge
+        // (bounce, movement) on top of the seam/spin split. Fast (rf/lf,
+        // pace 5) get the full benefit, fast-medium most, medium
+        // proportionally less.
+        if (category === 'seam' && pitchEffect.paceBonus) {
+            const paceWeight = (player.bowlerPace || 3) / 5;
+            mult *= (1 + (pitchEffect.paceBonus - 1) * paceWeight);
+        }
+        return core * mult;
     }
 
     function calculateKeepingScore(player) {
-        return (player.keeping * 3) + (player.batting * 1) + (player.experience * 0.5) +
-               (player.form * 1) + (player.fatigue * 0.3);
+        return (techniqueScaledPrimary(player.keeping, player.technique) + (player.batting * 1) +
+                (player.experience * 0.5) + (player.form * 1)) * fatigueMultiplier(player);
     }
 
     function calculateCaptainScore(player) {
@@ -4108,8 +4147,11 @@
         // here since parseSkill() just reflects whatever the page shows,
         // but don't be surprised two "10/Outstanding" captains tie on
         // this term — experience is the tiebreaker per the same thread.
-        let score = (player.captaincy * 3) + (player.experience * 2) + (player.batting * 0.5) +
-                    (player.form * 0.5) + (player.fatigue * 0.3);
+        // Fatigue multiplies: the fielding captain drains energy every over
+        // and takes a bigger post-match fatigue hit (manual) — a Listless
+        // captain was picked purely on captaincy+experience before.
+        let score = ((player.captaincy * 3) + (player.experience * 2) + (player.batting * 0.5) +
+                    (player.form * 0.5)) * fatigueMultiplier(player);
         // Natural Leader talent — captaincy bonus
         if (player.talents?.some(t => /natural leader/i.test(t))) score *= 1.20;
         return score;
@@ -4118,10 +4160,16 @@
     // ============================================================
     // OPPOSITION ANALYSIS
     // ============================================================
-    function analyzeOpposition(opponentPlayers, myPlayers = null) {
+    function analyzeOpposition(opponentPlayers, myPlayers = null, isYouthMatch = false) {
         if (!opponentPlayers || opponentPlayers.length === 0) return null;
-        const seniors = opponentPlayers.filter(p => p.isSenior);
-        const playingSquad = seniors.length > 0 ? seniors : opponentPlayers.slice(0, 11);
+        // Profile the squad that can actually take the field: seniors are
+        // barred from youth matches (manual). Profiling seniors for a youth
+        // game read Mystic Maidens as spin-heavy (their seniors are mostly
+        // finger spinners) when their youth XI bowled five seamers.
+        const pool = isYouthMatch
+            ? opponentPlayers.filter(p => p.isYouth === true || (!p.isSenior && p.age > 0 && p.age < 21))
+            : opponentPlayers.filter(p => p.isSenior);
+        const playingSquad = pool.length > 0 ? pool : opponentPlayers.slice(0, 11);
 
         // Use experience (0-15 scale) as a more reliable indicator than raw rating
         const avgExp = playingSquad.reduce((s, p) => s + p.experience, 0) / playingSquad.length;
@@ -4288,10 +4336,33 @@
     // ============================================================
     // LINEUP RECOMMENDATION (with LH/RH mixing + bowling variety)
     // ============================================================
-    function recommendLineup(availablePlayers, context, opponentAnalysis) {        // Keep every downstream selector on a unique candidate set. This is
+    // Manual-cited variety effects (LH/RH partnerships, mixed attacks) are
+    // explicitly small, so variety only breaks near-ties: swap the weakest
+    // pick for the best different-kind candidate when within this margin.
+    const VARIETY_TOLERANCE = 0.10;
+    function pickWithVariety(pool, n, scoreFn, kindFn) {
+        const sorted = [...pool].sort((a, b) => scoreFn(b) - scoreFn(a));
+        const picks = sorted.slice(0, n);
+        if (picks.length < 2) return picks;
+        const kinds = new Set(picks.map(kindFn));
+        if (kinds.size > 1) return picks;
+        const weakest = picks[picks.length - 1];
+        const alt = sorted.slice(n).find(p => !kinds.has(kindFn(p)));
+        if (alt && scoreFn(alt) >= scoreFn(weakest) * (1 - VARIETY_TOLERANCE)) picks[picks.length - 1] = alt;
+        return picks;
+    }
+
+    // Friendlies: the engine treats everyone as rested (manual), so real
+    // fatigue must not steer selection, scoring or spell lengths there.
+    function asMatchEnginePlayers(players, context) {
+        return context && context.isFriendly ? players.map(p => ({ ...p, fatigue: 10 })) : players;
+    }
+
+    function recommendLineup(availablePlayers, context, opponentAnalysis) {
+        // Keep every downstream selector on a unique candidate set. This is
         // a hard invariant: the XI and batting order cannot contain a player
         // twice, even if a page/cache scrape briefly duplicates a row.
-        availablePlayers = dedupePlayers(availablePlayers);
+        availablePlayers = asMatchEnginePlayers(dedupePlayers(availablePlayers), context);
         const pitchEffect = PITCH_EFFECTS[context.pitch] || PITCH_EFFECTS.Sporting;
         const weatherEffect = WEATHER_EFFECTS[context.weather] || WEATHER_EFFECTS.Sunny;
         const isT20 = context.matchType === 'T20' || context.matchType === 'YT20';
@@ -4340,71 +4411,35 @@
             };
         });
 
-        // Step 1: Pick keeper (highest keeping, cannot bowl)
+        // Step 1: Pick keeper. The keeper cannot bowl (manual), so among
+        // near-equal keepers (within 10%) take the one whose bowling we
+        // lose least — otherwise a marginally better gloveman who is also
+        // the side's best spinner gets parked behind the stumps.
         const keepers = ranked.filter(p => p.keeping >= 3).sort((a, b) => b.keepScore - a.keepScore);
-        const keeper = keepers[0];
-
-        // Step 2: Pick top 5 batsmen (alternating LH/RH for bowler penalty)
-        // Wiki: LH/RH partnerships cause penalty to bowlers → mix them!
-        const sortedBatters = [...ranked].sort((a, b) => b.batScore - a.batScore);
-        const topBatsmen = [];
+        const keeper = keepers.length
+            ? keepers.filter(p => p.keepScore >= keepers[0].keepScore * (1 - VARIETY_TOLERANCE))
+                .sort((a, b) => (a.isBowler ? a.bowlScore : 0) - (b.isBowler ? b.bowlScore : 0) || b.keepScore - a.keepScore)[0]
+            : undefined;
         const used = new Set();
         if (keeper) used.add(keeper.id);
 
-        // Try to alternate LH/RH in top 5
-        const leftHanded = sortedBatters.filter(p => p.isLeftHanded && !used.has(p.id));
-        const rightHanded = sortedBatters.filter(p => !p.isLeftHanded && !used.has(p.id));
+        // Step 2: top 5 batsmen by batScore. LH/RH mixing is a "small
+        // penalty" to bowlers (manual) — a tiebreak, never a quota: the old
+        // forced 3 RH + 2 LH dropped better batsmen for weaker ones.
+        const topBatsmen = pickWithVariety(ranked.filter(p => !used.has(p.id)), 5, p => p.batScore, p => !!p.isLeftHanded);
+        topBatsmen.forEach(p => used.add(p.id));
 
-        // Take 2-3 of each type to mix
-        for (let i = 0; i < 3 && rightHanded.length > 0; i++) {
-            topBatsmen.push(rightHanded.shift());
-            used.add(topBatsmen[topBatsmen.length - 1].id);
-        }
-        for (let i = 0; i < 2 && leftHanded.length > 0; i++) {
-            topBatsmen.push(leftHanded.shift());
-            used.add(topBatsmen[topBatsmen.length - 1].id);
-        }
-        while (topBatsmen.length < 5) {
-            const next = sortedBatters.find(p => !used.has(p.id));
-            if (!next) break;
-            topBatsmen.push(next);
-            used.add(next.id);
-        }
-
-        // Step 3: Pick bowlers (seam + spin variety per wiki)
-        const seamers = ranked.filter(p => p.isSeamer).sort((a, b) => b.bowlScore - a.bowlScore);
-        const spinners = ranked.filter(p => p.isSpinner).sort((a, b) => b.bowlScore - a.bowlScore);
-        // Also consider all-rounders: batters with good bowling (not designated bowlers)
-        const allRounders = ranked.filter(p => !p.isSeamer && !p.isSpinner && p.bowling >= MIN_BOWLING_FOR_BOWLERS)
-            .sort((a, b) => b.bowlScore - a.bowlScore);
-
-        // Wiki: prefer not too many of same type, balanced LH/RH mix
-        // Game rule: ALL selected bowlers MUST be in the batting lineup
-        const bowlerPicks = [];
-        // Priority 1: Designated seamers + spinners (variety matters per wiki)
-        if (seamers.length > 0 && !used.has(seamers[0].id)) { bowlerPicks.push(seamers[0]); used.add(seamers[0].id); }
-        if (spinners.length > 0 && !used.has(spinners[0].id)) { bowlerPicks.push(spinners[0]); used.add(spinners[0].id); }
-        if (seamers.length > 1 && !used.has(seamers[1].id)) { bowlerPicks.push(seamers[1]); used.add(seamers[1].id); }
-        if (spinners.length > 1 && !used.has(spinners[1].id)) { bowlerPicks.push(spinners[1]); used.add(spinners[1].id); }
-        if (seamers.length > 2 && !used.has(seamers[2].id) && bowlerPicks.length < 5) { bowlerPicks.push(seamers[2]); used.add(seamers[2].id); }
-        if (spinners.length > 2 && !used.has(spinners[2].id) && bowlerPicks.length < 5) { bowlerPicks.push(spinners[2]); used.add(spinners[2].id); }
-        // Priority 2: All-rounders (batters who can bowl) — fills gaps if not enough designated bowlers
-        for (const ar of allRounders) {
-            if (bowlerPicks.length >= 5) break;
-            if (!used.has(ar.id)) { bowlerPicks.push(ar); used.add(ar.id); }
-        }
+        // Step 3: 5 bowling options by bowlScore (already pitch/weather/
+        // fatigue aware). Manual: attack variety helps "relatively minor"
+        // and it's "often still advisable to select the bowlers best
+        // suited to the pitch and weather conditions, regardless of style"
+        // — the old fixed seam/spin alternation forced a second spinner
+        // in (an Exhausted one) on a humid day that punishes spin.
+        const bowlerPicks = pickWithVariety(ranked.filter(p => p.isBowler && !used.has(p.id)), 5, p => p.bowlScore, p => p.bowlerCategory);
+        bowlerPicks.forEach(p => used.add(p.id));
 
         // Step 4: Pick captain (highest captaincy + experience in lineup)
         const lineup = [keeper, ...topBatsmen, ...bowlerPicks].filter(Boolean);
-
-        // Ensure ALL bowlers are in the lineup (game requirement)
-        // If a bowler was selected but not in topBatsmen, add them
-        bowlerPicks.forEach(b => {
-            if (!lineup.find(p => p.id === b.id)) {
-                lineup.push(b);
-            }
-        });
-
         const captain = [...lineup].sort((a, b) => b.captainScore - a.captainScore)[0];
         if (captain) captain.isCaptain = true;
 
@@ -4461,31 +4496,28 @@
         // Sort by batScore
         const sorted = [...lineup].sort((a, b) => b.batScore - a.batScore);
 
-        // Position 1-2: Openers — prefer Opener talent, then best RH/LH
-        const rhBatsmen = sorted.filter(p => !p.isLeftHanded && !used.has(p.id));
-        const lhBatsmen = sorted.filter(p => p.isLeftHanded && !used.has(p.id));
-
-        // Prefer Opener talent at position 1
-        let pos1 = rhBatsmen.find(p => openerIds.has(p.id)) || lhBatsmen.find(p => openerIds.has(p.id));
-        if (!pos1) pos1 = rhBatsmen[0] || lhBatsmen[0];
+        // Position 1-2: Openers — Opener talent first, otherwise the best
+        // batsman. A LH/RH pairing is only a tiebreak (manual: "small
+        // penalty" to bowlers): the old code forced the best LEFT-hander
+        // into #2 however weak, which put a Listless No.9-quality batter
+        // in to face the new ball.
+        const oppositeHandPick = (cands, hand) => {
+            if (!cands.length) return undefined;
+            const alt = cands.find(p => !!p.isLeftHanded !== hand);
+            return alt && alt.batScore >= cands[0].batScore * (1 - VARIETY_TOLERANCE) ? alt : cands[0];
+        };
+        const openerFirst = (cands) => {
+            const withTalent = cands.filter(p => openerIds.has(p.id));
+            return withTalent.length ? withTalent : cands;
+        };
+        const pos1 = openerFirst(sorted)[0];
         if (pos1) {
             // T20 openers: Normal to survive new ball, then accelerate
             // OD openers: Normal to build platform
             ordered.push({ ...pos1, position: 1, battingTactic: 2 });
             used.add(pos1.id);
         }
-
-        // Position 2: Opposite hand if possible, also prefer Opener talent
-        const remainingRH = sorted.filter(p => !p.isLeftHanded && !used.has(p.id));
-        const remainingLH = sorted.filter(p => p.isLeftHanded && !used.has(p.id));
-        let pos2;
-        const preferOpposite = pos1 && pos1.isLeftHanded;
-        if (preferOpposite) {
-            pos2 = remainingRH.find(p => openerIds.has(p.id)) || remainingRH[0];
-        } else {
-            pos2 = remainingLH.find(p => openerIds.has(p.id)) || remainingLH[0];
-        }
-        if (!pos2) pos2 = remainingRH[0] || remainingLH[0]; // fallback if no opposite hand
+        const pos2 = pos1 && oppositeHandPick(openerFirst(sorted.filter(p => !used.has(p.id))), !!pos1.isLeftHanded);
         if (pos2) {
             ordered.push({ ...pos2, position: 2, battingTactic: 2 });
             used.add(pos2.id);
@@ -4506,9 +4538,8 @@
         // OD: Normal — rotate strike, build partnerships
         // T20: Aggressive — attack from ball 1 in the middle overs
         {
-            const nextRH = sorted.find(p => !p.isLeftHanded && !used.has(p.id));
-            const nextLH = sorted.find(p => p.isLeftHanded && !used.has(p.id));
-            const pick = (ordered.length % 2 === 0 ? nextRH : nextLH) || nextRH || nextLH;
+            const prev = ordered[ordered.length - 1];
+            const pick = oppositeHandPick(sorted.filter(p => !used.has(p.id)), !!(prev && prev.isLeftHanded));
             if (pick) {
                 ordered.push({ ...pick, position: 4, battingTactic: isT20 ? 5 : 2 });
                 used.add(pick.id);
@@ -4575,6 +4606,7 @@
     // BOWLING SPELL ALLOCATION
     // ============================================================
     function allocateBowlingSpells(lineup, context, opponentAnalysis) {
+        lineup = asMatchEnginePlayers(lineup, context);
         const totalOvers = context.overs;
         const isT20 = context.matchType === 'T20' || context.matchType === 'YT20';
         // Confirmed verbatim (rules.htm?rulespage=competitions): "There are
@@ -5682,12 +5714,19 @@ const MAX_OVERS_PER_BOWLER = { OD: 10, YOD: 8, T20: 4, YT20: 4 };
         }
 
         // Opponent analysis
-        const opponentAnalysis = opponentCache ? analyzeOpposition(opponentCache.players, enrichedPlayers) : null;
+        const opponentAnalysis = opponentCache ? analyzeOpposition(opponentCache.players, enrichedPlayers, !!context.isYouthOnly) : null;
 
         // Generate recommendations
         const tossRec = recommendTossDecision(context, opponentAnalysis);
         const lineup = recommendLineup(enrichedPlayers, context, opponentAnalysis);
         const battingOrder = recommendBattingOrder(lineup, context, opponentAnalysis);
+        // Only when it fires: a weary-or-worse player still made the XI
+        // because nobody fresher was better even after the fatigue penalty.
+        const tiredNames = context.isFriendly ? [] : battingOrder.filter(p => (p.fatigue ?? 10) <= FATIGUE_MAP.weary)
+            .map(p => `${p.name} (${Object.keys(FATIGUE_MAP).find(k => k.length >= 5 && FATIGUE_MAP[k] === p.fatigue) || 'tired'}, ~${Math.round(fatigueMultiplier(p) * 100)}%)`);
+        const tiredWarning = tiredNames.length
+            ? `<div class="ftp-alert warning" style="margin:4px 0 0 0;"><span>⚠</span><div>Playing while tired: ${tiredNames.join(', ')} — still the best option after the fatigue penalty; resting them before this match would help.</div></div>`
+            : '';
         const bowling = allocateBowlingSpells(lineup, context, opponentAnalysis);
 
         // Display toss
@@ -5705,7 +5744,7 @@ const MAX_OVERS_PER_BOWLER = { OD: 10, YOD: 8, T20: 4, YT20: 4 };
         // references the opponent's actual squad names first (most precise),
         // falls back to a team-name-level aggregate. Silently renders nothing
         // when no pasted matches touch this opponent yet.
-        dangerHtml += buildPastedScoutingHtml(opponentCache ? opponentCache.players : null, getOpponentTeamName());
+        dangerHtml += buildPastedScoutingHtml(opponentCache ? opponentCache.players : null, getOpponentTeamName(), { pitch: context.pitch, weather: context.weather });
 
         document.getElementById('ftp-toss').innerHTML = `
             <div class="ftp-info-box success" style="text-align:center;">
@@ -5715,6 +5754,7 @@ const MAX_OVERS_PER_BOWLER = { OD: 10, YOD: 8, T20: 4, YT20: 4 };
             </div>
             ${dangerHtml}
             ${ageWarning}
+            ${tiredWarning}
         `;
 
         // Display batting order
@@ -6175,9 +6215,9 @@ const MAX_OVERS_PER_BOWLER = { OD: 10, YOD: 8, T20: 4, YT20: 4 };
                 currentHtml += `<tr><td style="font-weight:600;">${className}</td><td><span class="ftp-stat-badge ${isMatch ? 'green' : 'neutral'}">${currentPitch}</span></td><td><span class="ftp-stat-badge ${isMatch ? 'green' : 'amber'}">${rec.pitch}</span></td></tr>`;
                 if (className) {
                     // Real pasted-match evidence for the CURRENT pitch, if any
-                    // exists — only shown when there's actually a Pitch: row
-                    // in history for it (raw-HTML pastes only), never guessed.
-                    const pitchEvidence = getPitchHistoryStats(currentPitch);
+                    // exists — only from pastes that carried a pitch (HTML
+                    // scorecards, commentary), never guessed.
+                    const pitchEvidence = getConditionsHistoryStats({ pitch: currentPitch });
                     const evidenceLine = pitchEvidence
                         ? `<div class="vj-text-xs vj-mt-4" style="color:var(--vj-blue);">📋 ${pitchEvidence.matches} pasted match${pitchEvidence.matches > 1 ? 'es' : ''} on ${currentPitch}: seam econ ${pitchEvidence.seamEcon ?? '—'} vs spin econ ${pitchEvidence.spinEcon ?? '—'}</div>`
                         : '';
@@ -6496,8 +6536,113 @@ const MAX_OVERS_PER_BOWLER = { OD: 10, YOD: 8, T20: 4, YT20: 4 };
         return { teams, result, toss, motm, innings, ground: ground || undefined, pitch: pitch || undefined, weather: weather || undefined };
     }
 
+    // Commentary-page text (commentary.htm copy). The only per-match source
+    // that carries pitch + weather + match type for EVERY paste (the tab
+    // scorecard has none), so it's what makes conditions evidence grow.
+    // Final figures come from the game's own summary lines: each "End of
+    // over N (r runs) - Team(runs-wkts)" is followed by "Bat 12 (7b), Bat2
+    // 3 (2b), Bowler (rm) 1-0-14-0"; dismissals end a ball line with
+    // "T. Regan b. B. Melchiot 4 (2b 1x4 0x6) SR:200.00". An innings that
+    // ends mid-over (chase won / all out) has no closing summary, so its
+    // last partial over is missing from the bowler figures — evidence, not
+    // a scorecard.
+    const COMMENTARY_BOWL_FIG = /([A-Z][^,()]*?)\s*\((rfm|lfm|rfs|lfs|rws|lws|rf|lf|rm|lm)\)\s+(\d+)-(\d+)-(\d+)-(\d+)/g;
+    const COMMENTARY_NAME = "[A-Z]\\.(?: ?[A-Z]\\.)* [A-Z][\\w'\u2019-]*(?: [A-Z][\\w'\u2019-]*)?";
+    const COMMENTARY_OUT = new RegExp(`(${COMMENTARY_NAME}) ((?:c (?:& |${COMMENTARY_NAME} ))?(?:lbw |st ${COMMENTARY_NAME} |hit wicket )?b\\. ${COMMENTARY_NAME}|run out[^0-9(]*(?:\\([^)]*\\))?|retired[^0-9]*) (\\d+) \\((\\d+)b (\\d+)x4 (\\d+)x6\\) SR:([\\d.]+)`);
+    function parseMatchCommentary(text) {
+        const lines = String(text || '').replace(/\r/g, '').split('\n').map(l => l.trim()).filter(Boolean);
+        const header = lines.find(l => />>\s*Commentary/i.test(l)) || '';
+        const teams = header ? header.replace(/>>\s*Commentary.*$/i, '').split(/\s+v\s+/i).map(t => t.trim()).filter(Boolean) : [];
+        const firstOver = lines.findIndex(l => /^End of over \d+/i.test(l));
+        if (firstOver < 0) return null;
+        const intro = lines.slice(0, firstOver).join(' ');
+        const near = (keys, word) => {
+            const m = intro.match(new RegExp(`\\b(${keys.join('|')})\\b[^.]{0,20}?\\b${word}`, 'i'));
+            return m ? keys.find(k => k.toLowerCase() === m[1].toLowerCase()) : undefined;
+        };
+        const fmt = intro.match(/\b(Youth Twenty20|Youth One Day|Twenty20|One Day)\b/i);
+        const matchType = fmt ? ({ 'youth twenty20': 'YT20', 'youth one day': 'YOD', 'twenty20': 'T20', 'one day': 'OD' })[fmt[1].toLowerCase()] : undefined;
+
+        const innings = [];
+        let inn = null;
+        const startInnings = (team) => {
+            inn = { battingTeam: team, battingPlayers: [], bowlingPlayers: [], runs: 0, wickets: 0, overs: '', extras: '', fall: [], rr: null, _bowl: {}, _notOut: [] };
+            innings.push(inn);
+        };
+        let result = '';
+        // A dismissal can come before its innings' first over summary (an
+        // opener out in over 1) — hold it until that summary names the side.
+        let pendingOuts = [];
+        let lastBall = -1;
+        for (let i = 0; i < lines.length; i++) {
+            const line = lines[i];
+            // Ball counter resetting (19.x -> 0.x) = new innings: anything
+            // still pending belongs to the innings that just ended mid-over.
+            const ball = line.match(/^(\d+)\.(\d)/);
+            if (ball) {
+                const b = +ball[1] + +ball[2] / 10;
+                if (b < lastBall - 1 && inn) { inn.battingPlayers.push(...pendingOuts); pendingOuts = []; }
+                lastBall = b;
+            }
+            const won = line.match(/^(.+?) won by \d+ (?:runs?|wickets?)/i) || line.match(/^Match tied/i);
+            if (won) { result = line; continue; }
+            const eo = line.match(/^End of over (\d+) \(\d+ runs?\) - (.+?)\((\d+)-(\d+)\)(?:.*?\bRR ([\d.]+))?/i);
+            if (eo) {
+                const team = eo[2].trim();
+                if (!inn || inn.battingTeam !== team) startInnings(team);
+                inn.battingPlayers.push(...pendingOuts);
+                pendingOuts = [];
+                inn.overs = eo[1]; inn.runs = +eo[3]; inn.wickets = +eo[4];
+                inn.rr = eo[5] ? +eo[5] : +(inn.runs / +eo[1]).toFixed(2);
+                const next = lines[i + 1] || '';
+                let fm; COMMENTARY_BOWL_FIG.lastIndex = 0;
+                while ((fm = COMMENTARY_BOWL_FIG.exec(next))) {
+                    inn._bowl[fm[1].trim()] = { type: fm[2], overs: +fm[3], maidens: +fm[4], runs: +fm[5], wickets: +fm[6] };
+                }
+                inn._notOut = (next.match(/[A-Z][^,()]*? \d+ \(\d+b\)/g) || []).map(t => {
+                    const m = t.match(/^(.+?) (\d+) \((\d+)b\)$/);
+                    return m ? { name: m[1].trim(), runs: +m[2], balls: +m[3] } : null;
+                }).filter(Boolean);
+                continue;
+            }
+            const out = line.match(COMMENTARY_OUT);
+            if (out) {
+                pendingOuts.push({ name: escapeHtml(out[1]), dismissal: escapeHtml(out[2]), runs: +out[3], balls: +out[4], fours: +out[5], sixes: +out[6], sr: +out[7], isKeeper: false, isNotOut: false });
+            }
+        }
+        if (!innings.length) return null;
+        if (pendingOuts.length) innings[innings.length - 1].battingPlayers.push(...pendingOuts);
+        innings.forEach((x, idx) => {
+            x._notOut.forEach(b => {
+                const nm = escapeHtml(b.name);
+                if (!x.battingPlayers.some(q => q.name === nm)) {
+                    x.battingPlayers.push({ name: nm, dismissal: 'not out', runs: b.runs, balls: b.balls, fours: 0, sixes: 0, sr: b.balls ? +(b.runs / b.balls * 100).toFixed(2) : 0, isKeeper: false, isNotOut: true });
+                }
+            });
+            x.bowlingPlayers = Object.entries(x._bowl).map(([name, f]) => ({
+                name: escapeHtml(name), type: f.type, category: BOWLER_CATEGORY[f.type] || 'none',
+                oversText: String(f.overs), overs: f.overs, maidens: f.maidens, runs: f.runs, wickets: f.wickets,
+                econ: f.overs ? +(f.runs / f.overs).toFixed(2) : 0, noballs: 0, wides: 0
+            }));
+            delete x._bowl; delete x._notOut;
+            const other = innings[1 - idx] || null;
+            x.bowlingTeam = other ? other.battingTeam : (teams.find(t => t !== x.battingTeam) || '');
+        });
+        return {
+            teams: teams.length >= 2 ? teams : innings.map(x => x.battingTeam),
+            result, toss: '', motm: '', innings, source: 'commentary', matchType,
+            pitch: near(Object.keys(PITCH_EFFECTS), 'pitch'),
+            weather: near(Object.keys(WEATHER_EFFECTS), 'weather')
+        };
+    }
+
     function parseMatchScorecard(text) {
         const raw = String(text || '');
+        // Commentary copy(ies): split on each ">> Commentary" header.
+        if (/^End of over \d+ \(\d+ runs?\) - /im.test(raw)) {
+            const parts = raw.split(/\n(?=[^\n]*>>\s*Commentary)/i);
+            return parts.map(parseMatchCommentary).filter(Boolean);
+        }
         // HTML input (a real scorecard.htm page pasted, possibly several
         // back to back) — detected by a real document boundary rather
         // than a loose tag sniff, so a tab-pasted result that happens to
@@ -6545,7 +6690,7 @@ const MAX_OVERS_PER_BOWLER = { OD: 10, YOD: 8, T20: 4, YT20: 4 };
             let hist = loadMatchHistory();
             // Dedupe on (teams+result+both innings' final score) so re-analyzing
             // the same paste (e.g. re-clicking Analyze) doesn't duplicate it.
-            const sig = m => [m.teams.join('|'), m.result, ...m.innings.map(i => `${i.battingTeam}:${i.runs}/${i.wickets}`)].join('~');
+            const sig = m => [m.result, ...m.innings.map(i => `${i.battingTeam}:${i.runs}/${i.wickets}`)].join('~');
             const known = new Set(hist.map(sig));
             matches.forEach(m => {
                 if (!known.has(sig(m))) { hist.push(Object.assign({ savedAt: Date.now() }, m)); known.add(sig(m)); }
@@ -6559,9 +6704,21 @@ const MAX_OVERS_PER_BOWLER = { OD: 10, YOD: 8, T20: 4, YT20: 4 };
     // whitespace-insensitive) into overall bowling/batting figures. Returns
     // null when the name has never appeared, so callers can tell "no
     // evidence" apart from "evidence of a weak player".
+    // Squad pages show full names ("Bastiaan Melchiot"); scorecards and
+    // commentary show initial + surname ("B. Melchiot"). Matching on the
+    // raw string meant opponent squad players could NEVER be found in
+    // pasted history. Two squad-mates can share a key (Shiva/Sundeep
+    // Lamichhane -> "s. lamichhane") — the game's own scorecard can't tell
+    // them apart either, so callers skip ambiguous keys.
+    function playerNameKey(name) {
+        const t = String(name || '').trim().split(/\s+/).filter(Boolean);
+        if (t.length < 2) return t.join(' ').toLowerCase();
+        return `${t[0][0]}. ${t[t.length - 1]}`.toLowerCase();
+    }
+
     function getPlayerHistoryStats(name, history) {
         if (!name) return null;
-        const target = String(name).trim().toLowerCase();
+        const target = playerNameKey(name);
         if (!target) return null;
         const hist = history || loadMatchHistory();
         let bOvers = 0, bRuns = 0, bWkts = 0, bMatches = 0;
@@ -6569,12 +6726,12 @@ const MAX_OVERS_PER_BOWLER = { OD: 10, YOD: 8, T20: 4, YT20: 4 };
         hist.forEach(m => {
             (m.innings || []).forEach(inn => {
                 (inn.bowlingPlayers || []).forEach(bp => {
-                    if (bp.name && bp.name.trim().toLowerCase() === target) {
+                    if (bp.name && playerNameKey(bp.name) === target) {
                         bOvers += bp.overs || 0; bRuns += bp.runs || 0; bWkts += bp.wickets || 0; bMatches++;
                     }
                 });
                 (inn.battingPlayers || []).forEach(bp => {
-                    if (bp.name && bp.name.trim().toLowerCase() === target) {
+                    if (bp.name && playerNameKey(bp.name) === target) {
                         batRuns += bp.runs || 0; batBalls += bp.balls || 0; batInnings++;
                         if (bp.runs > batBest) batBest = bp.runs;
                     }
@@ -6634,27 +6791,26 @@ const MAX_OVERS_PER_BOWLER = { OD: 10, YOD: 8, T20: 4, YT20: 4 };
         return { matchesFound, bowlers: bowlerList.slice(0, 3), batters: batterList.slice(0, 3) };
     }
 
-    // Aggregates seam-vs-spin economy across every pasted match that recorded
-    // a given pitch type (only present when the pasted input was raw HTML
-    // with a Pitch: row — the tab-delimited copy has no pitch info, so those
-    // matches are simply skipped here rather than guessed at). Returns null
-    // below a small evidence floor (2 matches) to avoid a one-match fluke
-    // reading as a real trend.
-    function getPitchHistoryStats(pitchName, history) {
-        if (!pitchName) return null;
-        const target = String(pitchName).trim().toLowerCase();
-        const hist = (history || loadMatchHistory()).filter(m => m.pitch && m.pitch.trim().toLowerCase() === target);
+    // Seam-vs-spin economy across pasted matches played in the given
+    // conditions ({pitch} and/or {weather}; commentary pastes always carry
+    // both, HTML scorecards pitch only, tab scorecards neither — those are
+    // skipped, never guessed). Null below 2 matches / 5 overs so a single
+    // fluke can't read as a trend.
+    function getConditionsHistoryStats(cond, history) {
+        const same = (a, b) => !b || (a && a.trim().toLowerCase() === String(b).trim().toLowerCase());
+        if (!cond || (!cond.pitch && !cond.weather)) return null;
+        const hist = (history || loadMatchHistory()).filter(m => same(m.pitch, cond.pitch) && same(m.weather, cond.weather));
         if (hist.length < 2) return null;
-        let seamOvers = 0, seamRuns = 0, spinOvers = 0, spinRuns = 0;
+        let seamOvers = 0, seamRuns = 0, seamWkts = 0, spinOvers = 0, spinRuns = 0, spinWkts = 0;
         hist.forEach(m => (m.innings || []).forEach(inn => (inn.bowlingPlayers || []).forEach(bp => {
-            if (bp.category === 'seam') { seamOvers += bp.overs || 0; seamRuns += bp.runs || 0; }
-            else if (bp.category === 'spin') { spinOvers += bp.overs || 0; spinRuns += bp.runs || 0; }
+            if (bp.category === 'seam') { seamOvers += bp.overs || 0; seamRuns += bp.runs || 0; seamWkts += bp.wickets || 0; }
+            else if (bp.category === 'spin') { spinOvers += bp.overs || 0; spinRuns += bp.runs || 0; spinWkts += bp.wickets || 0; }
         })));
         if (seamOvers < 5 && spinOvers < 5) return null;
         return {
             matches: hist.length,
-            seamEcon: seamOvers > 0 ? +(seamRuns / seamOvers).toFixed(2) : null,
-            spinEcon: spinOvers > 0 ? +(spinRuns / spinOvers).toFixed(2) : null
+            seamEcon: seamOvers > 0 ? +(seamRuns / seamOvers).toFixed(2) : null, seamWkts, seamOvers: +seamOvers.toFixed(1),
+            spinEcon: spinOvers > 0 ? +(spinRuns / spinOvers).toFixed(2) : null, spinWkts, spinOvers: +spinOvers.toFixed(1)
         };
     }
 
@@ -6671,12 +6827,21 @@ const MAX_OVERS_PER_BOWLER = { OD: 10, YOD: 8, T20: 4, YT20: 4 };
     // against pasted-match history first (most precise: same actual player),
     // falling back to a team-level aggregate keyed by opponent name when no
     // squad cache or no name matches are available.
-    function buildPastedScoutingHtml(opponentPlayers, opponentName) {
+    function buildPastedScoutingHtml(opponentPlayers, opponentName, conditions) {
         const history = loadMatchHistory();
         if (!history.length) return '';
+        let html = '';
+        const cond = conditions && getConditionsHistoryStats({ pitch: conditions.pitch, weather: conditions.weather }, history);
+        if (cond) {
+            const line = (label, econ, wk, ov) => econ == null ? `${label} —` : `${label} ${econ} econ, ${wk}wk in ${ov} ov`;
+            html += `<div class="ftp-alert info" style="margin:4px 0 0 0;"><span>📋</span><div>${cond.matches} pasted matches on ${escapeHtml(conditions.pitch)} + ${escapeHtml(conditions.weather)}: ${line('seam', cond.seamEcon, cond.seamWkts, cond.seamOvers)} · ${line('spin', cond.spinEcon, cond.spinWkts, cond.spinOvers)}</div></div>`;
+        }
         const playerHits = [];
         if (opponentPlayers && opponentPlayers.length) {
+            const keyCount = {};
+            opponentPlayers.forEach(p => { const k = playerNameKey(p.name); keyCount[k] = (keyCount[k] || 0) + 1; });
             opponentPlayers.forEach(p => {
+                if (keyCount[playerNameKey(p.name)] > 1) return;
                 const stats = getPlayerHistoryStats(p.name, history);
                 if (stats) playerHits.push({ name: p.name, stats });
             });
@@ -6689,8 +6854,8 @@ const MAX_OVERS_PER_BOWLER = { OD: 10, YOD: 8, T20: 4, YT20: 4 };
             const parts = [];
             if (bowlLines.length) parts.push(`<strong>Bowlers to watch:</strong> ${bowlLines.join('; ')}`);
             if (batLines.length) parts.push(`<strong>Batters to watch:</strong> ${batLines.join('; ')}`);
-            if (!parts.length) return '';
-            return `<div class="ftp-alert info" style="margin:4px 0 0 0;"><span>📋</span><div>Real evidence from ${playerHits.length} squad player${playerHits.length > 1 ? 's' : ''} seen in pasted matches: ${parts.join(' · ')}</div></div>`;
+            if (!parts.length) return html;
+            return html + `<div class="ftp-alert info" style="margin:4px 0 0 0;"><span>📋</span><div>Real evidence from ${playerHits.length} squad player${playerHits.length > 1 ? 's' : ''} seen in pasted matches: ${parts.join(' · ')}</div></div>`;
         }
         // No per-player cross-reference (squad not cached, or none of these
         // names have shown up in a pasted match yet) — fall back to a
@@ -6701,16 +6866,42 @@ const MAX_OVERS_PER_BOWLER = { OD: 10, YOD: 8, T20: 4, YT20: 4 };
                 const parts = [];
                 if (teamStats.bowlers.length) parts.push(`<strong>Bowlers:</strong> ${teamStats.bowlers.map(b => `${b.name} (${b.wickets}wk @${b.econ})`).join('; ')}`);
                 if (teamStats.batters.length) parts.push(`<strong>Batters:</strong> ${teamStats.batters.map(b => `${b.name} (${b.runs}r, SR ${b.sr})`).join('; ')}`);
-                if (!parts.length) return '';
-                return `<div class="ftp-alert info" style="margin:4px 0 0 0;"><span>📋</span><div>Real evidence from ${teamStats.matchesFound} pasted match${teamStats.matchesFound > 1 ? 'es' : ''} of ${escapeHtml(opponentName)}: ${parts.join(' · ')}</div></div>`;
+                if (!parts.length) return html;
+                return html + `<div class="ftp-alert info" style="margin:4px 0 0 0;"><span>📋</span><div>Real evidence from ${teamStats.matchesFound} pasted match${teamStats.matchesFound > 1 ? 'es' : ''} of ${escapeHtml(opponentName)}: ${parts.join(' · ')}</div></div>`;
             }
         }
-        return '';
+        return html;
+    }
+
+    // Rebuilds an exported-history entry from scratch with only known
+    // fields. An import skips the parsers' escapeHtml, and these names are
+    // later rendered into innerHTML — so text fields are stripped of markup
+    // characters, numbers coerced, enums whitelisted.
+    function sanitizeImportedMatch(m) {
+        if (!m || typeof m !== 'object' || !Array.isArray(m.innings)) return null;
+        const txt = v => String(v == null ? '' : v).replace(/[<>"'`]/g, '').slice(0, 80);
+        const num = v => (Number.isFinite(+v) ? +v : 0);
+        const innings = m.innings.slice(0, 2).map(i => ({
+            battingTeam: txt(i.battingTeam), bowlingTeam: txt(i.bowlingTeam),
+            runs: num(i.runs), wickets: num(i.wickets), overs: txt(i.overs), rr: i.rr == null ? null : num(i.rr), extras: '', fall: [],
+            battingPlayers: (i.battingPlayers || []).slice(0, 15).map(b => ({ name: txt(b.name), dismissal: txt(b.dismissal), runs: num(b.runs), balls: num(b.balls), fours: num(b.fours), sixes: num(b.sixes), sr: num(b.sr), isKeeper: !!b.isKeeper, isNotOut: !!b.isNotOut })),
+            bowlingPlayers: (i.bowlingPlayers || []).slice(0, 15).map(b => {
+                const type = BOWLER_CATEGORY[b.type] ? b.type : '';
+                return { name: txt(b.name), type, category: BOWLER_CATEGORY[type] || 'none', oversText: txt(b.oversText || b.overs), overs: num(b.overs), maidens: num(b.maidens), runs: num(b.runs), wickets: num(b.wickets), econ: num(b.econ), noballs: num(b.noballs), wides: num(b.wides) };
+            })
+        }));
+        if (!innings.length) return null;
+        return {
+            savedAt: num(m.savedAt) || Date.now(), teams: (m.teams || []).slice(0, 2).map(txt), result: txt(m.result), toss: '', motm: '',
+            matchType: ['OD', 'YOD', 'T20', 'YT20'].includes(m.matchType) ? m.matchType : undefined,
+            pitch: PITCH_EFFECTS[m.pitch] ? m.pitch : undefined, weather: WEATHER_EFFECTS[m.weather] ? m.weather : undefined,
+            source: txt(m.source), innings
+        };
     }
 
     // A bare paste-and-save box — deliberately NOT a report. Pasting a match
     // here only feeds the persisted history that Match Orders/Ground read
-    // from (buildPastedScoutingHtml/getPitchHistoryStats above); there is no
+    // from (buildPastedScoutingHtml/getConditionsHistoryStats above); there is no
     // on-screen analysis of the pasted match itself, per explicit user
     // instruction ("the match review part is not needed").
     function createMatchPasteUI() {
@@ -6724,9 +6915,12 @@ const MAX_OVERS_PER_BOWLER = { OD: 10, YOD: 8, T20: 4, YT20: 4 };
                 <button id="ftp-match-toggle" style="background:none;border:none;cursor:pointer;font-size:12px;">▼</button>
               </div>
               <div id="ftp-match-body" style="padding:8px 10px;">
-                <div class="vj-text-xs vj-text-muted" style="margin-bottom:4px;">Paste a completed scorecard (tab-copy or full page HTML) to feed real bowler/batter/pitch evidence into Match Orders and Ground.</div>
+                <div class="vj-text-xs vj-text-muted" style="margin-bottom:4px;">Paste a completed match — commentary page text (best: carries pitch + weather), scorecard copy, or scorecard page HTML — to feed real bowler/batter/conditions evidence into Match Orders and Ground.</div>
                 <textarea id="ftp-match-input" spellcheck="false" style="width:100%;height:72px;box-sizing:border-box;font:11px/1.4 monospace;"></textarea>
-                <button id="ftp-match-analyze" class="ftp-button ftp-button-primary" style="width:100%;margin-top:6px;">\u{1F4BE} Save</button>
+                <div style="display:flex;gap:6px;margin-top:6px;">
+                  <button id="ftp-match-analyze" class="ftp-button ftp-button-primary" style="flex:1;">\u{1F4BE} Save</button>
+                  <button id="ftp-match-export" class="ftp-button" style="flex:1;" title="Copy your match history out as text — paste it back here + Save to restore or merge (e.g. after a reinstall or on another browser)">\u{1F4E4} Export</button>
+                </div>
                 <div id="ftp-match-output" class="vj-text-xs vj-text-muted" style="margin-top:6px;"></div>
               </div>
             </div>`;
@@ -6740,12 +6934,30 @@ const MAX_OVERS_PER_BOWLER = { OD: 10, YOD: 8, T20: 4, YT20: 4 };
             body.style.display = hidden ? 'block' : 'none';
             e.target.textContent = hidden ? '▼' : '▲';
         });
+        panel.querySelector('#ftp-match-export').addEventListener('click', () => {
+            const hist = loadMatchHistory();
+            const input = panel.querySelector('#ftp-match-input');
+            input.value = JSON.stringify(hist);
+            input.select();
+            panel.querySelector('#ftp-match-output').textContent = `${hist.length} match${hist.length === 1 ? '' : 'es'} exported above — copy and keep it somewhere safe. Paste it back + Save to restore/merge.`;
+        });
         panel.querySelector('#ftp-match-analyze').addEventListener('click', () => {
             const input = panel.querySelector('#ftp-match-input');
-            const matches = parseMatchScorecard(input.value);
             const output = panel.querySelector('#ftp-match-output');
+            const trimmed = input.value.trim();
+            if (trimmed.startsWith('[')) {
+                let imported = [];
+                try { imported = JSON.parse(trimmed).map(sanitizeImportedMatch).filter(Boolean); } catch (e) { imported = []; }
+                if (!imported.length) { output.textContent = 'That looks like an export but no matches could be read from it.'; return; }
+                const before = loadMatchHistory().length;
+                saveMatchesToHistory(imported);
+                output.textContent = `Imported ${loadMatchHistory().length - before} new match(es) (${imported.length} in the export; duplicates skipped). History now ${loadMatchHistory().length}.`;
+                input.value = '';
+                return;
+            }
+            const matches = parseMatchScorecard(input.value);
             if (!matches.length) {
-                output.textContent = 'Couldn’t parse any matches — paste a full scorecard (Result/Toss + two innings, or the full scorecard.htm HTML).';
+                output.textContent = 'Couldn’t parse any matches — paste the commentary page text, a full scorecard (Result/Toss + two innings), or the full scorecard.htm HTML.';
                 return;
             }
             saveMatchesToHistory(matches);
@@ -8703,7 +8915,7 @@ const progMap = { batting: 'batting', bowling: 'bowling', keeping: 'keeperbattin
         if (hasGiftedEndurance) talentScore += 1;
         if (hasGiftedFielding) talentScore += 1;
         if (hasGiftedPower) talentScore += 1;
-        if (isSturdy) talentScore += 0.5;
+        if (isSturdy) talentScore += 0.5 * talentWeight('Sturdy', age);
         if (hasSkilledBatting && primaryName === 'batting') talentScore += 1.5;
         if (hasSkilledBowling && primaryName === 'bowling') talentScore += 1.5;
 
@@ -10019,7 +10231,7 @@ const progMap = { batting: 'batting', bowling: 'bowling', keeping: 'keeperbattin
         if (talents.some(t => /natural leader/i.test(t))) protect += 4;
         if (talents.some(t => /safe hands/i.test(t))) protect += 3;
         if (talents.some(t => /new ball bowler|old ball bowler|^opener$|finisher/i.test(t))) protect += 4;
-        if (talents.some(t => /sturdy/i.test(t))) protect += 2;
+        if (talents.some(t => /sturdy/i.test(t))) protect += 2 * talentWeight('Sturdy', player.age);
         return protect;
     }
 
