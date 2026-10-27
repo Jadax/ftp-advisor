@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         FTP Advisor
 // @namespace    http://tampermonkey.net/
-// @version      8.101
+// @version      8.102
 // @description  Tactical/scouting advisor for fromthepavilion.org (cricket sim): team, tactics, pitch, training, transfer market, youth and squad plan advice with projections. Full changelog: github.com/Jadax/ftp-advisor
 // @author       Tushant Sharma
 // @license      MIT
@@ -888,11 +888,11 @@
         qualityRef = (opts.seniorCeiling && opts.seniorCeiling.ceiling != null)
             ? opts.seniorCeiling.ceiling
             : computePlayerCeiling(player, opts.academySpeed, opts.squadContext, 25).ceiling;
-        // Linear to full marks at a 70 skill-sum. The old 1:1 mapping capped
-        // at 55 while real to-25 projections run ~40-65: a Reliable 17yo
-        // (60) and an Average one (55) both maxed out, so the dominant term
-        // stopped separating exactly the youth the user is buying.
-        const qualityScore = Math.max(0, Math.min(55, qualityRef * 55 / 70));
+        // Linear to full marks at an 80 skill-sum. Real to-25 projections run
+        // ~40 (ordinary senior) to ~75 (16yo Prodigy Expert bat): the old
+        // 1:1 cap at 55, and a later 70, both tied the best youth prospects
+        // at the maximum — exactly the players the user buys.
+        const qualityScore = Math.max(0, Math.min(55, qualityRef * 55 / 80));
 
         // 2) Age/trajectory factor (0-10) — ONE continuous lifecycle curve
         //    for EVERY age (v8.65). The old two-curve split (youth declining
@@ -1092,7 +1092,7 @@
     const PITCH_EFFECTS = {
         'Sticky': { seam: 1.3, spin: 1.3, bat: 0.6, paceBonus: 1.0, favor: 'bowlers', desc: 'Heavily favours ALL bowlers' },
         'Uneven': { seam: 1.3, spin: 0.9, bat: 0.7, paceBonus: 1.3, favor: 'seam', desc: 'Favours seam (fast/fast-medium)' },
-        'Green': { seam: 1.2, spin: 0.8, bat: 0.85, paceBonus: 1.0, favor: 'seam', desc: 'Favours medium seam, slight disadvantage to spin' },
+        'Green': { seam: 1.25, spin: 0.8, bat: 0.85, paceBonus: 0.9, favor: 'seam', desc: 'Favours medium seam, slight disadvantage to spin' },
         'Hard': { seam: 1.0, spin: 0.7, bat: 1.3, paceBonus: 1.1, favor: 'batting', desc: 'Favours batters, fast bowlers get bounce' },
         'Flat': { seam: 0.8, spin: 0.8, bat: 1.3, paceBonus: 0.8, favor: 'batting', desc: 'Favours batters' },
         'Even': { seam: 1.0, spin: 1.0, bat: 1.0, paceBonus: 1.0, favor: 'balanced', desc: 'No advantage to anyone' },
@@ -6170,6 +6170,16 @@ const MAX_OVERS_PER_BOWLER = { OD: 10, YOD: 8, T20: 4, YT20: 4 };
             </div>`;
         document.getElementById('ftp-squad-strengths').innerHTML = strengthsHtml;
 
+        const topMean = (arr) => {
+            const top = arr.map(p => p.bowling || 0).sort((a, b) => b - a).slice(0, 3);
+            return top.length ? top.reduce((a, b) => a + b, 0) / top.length : 0;
+        };
+        const paceMixOf = (seamers) => ({
+            fast: topMean(seamers.filter(p => (p.bowlerPace || 0) >= 4)),
+            medium: topMean(seamers.filter(p => (p.bowlerPace || 0) === 3))
+        });
+        const seniorPaceMix = paceMixOf(seniorSeamers);
+        const youthPaceMix = paceMixOf(youthSeamers);
         const seniorT20BatRating = seniorBatRating * 0.7 + seniorPowerRating * 0.3;
         const youthT20BatRating = youthBatRating * 0.7 + youthPowerRating * 0.3;
 
@@ -6208,7 +6218,7 @@ const MAX_OVERS_PER_BOWLER = { OD: 10, YOD: 8, T20: 4, YT20: 4 };
                 const bat = isT20Class
                     ? (isYouthClass ? youthT20BatRating : seniorT20BatRating)
                     : (isYouthClass ? youthBatRating : seniorBatRating);
-                const rec = recommendPitchForSquad(seam, spin, bat);
+                const rec = recommendPitchForSquad(seam, spin, bat, isYouthClass ? youthPaceMix : seniorPaceMix);
                 const isMatch = currentPitch && rec.pitch && currentPitch.toLowerCase() === rec.pitch.toLowerCase();
                 if (className) matchedAnyClass = true;
 
@@ -6238,10 +6248,10 @@ const MAX_OVERS_PER_BOWLER = { OD: 10, YOD: 8, T20: 4, YT20: 4 };
             // senior/youth x OD/T20 breakdown so there's still useful
             // output, just not tied to real settable pitch slots.
             const fallback = [
-                { type: 'Senior (most matches)', ...recommendPitchForSquad(seniorSeamRating, seniorSpinRating, seniorBatRating) },
-                { type: 'Senior T20', ...recommendPitchForSquad(seniorSeamRating, seniorSpinRating, seniorT20BatRating) },
-                { type: 'Youth', ...recommendPitchForSquad(youthSeamRating, youthSpinRating, youthBatRating) },
-                { type: 'Youth T20', ...recommendPitchForSquad(youthSeamRating, youthSpinRating, youthT20BatRating) }
+                { type: 'Senior (most matches)', ...recommendPitchForSquad(seniorSeamRating, seniorSpinRating, seniorBatRating, seniorPaceMix) },
+                { type: 'Senior T20', ...recommendPitchForSquad(seniorSeamRating, seniorSpinRating, seniorT20BatRating, seniorPaceMix) },
+                { type: 'Youth', ...recommendPitchForSquad(youthSeamRating, youthSpinRating, youthBatRating, youthPaceMix) },
+                { type: 'Youth T20', ...recommendPitchForSquad(youthSeamRating, youthSpinRating, youthT20BatRating, youthPaceMix) }
             ];
             fallback.forEach(rec => {
                 recHtml += `<div class="ftp-rec low" style="margin:5px 0;">
@@ -6546,7 +6556,10 @@ const MAX_OVERS_PER_BOWLER = { OD: 10, YOD: 8, T20: 4, YT20: 4 };
     // ends mid-over (chase won / all out) has no closing summary, so its
     // last partial over is missing from the bowler figures — evidence, not
     // a scorecard.
-    const COMMENTARY_BOWL_FIG = /([A-Z][^,()]*?)\s*\((rfm|lfm|rfs|lfs|rws|lws|rf|lf|rm|lm)\)\s+(\d+)-(\d+)-(\d+)-(\d+)/g;
+    // Overs can be partial ("1.5-0-21-0") when an innings ends mid-over.
+    const COMMENTARY_BOWL_FIG = /([A-Z][^,()]*?)\s*\((rfm|lfm|rfs|lfs|rws|lws|rf|lf|rm|lm)\)\s+(\d+(?:\.\d)?)-(\d+)-(\d+)-(\d+)/g;
+    // A maiden's summary reads "End of over 9 (maiden) - Team(59-1)".
+    const COMMENTARY_END_OVER = /^End of over (\d+) \((?:\d+ runs?|maiden)\) - (.+?)\((\d+)-(\d+)\)(?:.*?\bRR ([\d.]+))?/i;
     const COMMENTARY_NAME = "[A-Z]\\.(?: ?[A-Z]\\.)* [A-Z][\\w'\u2019-]*(?: [A-Z][\\w'\u2019-]*)?";
     const COMMENTARY_OUT = new RegExp(`(${COMMENTARY_NAME}) ((?:c (?:& |${COMMENTARY_NAME} ))?(?:lbw |st ${COMMENTARY_NAME} |hit wicket )?b\\. ${COMMENTARY_NAME}|run out[^0-9(]*(?:\\([^)]*\\))?|retired[^0-9]*) (\\d+) \\((\\d+)b (\\d+)x4 (\\d+)x6\\) SR:([\\d.]+)`);
     function parseMatchCommentary(text) {
@@ -6586,7 +6599,7 @@ const MAX_OVERS_PER_BOWLER = { OD: 10, YOD: 8, T20: 4, YT20: 4 };
             }
             const won = line.match(/^(.+?) won by \d+ (?:runs?|wickets?)/i) || line.match(/^Match tied/i);
             if (won) { result = line; continue; }
-            const eo = line.match(/^End of over (\d+) \(\d+ runs?\) - (.+?)\((\d+)-(\d+)\)(?:.*?\bRR ([\d.]+))?/i);
+            const eo = line.match(COMMENTARY_END_OVER);
             if (eo) {
                 const team = eo[2].trim();
                 if (!inn || inn.battingTeam !== team) startInnings(team);
@@ -6597,7 +6610,7 @@ const MAX_OVERS_PER_BOWLER = { OD: 10, YOD: 8, T20: 4, YT20: 4 };
                 const next = lines[i + 1] || '';
                 let fm; COMMENTARY_BOWL_FIG.lastIndex = 0;
                 while ((fm = COMMENTARY_BOWL_FIG.exec(next))) {
-                    inn._bowl[fm[1].trim()] = { type: fm[2], overs: +fm[3], maidens: +fm[4], runs: +fm[5], wickets: +fm[6] };
+                    inn._bowl[fm[1].trim()] = { type: fm[2], oversText: fm[3], overs: oversToDecimal(fm[3]), maidens: +fm[4], runs: +fm[5], wickets: +fm[6] };
                 }
                 inn._notOut = (next.match(/[A-Z][^,()]*? \d+ \(\d+b\)/g) || []).map(t => {
                     const m = t.match(/^(.+?) (\d+) \((\d+)b\)$/);
@@ -6621,7 +6634,7 @@ const MAX_OVERS_PER_BOWLER = { OD: 10, YOD: 8, T20: 4, YT20: 4 };
             });
             x.bowlingPlayers = Object.entries(x._bowl).map(([name, f]) => ({
                 name: escapeHtml(name), type: f.type, category: BOWLER_CATEGORY[f.type] || 'none',
-                oversText: String(f.overs), overs: f.overs, maidens: f.maidens, runs: f.runs, wickets: f.wickets,
+                oversText: f.oversText, overs: f.overs, maidens: f.maidens, runs: f.runs, wickets: f.wickets,
                 econ: f.overs ? +(f.runs / f.overs).toFixed(2) : 0, noballs: 0, wides: 0
             }));
             delete x._bowl; delete x._notOut;
@@ -6639,7 +6652,7 @@ const MAX_OVERS_PER_BOWLER = { OD: 10, YOD: 8, T20: 4, YT20: 4 };
     function parseMatchScorecard(text) {
         const raw = String(text || '');
         // Commentary copy(ies): split on each ">> Commentary" header.
-        if (/^End of over \d+ \(\d+ runs?\) - /im.test(raw)) {
+        if (/^End of over \d+ \((?:\d+ runs?|maiden)\) - /im.test(raw)) {
             const parts = raw.split(/\n(?=[^\n]*>>\s*Commentary)/i);
             return parts.map(parseMatchCommentary).filter(Boolean);
         }
@@ -6966,7 +6979,15 @@ const MAX_OVERS_PER_BOWLER = { OD: 10, YOD: 8, T20: 4, YT20: 4 };
         });
     }
 
-    function recommendPitchForSquad(seamRating, spinRating, batRating) {
+    // paceMix (optional): { fast, medium } = mean bowling of the top 3 F/FM
+    // and top 3 medium seamers — the bowlers who'd actually bowl, so token
+    // seam types on batsmen don't dilute it. Manual: Uneven favours "fast
+    // and fast-medium", Green "particularly medium pace". A medium-led
+    // attack recommended Uneven handed the edge to the OPPONENT's quicks
+    // (reported Chennai T20: their rf took 2-22, our spectacular mediums
+    // went for 9.5 an over).
+    function recommendPitchForSquad(seamRating, spinRating, batRating, paceMix) {
+        const mediumLed = !!(paceMix && paceMix.medium > 0 && paceMix.medium >= (paceMix.fast || 0) + 0.5);
         // Based on Admin team's expert guide from FTP forums
         // Team strength categories: Batting, Seam (F/FM), Spin
         // Find which areas we're strongest in (top 1-2)
@@ -7003,7 +7024,9 @@ const MAX_OVERS_PER_BOWLER = { OD: 10, YOD: 8, T20: 4, YT20: 4 };
         // Better Seamers: Uneven (F/FM), Green (M)
         // Only recommend Uneven if seam is CLEARLY dominant
         if (primary.type === 'seam' && primary.rating > avgBowling + 1.0) {
-            if (primaryAdvantage > 2 && primary.rating > 6) {
+            if (primaryAdvantage > 2 && primary.rating > 6 && mediumLed) {
+                return { pitch: 'Green', reason: `Seam (${primary.rating.toFixed(1)}) is dominant and led by MEDIUM pace (top mediums ${paceMix.medium.toFixed(1)} vs fast/fast-medium ${(paceMix.fast || 0).toFixed(1)}). Green favours "particularly medium pace" — Uneven would mostly help the opposition's quicks.` };
+            } else if (primaryAdvantage > 2 && primary.rating > 6) {
                 return { pitch: 'Uneven', reason: `Seam (${primary.rating.toFixed(1)}) is dominant. Uneven: "F/FM get big advantage, particularly destructive around drinks." Favour fast/fast-medium bowlers.` };
             } else if (secondary.type === 'bat' && secondary.rating > 5) {
                 return { pitch: 'Hard', reason: `Seam (${primary.rating.toFixed(1)}) + batting (${secondary.rating.toFixed(1)}). Hard rewards F/FM quicks and batting — use your fast bowlers aggressively.` };
@@ -9582,24 +9605,40 @@ const progMap = { batting: 'batting', bowling: 'bowling', keeping: 'keeperbattin
         if (resultsEl) {
             const results = scrapeTransferResults();
             if (results.length > 0) {
+                // Academy/squad context for per-candidate Dynasty + Overall Rating
+                // projections, reused by every render pass (initial and after
+                // "Fetch Experience, Wages & Talents") so the training
+                // simulation runs once per candidate per pass.
+                const academyInfoForProjection = loadAcademyCache();
+                const squadContextForProjection = { size: seniorPlayers.length + youthPlayers.length, academyInfo: academyInfoForProjection, financeInfo: loadFinanceCache() };
+                const projOpts = { academyInfo: academyInfoForProjection, squadContext: squadContextForProjection };
+                // Near-term projection (_ceilingResult, "Projected at 20"), the
+                // to-25 projection (_dynastyCeiling — shared by the Dynasty chip,
+                // the ★ rating AND the peer comparison) and the rating itself,
+                // stored on the player so nothing downstream recomputes them.
+                function computeCandidateRating(p) {
+                    const academySpeed = getAcademySpeedForPlayer(p, academyInfoForProjection);
+                    p._ceilingResult = computePlayerCeiling(p, academySpeed, squadContextForProjection);
+                    const dynastyCeiling = computePlayerCeiling(p, academySpeed, squadContextForProjection, 25);
+                    p._dynastyCeiling = dynastyCeiling;
+                    p._overallRating = computeOverallRating(p, {
+                        academySpeed,
+                        squadContext: squadContextForProjection,
+                        seniorCeiling: dynastyCeiling
+                    });
+                    return p;
+                }
                 // Evaluate each player against squad stats
                 const evaluated = results.map(p => {
+                    computeCandidateRating(p);
                     const ev = evaluateTransferTarget(p, squadStats);
                     ev.rank = calculateRank(p, squadStats);
                     // Squad-peer comparison computed up front (not just at
                     // render time) so it can gate the senior filter below,
                     // not just annotate the card afterwards.
-                    // v8.66: computed for EVERY age, not just 21+. The v8.28
-                    // "youth are development bets, not like-for-like swaps"
-                    // gate was meant to keep the FILTER from hiding them, but
-                    // it also silently removed the compare line from under-21
-                    // cards entirely — a 20y12w candidate the user is weighing
-                    // against a promotion slot got no "would replace anyone?"
-                    // answer at all. The comparison is against senior squad
-                    // peers either way (the only players who'd compete for an
-                    // XI spot), so it's exactly as meaningful for a player
-                    // weeks from promotion as it is for one already senior.
-                    const peerCompare = comparePlayerToSquadPeers(p, seniorPlayers);
+                    // Every age gets a compare line, against its OWN age group
+                    // at the shared to-25 horizon (see comparePlayerToSquadPeers).
+                    const peerCompare = comparePlayerToSquadPeers(p, allPlayers, projOpts);
                     return { ...p, eval: ev, peerCompare };
                 });
 
@@ -9616,20 +9655,11 @@ const progMap = { batting: 'batting', bowling: 'bowling', keeping: 'keeperbattin
                     return age >= 21 && age > SENIOR_MAX_AGE;
                 }).length;
 
-                // Requested behaviour: an ELITE senior sitting on the
-                // market is still a wasted signing if they're not
-                // actually better than what you already have — showing
-                // "elite" or "strong" verdicts on their own is pointless
-                // for a like-for-like swap. So for 21+, "worth showing"
-                // means BOTH the absolute verdict is elite AND the
-                // squad-peer comparison says they're a real upgrade
-                // (outrank at least one current player in the SAME role
-                // — batter vs batters, bowler vs bowlers, keeper vs
-                // keepers, see comparePlayerToSquadPeers) or fill a
-                // genuine role gap (isGap). Youth keep the original
-                // elite/strong/adequate gate — they're development bets
-                // against an age curve, not like-for-like swaps, so
-                // "better than your current squad" doesn't apply yet.
+                // Requested behaviour: a senior is only worth showing if he's a
+                // real upgrade in his role — judged at the same age (to-25
+                // projection, see comparePlayerToSquadPeers) — or fills a gap.
+                // Youth are development bets gated by the age curve (verdict),
+                // with the compare line shown against your youth peers.
                 function isWorthShowing(e) {
                     const age = ageYears(e.age);
                     const isYouth = age < 21;
@@ -9640,13 +9670,15 @@ const progMap = { batting: 'batting', bowling: 'bowling', keeping: 'keeperbattin
                     if (isYouth) {
                         return e.eval.verdict !== 'poor' && e.eval.verdict !== 'weak';
                     }
-                    if (e.eval.verdict !== 'elite') {
-                        e.eval.warnings.push(`Verdict ${e.eval.verdict.toUpperCase()} — only ELITE seniors that also upgrade your squad are shown here`);
-                        return false;
-                    }
+                    // Hard filters (base + senior minimums, age-specific) drop a
+                    // candidate to poor/weak; past that, the bar is "projects
+                    // better at 25 than a current senior in his role". The old
+                    // bar (legacy ELITE + outranks a senior on CURRENT skill)
+                    // hid exactly the 21yo development signings the user buys.
+                    if (e.eval.verdict === 'poor' || e.eval.verdict === 'weak') return false;
                     const cmp = e.peerCompare;
                     if (!cmp || cmp.isGap || cmp.wouldReplace.length > 0) return true;
-                    e.eval.warnings.push(`Elite, but doesn't outrank any current ${cmp.groupLabel} in your squad — not a real upgrade`);
+                    e.eval.warnings.push(`Projects (skill-sum ${cmp.candidateProj} at 25) no higher than any current ${cmp.groupLabel} — not an upgrade`);
                     return false;
                 }
 
@@ -9721,45 +9753,6 @@ const progMap = { batting: 'batting', bowling: 'bowling', keeping: 'keeperbattin
                 logSquadGapDiagnostic(seniorEval);
                 const priorityBuys = filtered;
 
-                // Academy/squad context for per-candidate Dynasty + Overall Rating
-                // projections. Computed once here and reused by every render
-                // pass (initial and after "Fetch Experience, Wages & Talents")
-                // so the expensive training simulation runs once per candidate
-                // per pass, not once per render.
-                const academyInfoForProjection = loadAcademyCache();
-                const squadContextForProjection = { size: seniorPlayers.length + youthPlayers.length, academyInfo: academyInfoForProjection, financeInfo: loadFinanceCache() };
-
-                // Precompute and cache each candidate's near-term projection
-                // (_ceilingResult, feeds the "Projected at 20" promo line),
-                // the to-25 Dynasty comparison (_dynastyCeiling — the SAME
-                // senior-comparable horizon the rating uses, so the card's
-                // Dynasty chip reads on the same scale as a squad player's
-                // Player Advisor Dynasty line), and the price-independent
-                // Overall Rating, on the player object so both the sort below
-                // and renderTransferResults can read them back instead of
-                // recomputing.
-                function computeCandidateRating(p) {
-                    const academySpeed = getAcademySpeedForPlayer(p, academyInfoForProjection);
-                    const ceilingResult = computePlayerCeiling(p, academySpeed, squadContextForProjection);
-                    p._ceilingResult = ceilingResult;
-                    // to-25 for EVERY age (v8.60, per the user: "I want till
-                    // 25 so I can compare his potential future to my current
-                    // 21/22/23 year olds") — the Dynasty chip AND the rating
-                    // share this one projection. Candidates already ≥25 make
-                    // it trivial (weeksToAge → 0 → ceiling == current).
-                    // Precomputed HERE rather than inside computeOverallRating
-                    // so the expensive training simulation still runs once per
-                    // candidate (see the v8.49 design note).
-                    const dynastyCeiling = computePlayerCeiling(p, academySpeed, squadContextForProjection, 25);
-                    p._dynastyCeiling = dynastyCeiling;
-                    p._overallRating = computeOverallRating(p, {
-                        academySpeed,
-                        squadContext: squadContextForProjection,
-                        seniorCeiling: dynastyCeiling
-                    });
-                    return p;
-                }
-                priorityBuys.forEach(computeCandidateRating);
 
                 // Record every candidate's price into the local price-history
                 // ledger so future searches can anchor asking prices against
@@ -9887,12 +9880,12 @@ const progMap = { batting: 'batting', bowling: 'bowling', keeping: 'keeperbattin
                             const cmp = p.peerCompare;
                             if (cmp) {
                                 if (cmp.isGap) {
-                                    compareHtml = `<div class="vj-text-xs" style="color:var(--vj-green);line-height:1.4;margin-top:2px;">\u2191 Fills a real gap \u2014 you have no current SENIOR ${cmp.role === 'keeping' ? 'wicketkeeper' : cmp.role === 'bowling' ? 'bowler' : 'batter'} (youth in that role, if any, aren't counted here \u2014 only players already eligible for the senior XI)</div>`;
+                                    compareHtml = `<div class="vj-text-xs" style="color:var(--vj-green);line-height:1.4;margin-top:2px;">\u2191 Fills a real gap \u2014 you have no ${cmp.groupName} ${cmp.roleLabel} (projects to ${cmp.candidateProj} at 25)</div>`;
                                 } else if (cmp.wouldReplace.length > 0) {
-                                    const names = cmp.wouldReplace.map(r => r.player.name).join(', ');
-                                    compareHtml = `<div class="vj-text-xs" style="color:var(--vj-green);line-height:1.4;margin-top:2px;">\u2191 Outranks ${cmp.wouldReplace.length} of your ${cmp.groupLabel} \u2014 would replace: ${names}</div>`;
+                                    const names = cmp.wouldReplace.map(r => `${r.player.name} (${r.proj})`).join(', ');
+                                    compareHtml = `<div class="vj-text-xs" style="color:var(--vj-green);line-height:1.4;margin-top:2px;">\u2191 At 25 projects to ${cmp.candidateProj} \u2014 above ${cmp.wouldReplace.length} of your ${cmp.groupLabel} at the same age: ${names}</div>`;
                                 } else {
-                                    compareHtml = `<div class="vj-text-xs vj-text-muted" style="line-height:1.4;margin-top:2px;">Doesn't outrank any current ${cmp.groupLabel} \u2014 depth signing only, not an upgrade.</div>`;
+                                    compareHtml = `<div class="vj-text-xs vj-text-muted" style="line-height:1.4;margin-top:2px;">At 25 projects to ${cmp.candidateProj} \u2014 below all your ${cmp.groupLabel} at the same age: depth only.</div>`;
                                 }
                             }
 
@@ -9943,21 +9936,16 @@ const progMap = { batting: 'batting', bowling: 'bowling', keeping: 'keeperbattin
                             fetchBtn.textContent = `\u21BB Fetching ${idx + 1}/${total}...`;
                         });
                         // Re-evaluate with fetched experience/wage/talents
+                        // Real experience/wage/talents feed the projection, the
+                        // rating's value/talent terms and therefore the peer
+                        // compare — recompute all three, in that order.
                         priorityBuys.forEach(p => {
+                            computeCandidateRating(p);
                             const ev = evaluateTransferTarget(p, squadStats);
                             ev.rank = calculateRank(p, squadStats);
                             p.eval = ev;
-                            // Role doesn't change from the detail fetch, but
-                            // candidateRank can shift slightly with real
-                            // experience now known — recompute for consistency
-                            // with the same isWorthShowing gate used above.
-                            p.peerCompare = comparePlayerToSquadPeers(p, seniorPlayers);
+                            p.peerCompare = comparePlayerToSquadPeers(p, allPlayers, projOpts);
                         });
-                        // Recompute Dynasty + Overall Rating now that wage/
-                        // talent are known (they feed the rating's value and
-                        // talent terms), then re-sort the same way as the first
-                        // pass so the list stays ordered by best player.
-                        priorityBuys.forEach(computeCandidateRating);
                         priorityBuys.sort((a, b) =>
                             (b._overallRating && b._overallRating.score || 0) - (a._overallRating && a._overallRating.score || 0) ||
                             (verdictOrder[a.eval.verdict] ?? 9) - (verdictOrder[b.eval.verdict] ?? 9) ||
@@ -10088,21 +10076,27 @@ const progMap = { batting: 'batting', bowling: 'bowling', keeping: 'keeperbattin
     // Ranked SENIOR sell list for the Squad Plan — who to sell first, by
     // urgency (depth/age/weakness), shown directly in the plan.
     // Returns HTML; empty HTML when nobody's flagged.
-    function buildSeniorSellRanking(seniors, squadStats, seniorOver) {
+    function buildSeniorSellRanking(seniors, seniorOver) {
         if (!seniors || seniors.length === 0) return '';
         const avg = (arr, key) => arr.length ? arr.reduce((s, p) => s + (p[key] || 0), 0) / arr.length : 0;
         const avgRating = avg(seniors, 'rating');
-        const surplusMap = squadStats ? computeRoleSurplus(seniors, squadStats) : new Map();
         const dynastyAcademyInfo = loadAcademyCache();
         const dynastySquadContext = { size: seniors.length, academyInfo: dynastyAcademyInfo, financeInfo: loadFinanceCache() };
+        const projOpts = { academyInfo: dynastyAcademyInfo, squadContext: dynastySquadContext };
+        const surplusMap = computeRoleSurplus(seniors, projOpts);
 
         const scored = seniors.map(p => {
             let s = 0;
             const reasons = [];
-            const primary = getPrimarySkillInfo(p).value;
+            // A still-developing senior (under 24 — the user buys 20-21yos to
+            // grow them) is judged on the primary he projects to at 25, not
+            // today's: otherwise every development signing tops the sell list.
+            const developing = ageYears(p.age) < 24;
+            const primary = getPrimarySkillInfo(developing ? projectionAt25(p, projOpts).projectedSkills : p).value;
+            const at25 = developing ? ' (projected at 25)' : '';
             if (p.age >= 30) s += 10; else if (p.age >= 28) s += 5;
-            if (primary < 5) { s += 15; reasons.push(`Primary ${skillLabel(primary)} — too weak for senior cricket`); }
-            else if (primary < 7) { s += 10; reasons.push(`Primary ${skillLabel(primary)} — below standard`); }
+            if (primary < 5) { s += 15; reasons.push(`Primary ${skillLabel(primary)}${at25} — too weak for senior cricket`); }
+            else if (primary < 7) { s += 10; reasons.push(`Primary ${skillLabel(primary)}${at25} — below standard`); }
             if ((p.technique || 0) < 5) s += 10;
             if (avgRating > 0 && (p.rating || 0) < avgRating * 0.5) s += 15;
             const surplus = surplusMap.get(p.id);
@@ -10110,7 +10104,7 @@ const progMap = { batting: 'batting', bowling: 'bowling', keeping: 'keeperbattin
                 const overBy = surplus.positionInRole - surplus.roleTarget;
                 s += overBy === 1 ? 12 : overBy === 2 ? 9 : 6;
                 const roleLabel = surplus.role === 'keeping' ? 'keeper' : surplus.role === 'bowling' ? 'bowler' : 'batter';
-                reasons.push(`Depth: #${surplus.positionInRole} of ${surplus.roleCount} ${roleLabel}s (target ~${surplus.roleTarget})`);
+                reasons.push(`Depth: #${surplus.positionInRole} of ${surplus.roleCount} ${roleLabel}s at age-25 projection (target ~${surplus.roleTarget})`);
             }
             s -= seniorTalentProtection(p);
             if (p.isCaptain) s -= 5;
@@ -10129,31 +10123,44 @@ const progMap = { batting: 'batting', bowling: 'bowling', keeping: 'keeperbattin
             const cause = r.reasons.length ? r.reasons.join(' · ') : `sellScore ${r.s}`;
             html += `<div class="vj-text-xs" style="color:var(--vj-${sev === 'critical' ? 'red' : sev === 'high' ? 'amber' : 'muted'});margin-top:2px;">${i + 1}. <strong>${r.player.name}</strong> (${formatAgeDisplay(r.player.age)}, ${skillLabel(getPrimarySkillInfo(r.player).value)}) — ${cause}</div>`;
         });
-        if (scored.length > showCount) html += `<div class="vj-text-xs vj-text-muted" style="margin-top:2px;">+ ${scored.length - showCount} more (expand Sell Candidates below)</div>`;
+        if (scored.length > showCount) html += `<div class="vj-text-xs vj-text-muted" style="margin-top:2px;">+ ${scored.length - showCount} more lower-priority sell candidates not shown</div>`;
         return html;
     }
 
     // Ranked YOUTH sell list for the Squad Plan — who to sell/retire first.
     // Behind-curve prospects (failing YOUTH_DEV_CURVE minimums) ranked
     // highest, priority down.
-    function buildYouthSellRanking(youth, allPlayers, squadStats) {
+    function buildYouthSellRanking(youth, allPlayers) {
         if (!youth || youth.length === 0) return '<div class="vj-text-xs vj-text-muted" style="margin-top:4px;">No youth in cached squad \u2014 the youth squad is on a separate page.</div>';
         const dynastyAcademyInfo = loadAcademyCache();
         const dynastySquadContext = { size: (allPlayers || []).length, academyInfo: dynastyAcademyInfo, financeInfo: loadFinanceCache() };
 
+        const projOpts = { academyInfo: dynastyAcademyInfo, squadContext: dynastySquadContext };
+        // The best 11 youths (role-aware current value) ARE the youth XI —
+        // they win youth league prize money and the sponsorship rating
+        // bonus now, so "won't beat a senior by 25" is no reason to sell
+        // them; that penalty only applies outside the XI core.
+        const youthXiCore = new Set([...youth].sort((a, b) => computePlayerValueSkillSum(b) - computePlayerValueSkillSum(a)).slice(0, 11).map(p => p.id));
         const scored = youth.map(p => {
             let s = 0;
             const reasons = [];
             const ydEval = evaluateYouthDevelopment(p);
-            const behindStats = ydEval ? ydEval.rows.filter(r => r.status === 'behind') : [];
+            // Experience only grows by PLAYING him (manual), so a shortfall
+            // there says "pick him more", not "sell" — noted, weighted lightly.
+            const behindAll = ydEval ? ydEval.rows.filter(r => r.status === 'behind') : [];
+            const behindStats = behindAll.filter(r => r.skill !== 'experience');
+            if (behindAll.length > behindStats.length) { s += 3; reasons.push('Experience below target (grows by playing — give him matches)'); }
             if (behindStats.length >= 2) { s += 15; reasons.push(`Behind on ${behindStats.length} stats (${behindStats.map(r => r.label).join(', ')})`); }
             else if (behindStats.length === 1) { s += 8; reasons.push(`Behind on ${behindStats[0].label}`); }
             if (p.age >= 20 && behindStats.length >= 1) { s += 20; reasons.push('Age 20 — final youth year, behind curve'); }
             if (p.age >= 19 && ydEval && ydEval.rows[0] && ydEval.rows[0].status === 'behind' && (ydEval.rows[0].min - ydEval.rows[0].value) >= 2) { s += 15; reasons.push('Primary well behind target — unlikely to catch up'); }
-            const overallSkill = ((p.batting||0) + (p.bowling||0) + (p.technique||0) + (p.fielding||0)) / 4;
-            if (overallSkill < 4) { s += 10; reasons.push('Very low overall skill'); }
+            // Role-aware: a specialist batter's bowling is irrelevant to his
+            // value (same reasoning as computePlayerValueSkillSum).
+            const overallSkill = (getPrimarySkillInfo(p).value + (p.technique || 0) + (p.fielding || 0)) / 3;
+            if (overallSkill < 4) { s += 10; reasons.push('Very low overall skill for his role'); }
             if (ydEval && behindStats.length === 0 && ydEval.rows.some(r => r.status === 'ahead')) s -= 10;
             s -= youthTalentProtection(p);
+            if (youthXiCore.has(p.id)) s -= 8; // sell non-XI weak prospects before a regular
             // Ceiling still can't clear the current weakest same-role senior.
             // Projected to age 25 (the SAME senior-comparable horizon the
             // overall rating uses — computePlayerCeiling's 4th param) so a
@@ -10162,22 +10169,41 @@ const progMap = { batting: 'batting', bowling: 'bowling', keeping: 'keeperbattin
             // every mid-teen as "won't catch up" even when their realistic
             // post-20 training would clear the squad floor — the exact
             // inconsistency this check exists to avoid.
+            // Both sides at the SAME horizon: the youth's to-25 projection vs
+            // each senior's to-25 projection (already-25+ seniors as they are).
+            // Comparing against seniors' CURRENT skills flagged youths who
+            // would overtake a 21yo senior who is himself still improving.
             const rolePeers = (allPlayers || []).filter(sp => sp.age >= 21 && getPrimarySkillInfo(sp).name === getPrimarySkillInfo(p).name);
-            const ceilingResult = computePlayerCeiling(p, getAcademySpeedForPlayer(p, dynastyAcademyInfo), dynastySquadContext, 25);
-            if (rolePeers.length > 0) {
-                const peerFloor = Math.min(...rolePeers.map(computePlayerValueSkillSum));
-                if (ceilingResult.ceiling < peerFloor) { s += 12; reasons.push(`Ceiling (${ceilingResult.ceiling.toFixed(1)}) below weakest senior ${getPrimarySkillInfo(p).name === 'keeping' ? 'keeper' : getPrimarySkillInfo(p).name === 'bowling' ? 'bowler' : 'batter'}`); }
+            const ceiling = projectedSkillAt25(p, projOpts);
+            if (rolePeers.length > 0 && !youthXiCore.has(p.id)) {
+                const peerFloor = Math.min(...rolePeers.map(sp => projectedSkillAt25(sp, projOpts)));
+                if (ceiling < peerFloor) { s += 12; reasons.push(`Projects to ${Math.round(ceiling)} at 25, below your weakest senior ${getPrimarySkillInfo(p).name === 'keeping' ? 'keeper' : getPrimarySkillInfo(p).name === 'bowling' ? 'bowler' : 'batter'} at the same age (${Math.round(peerFloor)})`); }
             }
             return { player: p, s, reasons };
         }).filter(r => r.s > 0).sort((a, b) => b.s - a.s);
 
         if (scored.length === 0) return '<div class="vj-text-xs vj-text-muted" style="margin-top:4px;">All youth on track or ahead of the curve \u2014 no urgent sells.</div>';
-        let html = `<div class="vj-text-xs vj-text-muted" style="margin-top:6px;">\u{1F331} <strong>Sell/retire first (behind the curve):</strong></div>`;
-        scored.forEach((r, i) => {
+        // Manual: dropping below 12 youths auto-drafts poor local recruits,
+        // and you can recruit only one a week — so only the excess over 12
+        // can go now; the rest are "replace as recruits arrive".
+        const canSellNow = Math.max(0, youth.length - 12);
+        const line = (r, i) => {
             const sev = r.s >= 20 ? 'critical' : r.s >= 10 ? 'high' : 'medium';
             const cause = r.reasons.length ? r.reasons.join(' · ') : `score ${r.s}`;
-            html += `<div class="vj-text-xs" style="color:var(--vj-${sev === 'critical' ? 'red' : sev === 'high' ? 'amber' : 'muted'});margin-top:2px;">${i + 1}. <strong>${r.player.name}</strong> (age ${ageYears(r.player.age)}, ${skillLabel(getPrimarySkillInfo(r.player).value)}) — ${cause}</div>`;
-        });
+            return `<div class="vj-text-xs" style="color:var(--vj-${sev === 'critical' ? 'red' : sev === 'high' ? 'amber' : 'muted'});margin-top:2px;">${i + 1}. <strong>${r.player.name}</strong> (age ${ageYears(r.player.age)}, ${skillLabel(getPrimarySkillInfo(r.player).value)}${youthXiCore.has(r.player.id) ? ', youth-XI regular' : ''}) — ${cause}</div>`;
+        };
+        let html = '';
+        const now = scored.slice(0, canSellNow), later = scored.slice(canSellNow);
+        if (now.length) {
+            html += `<div class="vj-text-xs vj-text-muted" style="margin-top:6px;">\u{1F331} <strong>Sell/retire now</strong> (${youth.length} youths — ${canSellNow} above the 12 floor):</div>`;
+            now.forEach((r, i) => { html += line(r, i); });
+        } else {
+            html += `<div class="vj-text-xs vj-text-muted" style="margin-top:6px;">\u{1F331} At the 12-youth floor — recruit first, then release from the list below one-for-one.</div>`;
+        }
+        if (later.length) {
+            html += `<div class="vj-text-xs vj-text-muted" style="margin-top:6px;">\u{1F504} <strong>Replace as weekly recruits arrive</strong> (selling now would trigger the auto-draft):</div>`;
+            later.forEach((r, i) => { html += line(r, now.length + i); });
+        }
         return html;
     }
 
@@ -10196,18 +10222,19 @@ const progMap = { batting: 'batting', bowling: 'bowling', keeping: 'keeperbattin
     const SENIOR_ROLE_TARGETS = { keeping: 2, bowling: 6, batting: 6 };
 
     // Ranks each senior within their own primary-role group (best to
-    // worst, via calculateRank — the same quality metric transfer
-    // scouting uses) and flags anyone past the role's healthy-depth
-    // target as squad surplus. This is what makes "16 good players, who
+    // worst at the to-25 projection — the same horizon transfer peer
+    // compare and the ★ rating use, so a developing 21yo isn't cut behind
+    // a 26yo he'll overtake) and flags anyone past the role's
+    // healthy-depth target as squad surplus. This is what makes "16 good players, who
     // do I cut" answerable: a decent 4th-string bowler behind three
     // better ones is surplus even though nothing about him individually
     // is bad — the same logic a real selector uses.
-    function computeRoleSurplus(seniors, squadStats) {
+    function computeRoleSurplus(seniors, projOpts) {
         const roles = { batting: [], bowling: [], keeping: [] };
         seniors.forEach(p => { roles[getPrimarySkillInfo(p).name].push(p); });
         const surplusMap = new Map();
         Object.entries(roles).forEach(([role, group]) => {
-            const ranked = [...group].sort((a, b) => calculateRank(b, squadStats) - calculateRank(a, squadStats));
+            const ranked = [...group].sort((a, b) => projectedSkillAt25(b, projOpts) - projectedSkillAt25(a, projOpts));
             ranked.forEach((p, idx) => {
                 surplusMap.set(p.id, {
                     role, roleCount: group.length, roleTarget: SENIOR_ROLE_TARGETS[role],
@@ -10243,10 +10270,13 @@ const progMap = { batting: 'batting', bowling: 'bowling', keeping: 'keeperbattin
     // version — not surfaced as a sell reason since it's the opposite of one.
     function youthTalentProtection(player) {
         const talents = player.talents || [];
+        const role = getPrimarySkillInfo(player).name;
+        const aligned = (re) => talents.some(t => re.test(t) && isTalentRoleAligned(t, role));
         let protect = 0;
         if (talents.some(t => /prodigy/i.test(t))) protect += 15;
-        if (talents.some(t => /gifted/i.test(t))) protect += 6;
-        if (talents.some(t => /skilled/i.test(t))) protect += 3;
+        if (aligned(/gifted/i)) protect += 6;
+        if (aligned(/skilled/i)) protect += 3;
+        if (talents.some(t => /sturdy/i.test(t))) protect += 2 * talentWeight('Sturdy', player.age);
         return protect;
     }
 
@@ -10319,7 +10349,7 @@ const progMap = { batting: 'batting', bowling: 'bowling', keeping: 'keeperbattin
         // answer to "who do I sell first", not a summary pointing at a
         // buried collapsible. Show the top surplus/urgency candidates (the
         // ones you'd cut to hit target), best-to-sell first.
-        seniorHtml += buildSeniorSellRanking(seniors, squadStats, seniorOver);
+        seniorHtml += buildSeniorSellRanking(seniors, seniorOver);
 
         // ── YOUTH half ──────────────────────────────────────────
         let youthHtml = '';
@@ -10334,7 +10364,7 @@ const progMap = { batting: 'batting', bowling: 'bowling', keeping: 'keeperbattin
         youthHtml += `<div class="vj-text-xs vj-text-muted" style="margin-top:4px;line-height:1.5;">Youth must meet the age-based development-curve minimums (primary/technique/fielding against the 16-20 targets) to justify carrying to a senior spot. A stat below target counts as "behind" only if it can't be trained up before the age-year ends — 20.14 for a 20yo. Behind on 2+ stats \u2014 especially at age 19-20 with no time left to catch up \u2014 is a strong sell/retire signal.</div>`;
         // Ranked youth sell list embedded too (same scoring as
         // buildYouthSellRanking) — behind-curve prospects first.
-        youthHtml += buildYouthSellRanking(youth, players, squadStats);
+        youthHtml += buildYouthSellRanking(youth, players);
 
         // Dynasty ceilings shown in the embedded sell rankings above use
         // getAcademySpeedForPlayer(), which silently falls back to a
@@ -10768,35 +10798,49 @@ const progMap = { batting: 'batting', bowling: 'bowling', keeping: 'keeperbattin
     }
 
     /**
-     * Ranks this candidate against the squad players who actually compete
-     * for the same spot — same PRIMARY ROLE (batting/bowling/keeping via
-     * getPrimarySkillInfo), not same age. Age was the original grouping
-     * here, but "does this new signing outrank your other 24-year-olds"
-     * is a meaningless question if those 24-year-olds are your bowlers
-     * and the candidate is a keeper — a keeper only ever replaces a
-     * keeper. Requested explicitly: batsmen, bowlers, and wicketkeepers
-     * need to be judged against their own kind.
-     * No peers in that role at all (e.g. squad currently has zero
-     * specialist keepers) is flagged via `isGap` — that's not "nobody to
-     * compare against so ignore this candidate", it's a genuine squad
-     * hole, arguably the strongest possible case FOR signing.
-     * Returns peers sorted worst-rank-first (best-sell-candidate-first),
-     * so a caller can show "if you sign this player, here's who to move
-     * on, starting with the clearest cut."
+     * Compares a candidate with the squad players he'd actually compete
+     * with: same PRIMARY ROLE (getPrimarySkillInfo) and the same age group
+     * (youth vs youth, senior vs senior — youths can't play senior-only
+     * slots' competition the same way and vice versa), measured at the SAME
+     * horizon: the to-25 projected skill-sum (computePlayerCeiling(..., 25),
+     * the one the ★ rating uses; players already 25+ project to themselves).
+     * The old version ranked on CURRENT skill (calculateRank), so a 21yo who
+     * will be the better player at 25 lost to a 26yo today and was hidden
+     * from the senior list — the user buys 20-21yos precisely for that
+     * development ("compare his potential future to my current 21/22/23
+     * year olds"). isGap = nobody of that role in the group: a real hole.
+     * wouldReplace is ascending (clearest cut first).
      */
-    function comparePlayerToSquadPeers(candidate, squadPlayers) {
-        const squadStats = computeSquadStats(squadPlayers);
+    const _peerProjectionCache = new Map();
+    function projectionAt25(player, projOpts) {
+        if (player._dynastyCeiling && player._dynastyCeiling.ceiling != null) return player._dynastyCeiling;
+        const academyInfo = projOpts && projOpts.academyInfo;
+        const speed = getAcademySpeedForPlayer(player, academyInfo);
+        const key = [player.id, player.name, player.age, player.batting, player.bowling, player.keeping, player.technique, player.fielding, player.endurance, player.power, player.experience, (player.talents || []).join(','), speed].join('|');
+        if (!_peerProjectionCache.has(key)) {
+            _peerProjectionCache.set(key, computePlayerCeiling(player, speed, (projOpts && projOpts.squadContext) || {}, 25));
+        }
+        return _peerProjectionCache.get(key);
+    }
+    function projectedSkillAt25(player, projOpts) {
+        return projectionAt25(player, projOpts).ceiling;
+    }
+    function comparePlayerToSquadPeers(candidate, squadPlayers, projOpts) {
         const candidateRole = getPrimarySkillInfo(candidate).name; // 'batting' | 'bowling' | 'keeping'
-        const peers = squadPlayers.filter(p => p.age >= 21 && getPrimarySkillInfo(p).name === candidateRole);
+        const youthGroup = isYouthAge(candidate.age);
+        const peers = squadPlayers.filter(p => isYouthAge(p.age) === youthGroup
+            && !(candidate.id != null && p.id === candidate.id) && p.name !== candidate.name
+            && getPrimarySkillInfo(p).name === candidateRole);
         const isGap = peers.length === 0;
         const roleLabel = candidateRole === 'keeping' ? 'wicketkeeper' : candidateRole === 'bowling' ? 'bowler' : 'batter';
-        const groupLabel = isGap ? `no current ${roleLabel}s — fills a squad gap` : `${roleLabel}`;
-        const candidateRank = calculateRank(candidate, squadStats);
+        const groupName = youthGroup ? 'YOUTH' : 'SENIOR';
+        const groupLabel = `${groupName.toLowerCase()} ${roleLabel}s`;
+        const candidateProj = Math.round(projectedSkillAt25(candidate, projOpts));
         const ranked = peers
-            .map(p => ({ player: p, rank: calculateRank(p, squadStats) }))
-            .sort((a, b) => a.rank - b.rank);
-        const wouldReplace = ranked.filter(r => candidateRank > r.rank);
-        return { candidateRank, groupLabel, wouldReplace, allPeers: ranked, squadStats, isGap, role: candidateRole };
+            .map(p => ({ player: p, proj: Math.round(projectedSkillAt25(p, projOpts)) }))
+            .sort((a, b) => a.proj - b.proj);
+        const wouldReplace = ranked.filter(r => candidateProj > r.proj);
+        return { candidateProj, groupName, groupLabel, roleLabel, wouldReplace, allPeers: ranked, isGap, role: candidateRole };
     }
 
     // Short training-program codes matching the workbook's own
@@ -10964,27 +11008,20 @@ const progMap = { batting: 'batting', bowling: 'bowling', keeping: 'keeperbattin
             trainingEl.innerHTML = tHtml;
         }
 
-        // Squad comparison — who this player would realistically replace.
-        // v8.66: shown for EVERY age, matching the transfer cards. The old
-        // "youth are development bets, not direct swaps" note sounded like a
-        // design decision but in practice just removed the answer to "would he
-        // replace anyone?" from under-21 player pages entirely. Peers are
-        // senior-squad players of the same role regardless of the player's
-        // age — a 20y12w weeks from promotion competes for an XI spot exactly
-        // like a 21yo, and a 16yo's future value is gauged against the seniors
-        // he'd eventually have to displace.
+        // Squad comparison — same role, same age group, at the shared to-25
+        // horizon (see comparePlayerToSquadPeers), matching the transfer cards.
         if (squadPlayers.length > 0) {
-            const cmp = comparePlayerToSquadPeers(player, squadPlayers);
+            const cmp = comparePlayerToSquadPeers(player, squadPlayers, { academyInfo, squadContext });
             let cHtml = cmp.isGap
-                ? `<div class="vj-text-xs vj-text-muted vj-mb-4">You have no current SENIOR ${cmp.role === 'keeping' ? 'wicketkeepers' : cmp.role === 'bowling' ? 'bowlers' : 'batters'} to compare against (youth in that role aren't counted here) — this player would fill a genuine squad gap. This player ranks ${cmp.candidateRank}/10.</div>`
-                : `<div class="vj-text-xs vj-text-muted vj-mb-4">Compared against your squad's ${cmp.groupLabel}s (${cmp.allPeers.length} player${cmp.allPeers.length === 1 ? '' : 's'}). This player ranks ${cmp.candidateRank}/10.</div>`;
+                ? `<div class="vj-text-xs vj-text-muted vj-mb-4">No other ${cmp.groupLabel} in your squad — this player fills a genuine gap. Projected skill-sum at 25: ${cmp.candidateProj}.</div>`
+                : `<div class="vj-text-xs vj-text-muted vj-mb-4">Compared with your ${cmp.allPeers.length} other ${cmp.groupLabel}, everyone projected to age 25 (players already 25+ as they are). This player: ${cmp.candidateProj}.</div>`;
             if (cmp.wouldReplace.length > 0) {
-                cHtml += `<div class="vj-fw-700 vj-mb-4">Would replace (best sell first):</div>`;
+                cHtml += `<div class="vj-fw-700 vj-mb-4">Projects above (clearest cut first):</div>`;
                 cmp.wouldReplace.forEach(r => {
-                    cHtml += `<div class="ftp-stat-row"><span class="ftp-stat-label">${r.player.name}</span><span class="ftp-stat-value">Rank ${r.rank}/10</span></div>`;
+                    cHtml += `<div class="ftp-stat-row"><span class="ftp-stat-label">${r.player.name} (${formatAgeDisplay(r.player.age)})</span><span class="ftp-stat-value">${r.proj} at 25</span></div>`;
                 });
             } else if (!cmp.isGap) {
-                cHtml += `<div class="vj-text-sm vj-text-muted">Doesn't clearly outrank anyone in this group — not an obvious replacement for your current squad.</div>`;
+                cHtml += `<div class="vj-text-sm vj-text-muted">Projects below every other ${cmp.groupLabel.replace(/s$/, '')} at the same age — not an obvious upgrade.</div>`;
             }
             compareEl.innerHTML = cHtml;
         } else {
