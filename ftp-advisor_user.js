@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         FTP Advisor
 // @namespace    http://tampermonkey.net/
-// @version      8.105
+// @version      8.106
 // @description  Tactical/scouting advisor for fromthepavilion.org (cricket sim): team, tactics, pitch, training, transfer market, youth and squad plan advice with projections. Full changelog: github.com/Jadax/ftp-advisor
 // @author       Tushant Sharma
 // @license      MIT
@@ -2179,6 +2179,21 @@
     // upgrade schedule or pace, so 5 years is a tunable assumption,
     // not a sourced number.
     const ACADEMY_RAMP_YEARS = 5;
+
+    // Youth-week multiplier for MULTI-WEEK PROJECTIONS only (not the training
+    // page's weekly estimates). The workbook rates alone took a 16yo exactly on
+    // the user's YOUTH_DEV_CURVE (4/4/4) to 7/7/7 at 20 vs the curve's 9/9/8;
+    // 1.6 is the fit that maps on-curve 16-19yos back onto the curve at 20
+    // (16: +1, 17: exact, 18: -1, 19: exact primary). Re-fit if real
+    // progression data ever disagrees.
+    const YOUTH_PROJECTION_CALIBRATION = 1.6;
+    // Deliberately youth-only: a 21-24 fit to AGE_SCOUT_THRESHOLDS (a
+    // cross-section of per-age minimums, not a trajectory) compounded with
+    // this one and drove every 16yo to the skill cap by 25 (no spread left).
+    function projectionCalibration(age) {
+        const a = age || 0;
+        return a < 21 ? YOUTH_PROJECTION_CALIBRATION : 1;
+    }
 
     /**
      * Real, age-appropriate training speed for a specific player.
@@ -8175,8 +8190,9 @@ table.ftp-table {
             }
 
             if (program === 'rest') continue; // no skill gain this week
-            const squadMult = squadPenaltyMultiplier(squadSizeForPlayer(simPlayer, squadContext));
-            const gainOpts = squadMult < 1 ? { squadSizePenalty: squadMult } : undefined;
+            const squadMult = squadPenaltyMultiplier(squadSizeForPlayer(simPlayer, squadContext))
+                * projectionCalibration(simPlayer.age);
+            const gainOpts = squadMult !== 1 ? { squadSizePenalty: squadMult } : undefined;
             // Academy improves over the horizon — later weeks train at a
             // higher speed than earlier ones (see academySpeedAtWeek).
             const gains = estimateWeeklyTrainingGain(program, simPlayer, academySpeedAtWeek(academySpeed, week - 1), gainOpts);
@@ -9698,15 +9714,16 @@ const progMap = { batting: 'batting', bowling: 'bowling', keeping: 'keeperbattin
                         e.eval.warnings.push(`Age ${age} — past prime years for senior transfer`);
                         return false;
                     }
-                    // User's bar for 20+: must project to 55+ at 25. Before Fetch
-                    // the projection lacks experience/talents (worth up to ~4),
-                    // so the bar is lowered by that margin until they're known.
-                    if (age >= 20) {
+                    // User's bar, every age (youth projections are curve-calibrated,
+                    // see YOUTH_PROJECTION_CALIBRATION): must project to 60+ at 25.
+                    // Before Fetch the projection lacks experience/talents (worth
+                    // up to ~4), so the bar is lowered by that margin until known.
+                    {
                         const known = (e.experience || 0) > 0 || (e.wage || 0) > 0;
-                        const bar = TRANSFER_MIN_PROJ_20PLUS - (known ? 0 : TRANSFER_PREFETCH_PROJ_MARGIN);
+                        const bar = TRANSFER_MIN_PROJ_AT25 - (known ? 0 : TRANSFER_PREFETCH_PROJ_MARGIN);
                         const proj = e._dynastyCeiling ? e._dynastyCeiling.ceiling : 0;
                         if (proj < bar) {
-                            e.eval.warnings.push(`Projects ${Math.round(proj)} at 25 — below the ${TRANSFER_MIN_PROJ_20PLUS} bar for 20+`);
+                            e.eval.warnings.push(`Projects ${Math.round(proj)} at 25 — below the ${TRANSFER_MIN_PROJ_AT25} bar`);
                             return false;
                         }
                     }
@@ -10915,7 +10932,7 @@ const progMap = { batting: 'batting', bowling: 'bowling', keeping: 'keeperbattin
     // buy, 16yo included, is ultimately a first-team bet (user's aim).
     // TRANSFER_XI_SLOTS = how deep in a role a player still makes a typical XI.
     const TRANSFER_XI_SLOTS = { batting: 5, bowling: 5, keeping: 1 };
-    const TRANSFER_MIN_PROJ_20PLUS = 55; // user's buying bar for 20+ (to-25 projection)
+    const TRANSFER_MIN_PROJ_AT25 = 60; // user's buying bar, all ages (to-25 projection)
     const TRANSFER_PREFETCH_PROJ_MARGIN = 4; // exp/talents not yet fetched
     function squadRankLines(candidate, squadPlayers, projOpts) {
         const role = getPrimarySkillInfo(candidate).name;
