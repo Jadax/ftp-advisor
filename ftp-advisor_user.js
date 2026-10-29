@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         FTP Advisor
 // @namespace    http://tampermonkey.net/
-// @version      8.104
+// @version      8.105
 // @description  Tactical/scouting advisor for fromthepavilion.org (cricket sim): team, tactics, pitch, training, transfer market, youth and squad plan advice with projections. Full changelog: github.com/Jadax/ftp-advisor
 // @author       Tushant Sharma
 // @license      MIT
@@ -1128,6 +1128,18 @@
     }
     function squadPenaltyMultiplier(squadSize) {
         return Math.max(0, 1 - squadPenaltyPct(squadSize) / 100);
+    }
+    // The 25 limit is per SQUAD (senior or youth), not the club total: the
+    // user's Academy page showed 100%/100% efficiency with 15 seniors + 17
+    // youths, while the combined count (32) halved every projection.
+    function squadSizeForPlayer(player, squadContext) {
+        if (!squadContext) return 0;
+        const n = (player.age || 0) < 21 ? squadContext.youthCount : squadContext.seniorCount;
+        return n != null ? n : (squadContext.size || 0);
+    }
+    function squadCounts(players) {
+        const youthCount = (players || []).filter(p => (p.age || 0) < 21).length;
+        return { size: (players || []).length, youthCount, seniorCount: (players || []).length - youthCount };
     }
 
     // Senior minimum skill requirements for transfers (age-dependent)
@@ -8133,10 +8145,8 @@ table.ftp-table {
         ADAPTIVE_PLAN_SKILLS.forEach(skill => {
             state[skill] = { level: Math.min(15, Math.round(player[skill] || 0)), progress: 0 };
         });
-        // Squad size penalty — constant across all simulated weeks since
-        // we don't model squad composition changes during the plan.
-        const ss = squadContext?.size || 0;
-        const squadMult = squadPenaltyMultiplier(ss);
+        // Squad size penalty — today's squad counts held constant (no model
+        // of squad changes); which squad applies follows the simulated age.
 
         const levelUps = [];
         const timeline = [];
@@ -8165,6 +8175,7 @@ table.ftp-table {
             }
 
             if (program === 'rest') continue; // no skill gain this week
+            const squadMult = squadPenaltyMultiplier(squadSizeForPlayer(simPlayer, squadContext));
             const gainOpts = squadMult < 1 ? { squadSizePenalty: squadMult } : undefined;
             // Academy improves over the horizon — later weeks train at a
             // higher speed than earlier ones (see academySpeedAtWeek).
@@ -8430,9 +8441,9 @@ const progMap = { batting: 'batting', bowling: 'bowling', keeping: 'keeperbattin
         if (academyInfo && academyInfo.levelNum <= 1) {
             rec.warnings.push(`Academy level is ${academyInfo.level} — training is only ${Math.round(academySpeed * 100)}% speed.`);
         }
-        const squadSize = squadContext?.size || 0;
-        if (squadSize > 25) {
-            rec.warnings.push(`Squad has ${squadSize} players (>${MAX_EFFICIENT_SQUAD} limit). Training penalty: ${squadPenaltyPct(squadSize).toFixed(1)}%.`);
+        const squadSize = squadSizeForPlayer(player, squadContext);
+        if (squadSize > MAX_EFFICIENT_SQUAD) {
+            rec.warnings.push(`${(player.age || 0) < 21 ? 'Youth' : 'Senior'} squad has ${squadSize} players (>${MAX_EFFICIENT_SQUAD} limit). Training penalty: ${squadPenaltyPct(squadSize).toFixed(1)}%.`);
         }
         const ageMult = getAgeTrainingMultiplier(player.age);
         if (ageMult.primary <= 0.5) {
@@ -8471,8 +8482,7 @@ const progMap = { batting: 'batting', bowling: 'bowling', keeping: 'keeperbattin
             // default (reads player.fatigue). Squad size penalty: compute from
             // squadContext.size and pass explicitly since the function has no
             // access to squadContext.
-            const ss = squadContext?.size || 0;
-            const squadMult = squadPenaltyMultiplier(ss);
+            const squadMult = squadPenaltyMultiplier(squadSizeForPlayer(player, squadContext));
             const gainOpts = squadMult < 1 ? { squadSizePenalty: squadMult } : undefined;
             rec.weeklyGain = estimateWeeklyTrainingGain(rec.program, player, academySpeed, gainOpts);
             const programDef = TRAINING_PROGRAMS[rec.program];
@@ -8598,7 +8608,7 @@ const progMap = { batting: 'batting', bowling: 'bowling', keeping: 'keeperbattin
         });
         displayAcademyRecommendation(academyRec);
 
-        const squadContext = { size: players.length, hasUpcomingMatch: false, academyInfo, financeInfo };
+        const squadContext = { ...squadCounts(players), hasUpcomingMatch: false, academyInfo, financeInfo };
         const recommendations = [];
         players.forEach(player => {
             const rec = recommendTraining(player, squadContext);
@@ -8612,7 +8622,8 @@ const progMap = { batting: 'batting', bowling: 'bowling', keeping: 'keeperbattin
         const fatigued = players.filter(p => p.fatigue <= 4);
         const youth = players.filter(p => p.age < 21);
         const aging = players.filter(p => p.age >= 30);
-        const efficiency = Math.max(0, 100 - squadPenaltyPct(players.length));
+        const biggestSquad = Math.max(squadContext.seniorCount, squadContext.youthCount);
+        const efficiency = Math.max(0, 100 - squadPenaltyPct(biggestSquad));
         // Squad-wide summary badge — uses the game's own live overall
         // efficiency (avg of Senior/Youth Training Efficiency %, already
         // scraped in parseAcademyDoc) rather than the derived ACADEMY_SPEED
@@ -8659,7 +8670,7 @@ const progMap = { batting: 'batting', bowling: 'bowling', keeping: 'keeperbattin
                 }
                 return '';
             })()}
-            ${players.length > MAX_EFFICIENT_SQUAD ? `<div class="ftp-alert warning" style="margin-top:4px;"><span>\u26A0</span><div>Squad has ${players.length} players (&gt;${MAX_EFFICIENT_SQUAD} limit). Training penalty: ${squadPenaltyPct(players.length).toFixed(1)}%.</div></div>` : ''}
+            ${biggestSquad > MAX_EFFICIENT_SQUAD ? `<div class="ftp-alert warning" style="margin-top:4px;"><span>\u26A0</span><div>${squadContext.youthCount > squadContext.seniorCount ? 'Youth' : 'Senior'} squad has ${biggestSquad} players (&gt;${MAX_EFFICIENT_SQUAD} limit). Training penalty: ${squadPenaltyPct(biggestSquad).toFixed(1)}%.</div></div>` : ''}
         `;
         document.getElementById('ftp-training-stats').innerHTML = statsHtml;
 
@@ -9630,7 +9641,7 @@ const progMap = { batting: 'batting', bowling: 'bowling', keeping: 'keeperbattin
                 // "Fetch Experience, Wages & Talents") so the training
                 // simulation runs once per candidate per pass.
                 const academyInfoForProjection = loadAcademyCache();
-                const squadContextForProjection = { size: seniorPlayers.length + youthPlayers.length, academyInfo: academyInfoForProjection, financeInfo: loadFinanceCache() };
+                const squadContextForProjection = { ...squadCounts(allPlayers), academyInfo: academyInfoForProjection, financeInfo: loadFinanceCache() };
                 const projOpts = { academyInfo: academyInfoForProjection, squadContext: squadContextForProjection };
                 // Near-term projection (_ceilingResult, "Projected at 20"), the
                 // to-25 projection (_dynastyCeiling — shared by the Dynasty chip,
@@ -9686,6 +9697,18 @@ const progMap = { batting: 'batting', bowling: 'bowling', keeping: 'keeperbattin
                     if (!isYouth && age > SENIOR_MAX_AGE) {
                         e.eval.warnings.push(`Age ${age} — past prime years for senior transfer`);
                         return false;
+                    }
+                    // User's bar for 20+: must project to 55+ at 25. Before Fetch
+                    // the projection lacks experience/talents (worth up to ~4),
+                    // so the bar is lowered by that margin until they're known.
+                    if (age >= 20) {
+                        const known = (e.experience || 0) > 0 || (e.wage || 0) > 0;
+                        const bar = TRANSFER_MIN_PROJ_20PLUS - (known ? 0 : TRANSFER_PREFETCH_PROJ_MARGIN);
+                        const proj = e._dynastyCeiling ? e._dynastyCeiling.ceiling : 0;
+                        if (proj < bar) {
+                            e.eval.warnings.push(`Projects ${Math.round(proj)} at 25 — below the ${TRANSFER_MIN_PROJ_20PLUS} bar for 20+`);
+                            return false;
+                        }
                     }
                     if (isYouth) {
                         return e.eval.verdict !== 'poor' && e.eval.verdict !== 'weak';
@@ -10174,7 +10197,7 @@ const progMap = { batting: 'batting', bowling: 'bowling', keeping: 'keeperbattin
     function buildYouthSellRanking(youth, allPlayers) {
         if (!youth || youth.length === 0) return '<div class="vj-text-xs vj-text-muted" style="margin-top:4px;">No youth in cached squad \u2014 the youth squad is on a separate page.</div>';
         const dynastyAcademyInfo = loadAcademyCache();
-        const dynastySquadContext = { size: (allPlayers || []).length, academyInfo: dynastyAcademyInfo, financeInfo: loadFinanceCache() };
+        const dynastySquadContext = { ...squadCounts(allPlayers), academyInfo: dynastyAcademyInfo, financeInfo: loadFinanceCache() };
 
         const projOpts = { academyInfo: dynastyAcademyInfo, squadContext: dynastySquadContext };
         // The best 11 youths (role-aware current value) ARE the youth XI —
@@ -10221,7 +10244,9 @@ const progMap = { batting: 'batting', bowling: 'bowling', keeping: 'keeperbattin
                 if (ceiling < peerFloor) { s += 12; reasons.push(`Projects to ${Math.round(ceiling)} at 25, below your weakest senior ${getPrimarySkillInfo(p).name === 'keeping' ? 'keeper' : getPrimarySkillInfo(p).name === 'bowling' ? 'bowler' : 'batter'} at the same age (${Math.round(peerFloor)})`); }
             }
             return { player: p, s, reasons };
-        }).filter(r => r.s > 0).sort((a, b) => b.s - a.s);
+        // Youth-XI regulars earn prize money now — they go after every
+        // non-XI prospect regardless of score.
+        }).filter(r => r.s > 0).sort((a, b) => (youthXiCore.has(a.player.id) - youthXiCore.has(b.player.id)) || b.s - a.s);
 
         if (scored.length === 0) return '<div class="vj-text-xs vj-text-muted" style="margin-top:4px;">All youth on track or ahead of the curve \u2014 no urgent sells.</div>';
         // Manual: dropping below 12 youths auto-drafts poor local recruits,
@@ -10890,6 +10915,8 @@ const progMap = { batting: 'batting', bowling: 'bowling', keeping: 'keeperbattin
     // buy, 16yo included, is ultimately a first-team bet (user's aim).
     // TRANSFER_XI_SLOTS = how deep in a role a player still makes a typical XI.
     const TRANSFER_XI_SLOTS = { batting: 5, bowling: 5, keeping: 1 };
+    const TRANSFER_MIN_PROJ_20PLUS = 55; // user's buying bar for 20+ (to-25 projection)
+    const TRANSFER_PREFETCH_PROJ_MARGIN = 4; // exp/talents not yet fetched
     function squadRankLines(candidate, squadPlayers, projOpts) {
         const role = getPrimarySkillInfo(candidate).name;
         const youth = isYouthAge(candidate.age);
@@ -10977,7 +11004,7 @@ const progMap = { batting: 'batting', bowling: 'bowling', keeping: 'keeperbattin
         // different age.
         const academyInfo = loadAcademyCache();
         const academySpeed = getAcademySpeedForPlayer(player, academyInfo);
-        const squadContext = { size: squadPlayers.length, academyInfo, financeInfo: loadFinanceCache() };
+        const squadContext = { ...squadCounts(squadPlayers), academyInfo, financeInfo: loadFinanceCache() };
         const ceilingResult = computePlayerCeiling(player, academySpeed, squadContext);
         const dynastyCeiling = computePlayerCeiling(player, academySpeed, squadContext, 25);
         // Overall Rating — the price-independent quality number, shown the
