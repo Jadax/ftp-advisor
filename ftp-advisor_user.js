@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         FTP Advisor
 // @namespace    http://tampermonkey.net/
-// @version      8.102
+// @version      8.103
 // @description  Tactical/scouting advisor for fromthepavilion.org (cricket sim): team, tactics, pitch, training, transfer market, youth and squad plan advice with projections. Full changelog: github.com/Jadax/ftp-advisor
 // @author       Tushant Sharma
 // @license      MIT
@@ -2365,7 +2365,7 @@
         const primaryName = getPrimarySkillInfo(player).name;
         if (primaryName === 'batting' || primaryName === 'keeping') {
             const total = squadStats.leftHandBatCount + squadStats.rightHandBatCount;
-            if (total >= 4) {
+            if (total >= 4 && player.isLeftHanded != null) {
                 const isLeft = player.isLeftHanded;
                 const sameHandCount = isLeft ? squadStats.leftHandBatCount : squadStats.rightHandBatCount;
                 const otherHandCount = isLeft ? squadStats.rightHandBatCount : squadStats.leftHandBatCount;
@@ -3479,7 +3479,7 @@
             bowlerType: bowlerType,
             bowlerCategory: BOWLER_CATEGORY[bowlerType] || 'none',
             bowlerPace: BOWLER_PACE[bowlerType] || 0,
-            isLeftHanded: false,
+            isLeftHanded: null, // not in the transfer table — unknown, not right-handed
             batting: parseSkill(getCell('batting')),
             bowling: parseSkill(getCell('bowling')),
             keeping: parseSkill(getCell('keeping')),
@@ -5455,6 +5455,11 @@ const MAX_OVERS_PER_BOWLER = { OD: 10, YOD: 8, T20: 4, YT20: 4 };
                 // list order only affects which spell gets the lower over numbers
                 // on its own side, never which side.
                 const buildAndVerify = (gAfter, sAfter) => {
+                    // Tactics key off phase, and these pieces inherit the
+                    // phase of the spell they were split from ("New ball" on
+                    // a spell now bowling the death) — relabel by position.
+                    [gBefore, sBefore].forEach(list => list.forEach((sp, i) => { sp.phase = i === 0 ? 'New ball' : 'Middle overs'; }));
+                    [gAfter, sAfter].forEach(list => list.forEach((sp, i) => { sp.phase = i === list.length - 1 ? 'Death overs' : 'Middle overs'; }));
                     const rebuilt = [];
                     for (let i = 0; i < Math.max(gBefore.length, sBefore.length); i++) {
                         if (i < gBefore.length) rebuilt.push(gBefore[i]);
@@ -5523,8 +5528,23 @@ const MAX_OVERS_PER_BOWLER = { OD: 10, YOD: 8, T20: 4, YT20: 4 };
                     }
                     return out;
                 };
-                const gPerms = gAfterBase.length <= 5 ? permutations(gAfterBase) : [gAfterBase];
-                const sPerms = sAfterBase.length <= 5 ? permutations(sAfterBase) : [sAfterBase];
+                // Preferred after-break order (tried first): weakest → strongest,
+                // so the best bowler on each end bowls the death overs. Copying
+                // the before-break order handed the death to the 5th/6th-best
+                // bowlers — a real Youth OD (Surge) had both best bowlers done
+                // by over 28 and a Dreadful-technique bowler go for 21 in the
+                // 39th. The end's last before-break bowler never opens the
+                // after side (that would merge into one spell across drinks).
+                const deathLast = (afterList, beforeList) => {
+                    const out = [...afterList].sort((a, b) => (a.player.bowlScore || 0) - (b.player.bowlScore || 0));
+                    const lastBefore = beforeList.length ? beforeList[beforeList.length - 1].player.id : null;
+                    if (out.length > 1 && out[0].player.id === lastBefore) [out[0], out[1]] = [out[1], out[0]];
+                    return out;
+                };
+                const gAfterPref = deathLast(gAfterBase, gBefore);
+                const sAfterPref = deathLast(sAfterBase, sBefore);
+                const gPerms = gAfterPref.length <= 5 ? permutations(gAfterPref) : [gAfterPref];
+                const sPerms = sAfterPref.length <= 5 ? permutations(sAfterPref) : [sAfterPref];
 
                 let found = null;
                 outer:
@@ -9678,6 +9698,15 @@ const progMap = { batting: 'batting', bowling: 'bowling', keeping: 'keeperbattin
                     if (e.eval.verdict === 'poor' || e.eval.verdict === 'weak') return false;
                     const cmp = e.peerCompare;
                     if (!cmp || cmp.isGap || cmp.wouldReplace.length > 0) return true;
+                    // Pre-fetch rows carry experience 0 and no talents, both of
+                    // which the projection counts, against squad peers that
+                    // have them — every senior lost the compare and, since
+                    // Fetch only fetches shown cards, could never be fetched.
+                    // Same "known" gating as the hard filters: pass pending.
+                    if (!((e.experience || 0) > 0 || (e.wage || 0) > 0)) {
+                        e.eval.warnings.push('Upgrade check pending — fetch experience & talents to confirm he projects above a current ' + cmp.groupLabel.replace(/s$/, ''));
+                        return true;
+                    }
                     e.eval.warnings.push(`Projects (skill-sum ${cmp.candidateProj} at 25) no higher than any current ${cmp.groupLabel} — not an upgrade`);
                     return false;
                 }
