@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         FTP Advisor
 // @namespace    http://tampermonkey.net/
-// @version      8.103
+// @version      8.104
 // @description  Tactical/scouting advisor for fromthepavilion.org (cricket sim): team, tactics, pitch, training, transfer market, youth and squad plan advice with projections. Full changelog: github.com/Jadax/ftp-advisor
 // @author       Tushant Sharma
 // @license      MIT
@@ -9830,7 +9830,7 @@ const progMap = { batting: 'batting', bowling: 'bowling', keeping: 'keeperbattin
                         // computed WITHOUT talents on this first pass.
                         // Verdicts, and which players even show up here,
                         // can genuinely change once fetched.
-                        html += `<div class="vj-text-xs vj-text-muted vj-mb-8">\u2139\uFE0F Talents aren't visible on the search table itself \u2014 click above to fetch them per player. Verdicts (and who qualifies as ELITE) may change once talents are known.</div>`;
+                        html += `<div class="vj-text-xs vj-text-muted vj-mb-8">\u2139\uFE0F Click Fetch for experience &amp; talents \u2014 rankings update after.</div>`;
                     }
 
                     if (players.length === 0) {
@@ -9926,6 +9926,18 @@ const progMap = { batting: 'batting', bowling: 'bowling', keeping: 'keeperbattin
                                         <span class="ftp-stat-badge ${ratingLabelClass}">${ratingLabel.toUpperCase()}</span>
                                     </div>
                                 </div>
+                                ${(() => {
+                                    const r = squadRankLines(p, allPlayers, projOpts);
+                                    const role = r.role === 'keeping' ? 'keeper' : r.role === 'bowling' ? 'bowler' : 'batter';
+                                    const col = (rank) => rank <= TRANSFER_XI_SLOTS[r.role] ? 'var(--vj-green)' : 'var(--vj-text-muted)';
+                                    const xi = (rank) => rank <= TRANSFER_XI_SLOTS[r.role] ? ' \u2014 would start' : '';
+                                    const pending = !detailsFetched && !((p.experience || 0) > 0) ? ' <span class="vj-text-muted">(exp/talents not fetched)</span>' : '';
+                                    return `<div class="vj-text-xs vj-text-muted" style="margin-top:2px;">${p.bowlerType && r.role === 'bowling' ? p.bowlerType.toUpperCase() + ' ' : ''}${role} \u00B7 ${primaryName} ${skillLabel(primarySkill)} \u00B7 Tech ${skillLabel(p.technique)}${p.price ? ` \u00B7 $${p.price.toLocaleString()}` : ''}</div>
+                                        <div class="vj-text-xs" style="margin-top:2px;color:${col(r.nowRank)};"><b>Now:</b> #${r.nowRank} of ${r.nowOf} ${r.nowGroup} ${role}s${xi(r.nowRank)}${pending}</div>
+                                        <div class="vj-text-xs" style="margin-top:1px;color:${col(r.at25Rank)};"><b>At 25:</b> #${r.at25Rank} of ${r.at25Of} senior ${role}s${xi(r.at25Rank)} <span class="vj-text-muted">(proj ${r.proj})</span></div>`;
+                                })()}
+                                ${fairPriceLine(p)}
+                                <details style="margin-top:2px;"><summary class="vj-text-xs vj-text-muted" style="cursor:pointer;">Details</summary>
                                 <div class="vj-text-xs vj-text-muted" style="line-height:1.4;margin-top:2px;">
                                     ${detailParts.join(' \u00B7 ')}
                                 </div>
@@ -9946,7 +9958,7 @@ const progMap = { batting: 'batting', bowling: 'bowling', keeping: 'keeperbattin
                                     return '';
                                 })()}
                                 ${compareHtml}
-                                ${fairPriceLine(p)}
+                                </details>
                             </div>`;
                         });
                     }
@@ -10870,6 +10882,30 @@ const progMap = { batting: 'batting', bowling: 'bowling', keeping: 'keeperbattin
             .sort((a, b) => a.proj - b.proj);
         const wouldReplace = ranked.filter(r => candidateProj > r.proj);
         return { candidateProj, groupName, groupLabel, roleLabel, wouldReplace, allPeers: ranked, isGap, role: candidateRole };
+    }
+
+    // Transfer card's two numbers. "Now" ranks him in his role within the
+    // group he can play for today (youth or senior); "At 25" ranks his to-25
+    // projection against your SENIOR players' to-25 projections — every
+    // buy, 16yo included, is ultimately a first-team bet (user's aim).
+    // TRANSFER_XI_SLOTS = how deep in a role a player still makes a typical XI.
+    const TRANSFER_XI_SLOTS = { batting: 5, bowling: 5, keeping: 1 };
+    function squadRankLines(candidate, squadPlayers, projOpts) {
+        const role = getPrimarySkillInfo(candidate).name;
+        const youth = isYouthAge(candidate.age);
+        const others = squadPlayers.filter(p => p.name !== candidate.name && getPrimarySkillInfo(p).name === role);
+        const nowPeers = others.filter(p => isYouthAge(p.age) === youth);
+        const seniors = others.filter(p => !isYouthAge(p.age));
+        const cand = projectionAt25(candidate, projOpts);
+        return {
+            role,
+            nowRank: 1 + nowPeers.filter(p => projectionAt25(p, projOpts).current > cand.current).length,
+            nowOf: nowPeers.length + 1,
+            nowGroup: youth ? 'youth' : 'senior',
+            at25Rank: 1 + seniors.filter(p => projectedSkillAt25(p, projOpts) > cand.ceiling).length,
+            at25Of: seniors.length + 1,
+            proj: Math.round(cand.ceiling)
+        };
     }
 
     // Short training-program codes matching the workbook's own
