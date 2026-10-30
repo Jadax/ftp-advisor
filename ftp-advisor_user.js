@@ -666,6 +666,18 @@
         };
     }
 
+    // Best-buy order for the transfer list: the ★ Overall Rating (quality,
+    // incl. the age-25 projection) nudged by price vs fair price. Capped
+    // small (+3 / -5) because the listed price is the CURRENT bid and can
+    // still rise; unknown fair price = no nudge.
+    function bestBuyScore(player) {
+        const base = (player._overallRating && player._overallRating.score) || 0;
+        const fp = computeFairPrice(player);
+        const asking = player.price || 0;
+        if (!fp || !fp.fair || asking <= 0) return base;
+        return base + Math.max(-5, Math.min(3, (1 - asking / fp.fair) * 10));
+    }
+
     function fairPriceLine(player) {
         const fp = computeFairPrice(player);
         if (!fp) return '';
@@ -10476,10 +10488,10 @@ const progMap = { batting: 'batting', bowling: 'bowling', keeping: 'keeperbattin
                 // here" with the fair-price line on each card separating a
                 // great deal from a great-but-overpriced player.
                 const verdictOrder = { elite: 0, strong: 1, adequate: 2 };
-                priorityBuys.sort((a, b) =>
-                    (b._overallRating && b._overallRating.score || 0) - (a._overallRating && a._overallRating.score || 0) ||
+                const bestBuyOrder = (a, b) => bestBuyScore(b) - bestBuyScore(a) ||
                     (verdictOrder[a.eval.verdict] ?? 9) - (verdictOrder[b.eval.verdict] ?? 9) ||
-                    (a.price || 0) - (b.price || 0));
+                    (a.price || 0) - (b.price || 0);
+                priorityBuys.sort(bestBuyOrder);
                 function renderTransferResults(players, totalScanned, ageFilteredCount, verdictFilteredCount, detailsFetched) {
                     // peerCompare was already computed per-candidate up in
                     // the `evaluated` map (it now gates which seniors even
@@ -10604,7 +10616,7 @@ const progMap = { batting: 'batting', bowling: 'bowling', keeping: 'keeperbattin
 
                             html += `<div class="ftp-rec low" style="padding:6px 8px;margin:3px 0;">
                                 <div class="vj-flex-between">
-                                    <span class="vj-fw-700" style="font-size:12px;">#${i+1} ${p.name} <span class="vj-text-xs vj-text-muted">(${formatAgeDisplay(p.age)})</span></span>
+                                    <span class="vj-fw-700" style="font-size:12px;">#${i+1} <a href="https://www.fromthepavilion.org/player.htm?playerId=${encodeURIComponent(p.id || '')}" target="_blank" rel="noopener" style="color:inherit;text-decoration:underline;text-underline-offset:2px;">${p.name}</a> <span class="vj-text-xs vj-text-muted">(${formatAgeDisplay(p.age)})</span></span>
                                     <div style="display:flex;gap:4px;align-items:center;">
                                         ${overallRatingBadge(overallRating)}
                                         <span class="ftp-stat-badge ${ratingLabelClass}">${ratingLabel.toUpperCase()}</span>
@@ -10672,10 +10684,7 @@ const progMap = { batting: 'batting', bowling: 'bowling', keeping: 'keeperbattin
                             p.eval = ev;
                             p.peerCompare = comparePlayerToSquadPeers(p, allPlayers, projOpts);
                         });
-                        priorityBuys.sort((a, b) =>
-                            (b._overallRating && b._overallRating.score || 0) - (a._overallRating && a._overallRating.score || 0) ||
-                            (verdictOrder[a.eval.verdict] ?? 9) - (verdictOrder[b.eval.verdict] ?? 9) ||
-                            (a.price || 0) - (b.price || 0));
+                        priorityBuys.sort(bestBuyOrder);
                         logSquadGapDiagnostic(priorityBuys.filter(p => ageYears(p.age) >= 21));
                         // Re-filter with the exact same rule as the initial
                         // pass (elite + genuine squad upgrade for seniors).
