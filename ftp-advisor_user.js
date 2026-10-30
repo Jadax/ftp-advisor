@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         FTP Advisor
 // @namespace    http://tampermonkey.net/
-// @version      8.106
+// @version      8.107
 // @description  Tactical/scouting advisor for fromthepavilion.org (cricket sim): team, tactics, pitch, training, transfer market, youth and squad plan advice with projections. Full changelog: github.com/Jadax/ftp-advisor
 // @author       Tushant Sharma
 // @license      MIT
@@ -1736,13 +1736,20 @@
             score += 15; // unknown — don't penalize too hard
         }
 
-        // Context info (0-20 pts)
-        if (opts.hasAcademyInfo) { score += 10; } else { reasons.push('Academy level unknown'); }
-        if (opts.hasFinanceInfo) { score += 5; } else { reasons.push('Finances not cached'); }
-        if (opts.hasOpponentData) { score += 5; } else { reasons.push('No opponent data — tactical recs are generic'); }
-
-        // Match type awareness (0-10 pts)
-        if (opts.matchTypeKnown) { score += 10; } else { reasons.push('Match format unknown — using defaults'); }
+        // Context info (0-20 pts) + match type (0-10). null = not relevant on
+        // this page: dropped from the max instead of counted as missing (the
+        // transfer badge used to report "no opponent data" / "match format
+        // unknown", which say nothing about transfer projections).
+        let max = 100;
+        const factor = (v, pts, missing) => {
+            if (v == null) { max -= pts; return; }
+            if (v) score += pts; else reasons.push(missing);
+        };
+        factor(opts.hasAcademyInfo, 10, 'Academy level unknown — visit the Academy page');
+        factor(opts.hasFinanceInfo, 5, 'Finances not cached — visit the Finances page');
+        factor(opts.hasOpponentData, 5, 'No opponent data — tactical recs are generic');
+        factor(opts.matchTypeKnown, 10, 'Match format unknown — using defaults');
+        score = Math.round(score * 100 / max);
 
         let level, label;
         if (score >= 70) { level = 'high'; label = 'High confidence'; }
@@ -3613,19 +3620,24 @@
     }
 
     // Fetch details for all priority buy players with rate limiting
+    // Promise per player id: updateTransferAdvisor renders twice per visit
+    // (stale cache, then refreshed squad) and both passes auto-fetch.
+    const _transferDetailCache = new Map();
     async function fetchTransferPlayerDetails(players, onUpdate) {
         const DELAY_MS = 300;
         for (let i = 0; i < players.length; i++) {
             const p = players[i];
             if (!p.id) continue;
-            const details = await fetchPlayerPageDetails(p.id);
+            const cached = _transferDetailCache.has(p.id);
+            if (!cached) _transferDetailCache.set(p.id, fetchPlayerPageDetails(p.id));
+            const details = await _transferDetailCache.get(p.id);
             if (details.experience !== null) p.experience = details.experience;
             if (details.wage !== null) p.wage = details.wage;
             if (details.wageDiscount != null) p.wageDiscount = details.wageDiscount;
             if (details.talents.length > 0) p.talents = details.talents;
             if (details.captaincy !== null) p.captaincy = details.captaincy;
             if (onUpdate) onUpdate(i, players.length);
-            if (i < players.length - 1) await new Promise(r => setTimeout(r, DELAY_MS));
+            if (!cached && i < players.length - 1) await new Promise(r => setTimeout(r, DELAY_MS));
         }
     }
 
@@ -5697,8 +5709,8 @@ const MAX_OVERS_PER_BOWLER = { OD: 10, YOD: 8, T20: 4, YT20: 4 };
                 cacheAgeHours: cache ? cache.ageHours : null,
                 playersWithSkills: cache ? cache.players.filter(p => (p.batting || 0) > 0).length : 0,
                 totalPlayers: availablePlayers.length,
-                hasAcademyInfo: false,
-                hasFinanceInfo: false,
+                hasAcademyInfo: null,
+                hasFinanceInfo: null,
                 hasOpponentData: !!opponentCache && opponentCache.players.length > 0,
                 matchTypeKnown: context.matchTypeKnown === true,
             });
@@ -8657,8 +8669,8 @@ const progMap = { batting: 'batting', bowling: 'bowling', keeping: 'keeperbattin
             totalPlayers: players.length,
             hasAcademyInfo: !!academyInfo,
             hasFinanceInfo: !!financeInfo,
-            hasOpponentData: false,
-            matchTypeKnown: false,
+            hasOpponentData: null,
+            matchTypeKnown: null,
         });
 
         let statsHtml = `
@@ -9615,10 +9627,10 @@ const progMap = { batting: 'batting', bowling: 'bowling', keeping: 'keeperbattin
                 cacheAgeHours: cache ? cache.ageHours : null,
                 playersWithSkills: allPlayers.filter(p => (p.batting || 0) > 0).length,
                 totalPlayers: allPlayers.length,
-                hasAcademyInfo: false,
+                hasAcademyInfo: !!loadAcademyCache(),
                 hasFinanceInfo: !!financeInfo,
-                hasOpponentData: false,
-                matchTypeKnown: false,
+                hasOpponentData: null,
+                matchTypeKnown: null,
             });
 
             // Role balance: ideal squad has ~4 batters, ~4 bowlers, ~2 all-rounders, 1 keeper
@@ -9716,13 +9728,13 @@ const progMap = { batting: 'batting', bowling: 'bowling', keeping: 'keeperbattin
                     }
                     // User's bar, every age (youth projections are curve-calibrated,
                     // see YOUTH_PROJECTION_CALIBRATION): must project to 60+ at 25.
-                    // Before Fetch the projection lacks experience/talents (worth
-                    // up to ~4), so the bar is lowered by that margin until known.
+                    // Applied only once experience/talents are fetched: before that
+                    // the projection runs 5+ low (Geyer 55 -> 60) and a pre-fetch
+                    // margin hid real targets — which then never got fetched.
                     {
                         const known = (e.experience || 0) > 0 || (e.wage || 0) > 0;
-                        const bar = TRANSFER_MIN_PROJ_AT25 - (known ? 0 : TRANSFER_PREFETCH_PROJ_MARGIN);
                         const proj = e._dynastyCeiling ? e._dynastyCeiling.ceiling : 0;
-                        if (proj < bar) {
+                        if (known && proj < TRANSFER_MIN_PROJ_AT25) {
                             e.eval.warnings.push(`Projects ${Math.round(proj)} at 25 — below the ${TRANSFER_MIN_PROJ_AT25} bar`);
                             return false;
                         }
@@ -9870,7 +9882,7 @@ const progMap = { batting: 'batting', bowling: 'bowling', keeping: 'keeperbattin
                         // computed WITHOUT talents on this first pass.
                         // Verdicts, and which players even show up here,
                         // can genuinely change once fetched.
-                        html += `<div class="vj-text-xs vj-text-muted vj-mb-8">\u2139\uFE0F Click Fetch for experience &amp; talents \u2014 rankings update after.</div>`;
+                        html += `<div class="vj-text-xs vj-text-muted vj-mb-8">\u2139\uFE0F Fetching experience &amp; talents automatically \u2014 the 60-at-25 bar applies once they're in.</div>`;
                     }
 
                     if (players.length === 0) {
@@ -10010,7 +10022,8 @@ const progMap = { batting: 'batting', bowling: 'bowling', keeping: 'keeperbattin
                 // Wire up fetch details button
                 const fetchBtn = document.getElementById('ftp-fetch-details-btn');
                 if (fetchBtn) {
-                    fetchBtn.addEventListener('click', async () => {
+                    const runFetch = async () => {
+                        if (fetchBtn.disabled) return;
                         fetchBtn.disabled = true;
                         fetchBtn.textContent = '\u21BB Fetching...';
                         await fetchTransferPlayerDetails(priorityBuys, (idx, total) => {
@@ -10038,7 +10051,13 @@ const progMap = { batting: 'batting', bowling: 'bowling', keeping: 'keeperbattin
                         const reAgeFiltered = priorityBuys.filter(p => { const age = ageYears(p.age); return age >= 21 && age > SENIOR_MAX_AGE; }).length;
                         const reVerdictFiltered = priorityBuys.length - reAgeFiltered - reFiltered.length;
                         resultsEl.innerHTML = renderTransferResults(reFiltered, evaluated.length, reAgeFiltered, reVerdictFiltered, true);
-                    });
+                    };
+                    fetchBtn.addEventListener('click', runFetch);
+                    // Automatic: the 60-at-25 bar only applies to fetched rows,
+                    // so without this every visit needed a manual click.
+                    // Requests go through _queuedRequest and are cached per
+                    // player, so the second render pass costs nothing extra.
+                    if (priorityBuys.length > 0) runFetch();
                 }
             } else {
                 resultsEl.innerHTML = '<div class="vj-text-sm vj-text-muted">No results found. Use the search form above to find players.</div>';
@@ -10933,7 +10952,6 @@ const progMap = { batting: 'batting', bowling: 'bowling', keeping: 'keeperbattin
     // TRANSFER_XI_SLOTS = how deep in a role a player still makes a typical XI.
     const TRANSFER_XI_SLOTS = { batting: 5, bowling: 5, keeping: 1 };
     const TRANSFER_MIN_PROJ_AT25 = 60; // user's buying bar, all ages (to-25 projection)
-    const TRANSFER_PREFETCH_PROJ_MARGIN = 4; // exp/talents not yet fetched
     function squadRankLines(candidate, squadPlayers, projOpts) {
         const role = getPrimarySkillInfo(candidate).name;
         const youth = isYouthAge(candidate.age);
