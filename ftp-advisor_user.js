@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         FTP Advisor
 // @namespace    http://tampermonkey.net/
-// @version      8.114
+// @version      8.115
 // @description  Tactical/scouting advisor for fromthepavilion.org (cricket sim): team, tactics, pitch, training, transfer market, youth and squad plan advice with projections. Full changelog: github.com/Jadax/ftp-advisor
 // @author       Tushant Sharma
 // @license      MIT
@@ -3788,7 +3788,7 @@ button{font:inherit;color:inherit;cursor:pointer}
 <div class="sec"><div class="h">Switches</div>
 ${sw('enabled', '<b>Autopilot</b> \u2014 runs in the background on any page', st.enabled)}
 ${sw('training', 'Submit training (every ' + PILOT_TRAINING_EVERY_H + ' h)', st.training)}
-${sw('ordersOn', 'Submit orders for matches in the next ' + AUTOPILOT_ORDERS_WINDOW_HOURS + ' h', st.ordersOn !== false)}</div>
+${sw('ordersOn', 'Submit match orders (within ' + AUTOPILOT_ORDERS_WINDOW_HOURS + ' h of the start)', st.ordersOn !== false)}</div>
 <div class="sec"><div class="h">Prep</div>
 ${ck(cache && cache.ageHours < 6, `Squad data \u2014 ${cache ? esc(getCacheAgeText(cache.ageDays)) : 'not loaded'}`)}
 ${ck(st.trainingAt && Date.now() - st.trainingAt < PILOT_TRAINING_EVERY_H * 3600e3, `Training submitted \u2014 ${ago(st.trainingAt)}`)}
@@ -9740,7 +9740,11 @@ const progMap = { batting: 'batting', bowling: 'bowling', keeping: 'keeperbattin
     // submitted when a check fails (plan doesn't tile the overs, a field
     // didn't take, the page refused a spell count).
     // ============================================================
-    const AUTOPILOT_ORDERS_WINDOW_HOURS = 48; // next match + any other inside this window
+    // Orders are saved only once a match starts within this window (user):
+    // fatigue moves after every match and form/skills after each training
+    // update, so earlier orders go stale. Background passes keep re-planning
+    // inside the window and resubmit only when the plan changes.
+    const AUTOPILOT_ORDERS_WINDOW_HOURS = 24;
 
     function loadHiddenFrame(url) {
         return new Promise((resolve, reject) => {
@@ -9871,8 +9875,14 @@ const progMap = { batting: 'batting', bowling: 'bowling', keeping: 'keeperbattin
                 const upcoming = await fetchUpcomingFixtures();
                 if (!upcoming.length) say('No upcoming matches found.');
                 else {
-                    const horizon = upcoming[0].matchDate.getTime() + AUTOPILOT_ORDERS_WINDOW_HOURS * 3600 * 1000;
-                    for (const m of upcoming.filter((m, i) => i === 0 || m.matchDate.getTime() <= horizon)) {
+                    const horizon = Date.now() + AUTOPILOT_ORDERS_WINDOW_HOURS * 3600 * 1000;
+                    const due = upcoming.filter(m => m.matchDate.getTime() <= horizon);
+                    if (!due.length) {
+                        const h = Math.round((upcoming[0].matchDate.getTime() - Date.now()) / 3600e3);
+                        say(`\u23F3 Next match ${upcoming[0].teams} in ${h} h \u2014 orders are saved within ${AUTOPILOT_ORDERS_WINDOW_HOURS} h of the start${dryRun ? ' (previewing it now)' : ''}`);
+                    }
+                    // Preview still shows the next match early; real saves wait for the window.
+                    for (const m of due.length ? due : (dryRun ? [upcoming[0]] : [])) {
                         status(m.teams);
                         try { await autoSubmitOrders(m, say, dryRun, force); } catch (e) { say(`\u26A0 ${m.teams}: ${e.message}`); }
                     }
