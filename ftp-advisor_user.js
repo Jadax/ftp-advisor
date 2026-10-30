@@ -6,6 +6,7 @@
 // @author       Tushant Sharma
 // @license      MIT
 // @match        https://www.fromthepavilion.org/*
+// @noframes
 // @grant        GM_xmlhttpRequest
 // @grant        GM_setValue
 // @grant        GM_getValue
@@ -3975,7 +3976,7 @@
     function scrapeMatchOrderSettings() {
         const settings = { oversPerEnd: null, minSpellLength: null, maxSpellLength: null };
         try {
-            for (const s of document.querySelectorAll('script')) {
+            for (const s of pageDoc().querySelectorAll('script')) {
                 const t = s.textContent || '';
                 const oe = t.match(/\b_oversPerEnd\s*=\s*([\d.]+)/);
                 if (oe) { const v = parseFloat(oe[1]); if (v > 0) settings.oversPerEnd = v; }
@@ -3985,8 +3986,8 @@
                 if (mx) { const v = parseInt(mx[1], 10); if (v >= 1) settings.maxSpellLength = v; }
             }
             if (!(settings.oversPerEnd > 0)) {
-                const even = document.querySelector('#bowlingEndEven .oversEven');
-                const odd = document.querySelector('#bowlingEndOdd .oversOdd');
+                const even = pageDoc().querySelector('#bowlingEndEven .oversEven');
+                const odd = pageDoc().querySelector('#bowlingEndOdd .oversOdd');
                 const perEnd = Math.max(even ? even.children.length : 0, odd ? odd.children.length : 0);
                 if (perEnd > 0) settings.oversPerEnd = perEnd;
             }
@@ -4011,7 +4012,7 @@
         };
 
         // Find weather, pitch, league from the match details table
-        const allThs = document.querySelectorAll('th');
+        const allThs = pageDoc().querySelectorAll('th');
         let foundPitchRow = false, foundWeatherRow = false;
         allThs.forEach(th => {
             const thText = th.textContent.trim();
@@ -4162,7 +4163,7 @@
     }
 
     function getOpponentTeamId() {
-        return findOpponentTeamIdInDocument(document);
+        return findOpponentTeamIdInDocument(pageDoc());
     }
 
     // ============================================================
@@ -5723,10 +5724,16 @@ const MAX_OVERS_PER_BOWLER = { OD: 10, YOD: 8, T20: 4, YT20: 4 };
     // ============================================================
     // ORDERS PAGE SCRAPER + UI
     // ============================================================
+    // The orders/training parsers read pageDoc(): the live page normally,
+    // or a hidden same-origin frame's document while runAutoPilot submits
+    // a page the user isn't on.
+    let _pageDocOverride = null;
+    function pageDoc() { return _pageDocOverride || document; }
+
     function scrapeAvailablePlayers() {
         const players = [];
         const seen = new Set();
-        const selects = document.querySelectorAll('select.batsmen, select.bowler');
+        const selects = pageDoc().querySelectorAll('select.batsmen, select.bowler');
         selects.forEach(select => {
             if (select.id === 'captain' || select.id === 'keeper' || select.id === 'gameTeam.tossCallHeads' || select.id === 'gameTeam.tossBatFirst') return;
             Array.from(select.options).forEach(opt => {
@@ -5759,6 +5766,77 @@ const MAX_OVERS_PER_BOWLER = { OD: 10, YOD: 8, T20: 4, YT20: 4 };
             ],
             footer: advisorFooterText()
         });
+    }
+
+    // Everything the orders recommendation depends on, from the page the
+    // parsers currently read (pageDoc) + caches. Shared by the Match Orders
+    // panel and runAutoPilot so both always produce the same plan.
+    function computeOrdersPlan() {
+        const availablePlayers = scrapeAvailablePlayers();
+        if (availablePlayers.length === 0) return null;
+        const context = scrapeMatchContext();
+        const cache = loadPlayerCache();
+        const opponentTeamId = getOpponentTeamId();
+        const opponentCache = opponentTeamId ? loadOpponentCache(opponentTeamId) : null;
+        // Enrich players with cached data
+        let enrichedPlayers = availablePlayers.map(p => {
+            const cached = cache ? cache.players.find(cp => cp.id === p.id) : null;
+            return cached || {
+                id: p.id, name: p.name,
+                batting: 4, bowling: 4, technique: 4, power: 4, keeping: 3,
+                fielding: 4, endurance: 5, experience: 4, captaincy: 3,
+                fatigue: 8, form: 5,
+                bowlerType: '', bowlerCategory: 'none', bowlerPace: 0,
+                isLeftHanded: false, age: 25, isSenior: true, isYouth: false
+            };
+        });
+
+        // Age filtering for youth matches.
+        // Official manual: "Only players aged 20 and under are eligible to
+        // play in these matches" (rulespage=competitions) and "At the end
+        // of each week, all players turning 21 are moved from your youth
+        // squad and are promoted to your senior squad" (rulespage=
+        // youthacademy). The second rule is the important one here: a
+        // player still sitting in the youth squad has by definition NOT
+        // turned 21, so the game's own squad classification is proof of
+        // eligibility — and it's more trustworthy than our derived
+        // decimal age at the exact year boundary. (Originally a player
+        // displayed as "20.14" parsed to 20 + 14/14 = exactly 21.0, so
+        // the old `age < maxAge + 1` test dropped them as 21 even though
+        // the game still listed them as a 20-year-old youth player.
+        // Since v8.64 the parser is 1-based — 20.14 reads 20.93, so the
+        // pure age test agrees with the game and this flag is now a
+        // belt-and-suspenders guard rather than the only correct path.)
+        // Squad membership is only used to INCLUDE, never to exclude:
+        // a 20yo already promoted/held in the senior squad is still
+        // eligible on age, so those fall through to the age test.
+        // (Safe against a stale flag: the orders page force-refreshes
+        // squad data on every visit — see forceRefresh in init().)
+        let ageWarning = '';
+        if (context.isYouthOnly) {
+            const beforeCount = enrichedPlayers.length;
+            enrichedPlayers = enrichedPlayers.filter(p => {
+                if (p.isYouth === true) return true;
+                if (p.age !== undefined && p.age !== null) return Math.floor(p.age) <= context.maxAge;
+                return !p.isSenior;
+            });
+            if (enrichedPlayers.length < 11) {
+                ageWarning = `<div class="ftp-alert danger" style="margin:4px 0 0 0;">Only ${enrichedPlayers.length} eligible youth players (U${context.maxAge}). ${11 - enrichedPlayers.length} short of full squad — fill with youth recruits.</div>`;
+                // Keep only eligible youth — do NOT fall back to seniors
+            } else if (enrichedPlayers.length < beforeCount) {
+                ageWarning = `<div class="ftp-alert warning" style="margin:4px 0 0 0;">Youth match: ${enrichedPlayers.length} eligible players (max age ${context.maxAge})</div>`;
+            }
+        }
+
+        // Opponent analysis
+        const opponentAnalysis = opponentCache ? analyzeOpposition(opponentCache.players, enrichedPlayers, !!context.isYouthOnly) : null;
+
+        // Generate recommendations
+        const tossRec = recommendTossDecision(context, opponentAnalysis);
+        const lineup = recommendLineup(enrichedPlayers, context, opponentAnalysis);
+        const battingOrder = recommendBattingOrder(lineup, context, opponentAnalysis);
+        const bowling = allocateBowlingSpells(lineup, context, opponentAnalysis);
+        return { availablePlayers, context, cache, opponentTeamId, opponentCache, enrichedPlayers, ageWarning, opponentAnalysis, tossRec, lineup, battingOrder, bowling };
     }
 
     function updateOrdersAdvisor() {
@@ -5835,63 +5913,7 @@ const MAX_OVERS_PER_BOWLER = { OD: 10, YOD: 8, T20: 4, YT20: 4 };
             console.warn('[FTP Advisor] Could not render confidence badge:', e);
         }
 
-        // Enrich players with cached data
-        let enrichedPlayers = availablePlayers.map(p => {
-            const cached = cache ? cache.players.find(cp => cp.id === p.id) : null;
-            return cached || {
-                id: p.id, name: p.name,
-                batting: 4, bowling: 4, technique: 4, power: 4, keeping: 3,
-                fielding: 4, endurance: 5, experience: 4, captaincy: 3,
-                fatigue: 8, form: 5,
-                bowlerType: '', bowlerCategory: 'none', bowlerPace: 0,
-                isLeftHanded: false, age: 25, isSenior: true, isYouth: false
-            };
-        });
-
-        // Age filtering for youth matches.
-        // Official manual: "Only players aged 20 and under are eligible to
-        // play in these matches" (rulespage=competitions) and "At the end
-        // of each week, all players turning 21 are moved from your youth
-        // squad and are promoted to your senior squad" (rulespage=
-        // youthacademy). The second rule is the important one here: a
-        // player still sitting in the youth squad has by definition NOT
-        // turned 21, so the game's own squad classification is proof of
-        // eligibility — and it's more trustworthy than our derived
-        // decimal age at the exact year boundary. (Originally a player
-        // displayed as "20.14" parsed to 20 + 14/14 = exactly 21.0, so
-        // the old `age < maxAge + 1` test dropped them as 21 even though
-        // the game still listed them as a 20-year-old youth player.
-        // Since v8.64 the parser is 1-based — 20.14 reads 20.93, so the
-        // pure age test agrees with the game and this flag is now a
-        // belt-and-suspenders guard rather than the only correct path.)
-        // Squad membership is only used to INCLUDE, never to exclude:
-        // a 20yo already promoted/held in the senior squad is still
-        // eligible on age, so those fall through to the age test.
-        // (Safe against a stale flag: the orders page force-refreshes
-        // squad data on every visit — see forceRefresh in init().)
-        let ageWarning = '';
-        if (context.isYouthOnly) {
-            const beforeCount = enrichedPlayers.length;
-            enrichedPlayers = enrichedPlayers.filter(p => {
-                if (p.isYouth === true) return true;
-                if (p.age !== undefined && p.age !== null) return Math.floor(p.age) <= context.maxAge;
-                return !p.isSenior;
-            });
-            if (enrichedPlayers.length < 11) {
-                ageWarning = `<div class="ftp-alert danger" style="margin:4px 0 0 0;">Only ${enrichedPlayers.length} eligible youth players (U${context.maxAge}). ${11 - enrichedPlayers.length} short of full squad — fill with youth recruits.</div>`;
-                // Keep only eligible youth — do NOT fall back to seniors
-            } else if (enrichedPlayers.length < beforeCount) {
-                ageWarning = `<div class="ftp-alert warning" style="margin:4px 0 0 0;">Youth match: ${enrichedPlayers.length} eligible players (max age ${context.maxAge})</div>`;
-            }
-        }
-
-        // Opponent analysis
-        const opponentAnalysis = opponentCache ? analyzeOpposition(opponentCache.players, enrichedPlayers, !!context.isYouthOnly) : null;
-
-        // Generate recommendations
-        const tossRec = recommendTossDecision(context, opponentAnalysis);
-        const lineup = recommendLineup(enrichedPlayers, context, opponentAnalysis);
-        const battingOrder = recommendBattingOrder(lineup, context, opponentAnalysis);
+        const { enrichedPlayers, ageWarning, opponentAnalysis, tossRec, lineup, battingOrder, bowling } = computeOrdersPlan();
         // Only when it fires: a weary-or-worse player still made the XI
         // because nobody fresher was better even after the fatigue penalty.
         const tiredNames = context.isFriendly ? [] : battingOrder.filter(p => (p.fatigue ?? 10) <= FATIGUE_MAP.weary)
@@ -5899,7 +5921,6 @@ const MAX_OVERS_PER_BOWLER = { OD: 10, YOD: 8, T20: 4, YT20: 4 };
         const tiredWarning = tiredNames.length
             ? `<div class="ftp-alert warning" style="margin:4px 0 0 0;"><span>⚠</span><div>Playing while tired: ${tiredNames.join(', ')} — still the best option after the fatigue penalty; resting them before this match would help.</div></div>`
             : '';
-        const bowling = allocateBowlingSpells(lineup, context, opponentAnalysis);
 
         // Display toss
         const tossIcon = tossRec.decision === 'bat' ? '\u{1F3CF}' : '\u{1F3C3}';
@@ -5962,13 +5983,7 @@ const MAX_OVERS_PER_BOWLER = { OD: 10, YOD: 8, T20: 4, YT20: 4 };
         if (tossEl && coverageOk) {
             tossEl.insertAdjacentHTML('afterbegin', `<div class="vj-flex vj-gap-6 vj-mb-8" style="align-items:center;flex-wrap:wrap;"><button id="ftp-fill-orders" class="vj-btn vj-btn-sm" style="font-size:12px;padding:4px 10px;cursor:pointer;">\u2B07 Fill orders into the form</button><span id="ftp-fill-result" class="vj-text-xs vj-text-muted">Fills only \u2014 you review and press Save Orders.</span></div>`);
             document.getElementById('ftp-fill-orders').addEventListener('click', () => {
-                const res = fillOrdersForm({
-                    batting: battingOrder.map(p => ({ id: p.id, name: p.name, tactic: p.battingTactic })),
-                    captainId: (battingOrder.find(p => p.isCaptain) || {}).id,
-                    keeperId: (battingOrder.find(p => p.role === 'WK') || {}).id,
-                    batFirst: tossRec.decision === 'bat',
-                    spells: bowling.map(sp => ({ id: sp.player.id, name: sp.player.name, startOver: sp.startOver, overs: sp.overs, tactic: sp.tactic }))
-                });
+                const res = fillOrdersForm(ordersFormPlan({ battingOrder, tossRec, bowling }));
                 const out = document.getElementById('ftp-fill-result');
                 if (out) out.innerHTML = res.ok
                     ? '<span style="color:var(--vj-green);">\u2713 Filled and checked against the page \u2014 review, then press Save Orders.</span>'
@@ -5994,13 +6009,23 @@ const MAX_OVERS_PER_BOWLER = { OD: 10, YOD: 8, T20: 4, YT20: 4 };
     // _maxSpells per end); its submit handler renames every spell's fields,
     // so cloned slots are safe. Bowler changes only re-tally overs (no
     // duplicate-clearing), so one bowler in two spells is fine.
+    function ordersFormPlan({ battingOrder, tossRec, bowling }) {
+        return {
+            batting: battingOrder.map(p => ({ id: p.id, name: p.name, tactic: p.battingTactic })),
+            captainId: (battingOrder.find(p => p.isCaptain) || {}).id,
+            keeperId: (battingOrder.find(p => p.role === 'WK') || {}).id,
+            batFirst: tossRec.decision === 'bat',
+            spells: bowling.map(sp => ({ id: sp.player.id, name: sp.player.name, startOver: sp.startOver, overs: sp.overs, tactic: sp.tactic }))
+        };
+    }
+
     function fillOrdersForm(plan) {
         const problems = [];
         const setVal = (el, v) => {
             if (!el) return false;
             el.value = String(v);
             if (String(el.value) !== String(v)) return false;
-            el.dispatchEvent(new Event('change', { bubbles: true }));
+            el.dispatchEvent(new (el.ownerDocument.defaultView || window).Event('change', { bubbles: true }));
             return true;
         };
         const setTactic = (input, value, codes) => {
@@ -6015,15 +6040,15 @@ const MAX_OVERS_PER_BOWLER = { OD: 10, YOD: 8, T20: 4, YT20: 4 };
         const BOWL = { normal: 2, defensive: 3, aggressive: 1 };
 
         plan.batting.forEach((b, i) => {
-            if (!setVal(document.querySelector(`select[name="batting[${i}].player"]`), b.id)) problems.push(`batting #${i + 1}: ${b.name} not selectable`);
-            setTactic(document.querySelector(`input[name="batting[${i}].battingTactic"]`), b.tactic || BAT.normal, BAT);
+            if (!setVal(pageDoc().querySelector(`select[name="batting[${i}].player"]`), b.id)) problems.push(`batting #${i + 1}: ${b.name} not selectable`);
+            setTactic(pageDoc().querySelector(`input[name="batting[${i}].battingTactic"]`), b.tactic || BAT.normal, BAT);
         });
-        if (plan.captainId != null && !setVal(document.getElementById('captain'), plan.captainId)) problems.push('captain not selectable');
-        if (plan.keeperId != null && !setVal(document.getElementById('keeper'), plan.keeperId)) problems.push('keeper not selectable');
-        if (plan.batFirst != null) setVal(document.querySelector('select[name="gameTeam.tossBatFirst"]'), plan.batFirst ? 'true' : 'false');
+        if (plan.captainId != null && !setVal(pageDoc().getElementById('captain'), plan.captainId)) problems.push('captain not selectable');
+        if (plan.keeperId != null && !setVal(pageDoc().getElementById('keeper'), plan.keeperId)) problems.push('keeper not selectable');
+        if (plan.batFirst != null) setVal(pageDoc().querySelector('select[name="gameTeam.tossBatFirst"]'), plan.batFirst ? 'true' : 'false');
 
         [['#bowlingEndOdd', 1], ['#bowlingEndEven', 0]].forEach(([sel, parity]) => {
-            const end = document.querySelector(sel);
+            const end = pageDoc().querySelector(sel);
             if (!end) { problems.push(`${sel} not found`); return; }
             const want = plan.spells.filter(s => s.startOver % 2 === parity).sort((a, b) => a.startOver - b.startOver);
             const slots = () => end.querySelectorAll('.spell');
@@ -6054,7 +6079,7 @@ const MAX_OVERS_PER_BOWLER = { OD: 10, YOD: 8, T20: 4, YT20: 4 };
         // Read back what the page now holds — the page renumbers start
         // overs itself, so this proves the plan landed on the right overs.
         const landed = [];
-        document.querySelectorAll('#bowlingEndOdd .spell, #bowlingEndEven .spell').forEach(s => {
+        pageDoc().querySelectorAll('#bowlingEndOdd .spell, #bowlingEndEven .spell').forEach(s => {
             const id = s.querySelector('.bowler') && s.querySelector('.bowler').value;
             if (id) landed.push({ id, startOver: parseInt(s.querySelector('.startOver').value, 10), overs: parseInt(s.querySelector('.spellLength').value, 10) });
         });
@@ -6070,7 +6095,7 @@ const MAX_OVERS_PER_BOWLER = { OD: 10, YOD: 8, T20: 4, YT20: 4 };
     // even) predate reading the page; the orders page names its ends per
     // ground ("Northern End"), so show those to make transcription obvious.
     function orderPageEndName(endKey) {
-        const el = document.querySelector(endKey === 'Gibson' ? '#bowlingEndOdd' : '#bowlingEndEven');
+        const el = pageDoc().querySelector(endKey === 'Gibson' ? '#bowlingEndOdd' : '#bowlingEndEven');
         const label = el && el.querySelector('h3,h4,.endname,th,b');
         const text = label ? label.textContent.trim().replace(/\s*end$/i, '') : '';
         return text || (endKey === 'Gibson' ? 'Odd-over' : 'Even-over');
@@ -7152,7 +7177,7 @@ const MAX_OVERS_PER_BOWLER = { OD: 10, YOD: 8, T20: 4, YT20: 4 };
 
     // Opponent name uses the same parsed fixture teams as opponent ID.
     function getOpponentTeamName() {
-        const teams = parseFixtureTeams(document);
+        const teams = parseFixtureTeams(pageDoc());
         if (teams.home && teams.home.id !== String(TEAM_ID)) return teams.home.name;
         if (teams.away && teams.away.id !== String(TEAM_ID)) return teams.away.name;
         return null;
@@ -8084,7 +8109,7 @@ table.ftp-table {
     // ============================================================
     function scrapeTrainingPage() {
         const players = [];
-        const rows = document.querySelectorAll('table tbody tr');
+        const rows = pageDoc().querySelectorAll('table tbody tr');
         console.log('[FTP Training] Found rows:', rows.length);
 
         // Training page has NO skill columns — must get skills from squad cache
@@ -9534,7 +9559,7 @@ const progMap = { batting: 'batting', bowling: 'bowling', keeping: 'keeperbattin
         }
     }
 
-    function applyTrainingRecommendations(recs) {
+    function applyTrainingRecommendations(recs, opts) {
         let applied = 0;
         recs.forEach(rec => {
             const p = rec.player;
@@ -9562,7 +9587,122 @@ const progMap = { batting: 'batting', bowling: 'bowling', keeping: 'keeperbattin
                 }
             }
         });
-        alert(`Applied ${applied} training recommendations. Click "Save Training" on the page to confirm changes.`);
+        if (!(opts && opts.silent)) alert(`Applied ${applied} training recommendations. Click "Save Training" on the page to confirm changes.`);
+        return applied;
+    }
+
+    // ============================================================
+    // AUTO-PILOT — one click on the club page: refresh everything, scout
+    // the next opponent, then SUBMIT training (seniors + youths) and the
+    // next match's orders. Each submission runs in a hidden same-origin
+    // frame of the game's own page and presses the page's own Save button,
+    // so the game's scripts (spell renumbering, field renaming on submit,
+    // double-submit guard) behave exactly as for a manual save. Nothing is
+    // submitted when a check fails (plan doesn't tile the overs, a field
+    // didn't take, the page refused a spell count).
+    // ============================================================
+    const AUTOPILOT_ORDERS_WINDOW_HOURS = 48; // next match + any other inside this window
+
+    function loadHiddenFrame(url) {
+        return new Promise((resolve, reject) => {
+            const f = document.createElement('iframe');
+            f.style.cssText = 'position:fixed;left:-10000px;top:0;width:900px;height:700px;opacity:0;pointer-events:none;';
+            const timer = setTimeout(() => { f.remove(); reject(new Error(`timed out loading ${url}`)); }, 30000);
+            f.addEventListener('load', () => { clearTimeout(timer); resolve(f); }, { once: true });
+            f.src = url;
+            document.body.appendChild(f);
+        });
+    }
+    function pressSaveInFrame(frame, button) {
+        return new Promise((resolve, reject) => {
+            const timer = setTimeout(() => reject(new Error('timed out waiting for the save response')), 30000);
+            frame.addEventListener('load', () => { clearTimeout(timer); resolve(frame.contentDocument); }, { once: true });
+            button.click();
+        });
+    }
+
+    async function autoSubmitTraining(log, dryRun) {
+        const frame = await loadHiddenFrame(`https://www.fromthepavilion.org/training.htm?teamId=${TEAM_ID}`);
+        try {
+            _pageDocOverride = frame.contentDocument;
+            const players = scrapeTrainingPage();
+            if (!players.length) throw new Error('no players on the training page');
+            const cache = loadPlayerCache();
+            const squadContext = { ...squadCounts(cache && cache.players.length ? cache.players : players), hasUpcomingMatch: false, academyInfo: loadAcademyCache(), financeInfo: loadFinanceCache() };
+            const recs = players.map(player => Object.assign(recommendTraining(player, squadContext, { skipProjection: true }), { player }));
+            const wanted = new Map(recs.map(r => [String(r.player.id), TRAINING_PROGRAM_IDS[r.program]]));
+            const changes = recs.filter(r => TRAINING_LABEL_TO_KEY[(r.player.currentTraining || '').toLowerCase()] !== r.program);
+            applyTrainingRecommendations(recs, { silent: true });
+            const save = frame.contentDocument.querySelector('form[action*="training.htm"] input[type=submit]');
+            if (!save) throw new Error('training Save button not found');
+            if (dryRun) {
+                log(`\u{1F441} Training (preview, not saved): ${changes.length} change(s)${changes.length ? ': ' + changes.map(r => `${r.player.name} \u2192 ${TRAINING_PROGRAM_LABELS[r.program]}`).join(', ') : ''}`);
+                return;
+            }
+            const after = await pressSaveInFrame(frame, save);
+            _pageDocOverride = after;
+            const mismatched = scrapeTrainingPage().filter(p => wanted.has(String(p.id)) && p.selectElement && p.selectElement.value !== wanted.get(String(p.id)));
+            if (mismatched.length) throw new Error(`saved, but ${mismatched.length} player(s) don't show the new program: ${mismatched.map(p => p.name).join(', ')}`);
+            log(`\u2705 Training saved for ${players.length} players (${changes.length} changed${changes.length ? ': ' + changes.map(r => `${r.player.name} \u2192 ${TRAINING_PROGRAM_LABELS[r.program]}`).join(', ') : ''})`);
+        } finally {
+            _pageDocOverride = null;
+            frame.remove();
+        }
+    }
+
+    async function autoSubmitOrders(match, log, dryRun) {
+        const gameId = (match.gameLink.match(/gameId=(\d+)/) || [])[1];
+        if (!gameId) throw new Error(`no game id for ${match.teams}`);
+        const frame = await loadHiddenFrame(`https://www.fromthepavilion.org/orders.htm?gameId=${gameId}`);
+        try {
+            _pageDocOverride = frame.contentDocument;
+            if (!scrapeAvailablePlayers().length) { log(`\u23ED ${match.teams}: orders are locked (match started or finished)`); return; }
+            const oppId = getOpponentTeamId();
+            if (oppId && !loadOpponentCache(oppId)) {
+                log(`\u{1F50D} Scouting ${getOpponentTeamName() || 'opponent'}\u2026`);
+                await fetchOpponentSquad(oppId);
+            }
+            const plan = computeOrdersPlan();
+            if (!plan) throw new Error('no order form');
+            const coverage = validateSpellCoverage(plan.bowling, plan.context.overs);
+            if (!coverage.ok) throw new Error(`bowling plan doesn't cover every over (gaps ${coverage.gaps.join(',') || '-'}) — not submitted`);
+            const res = fillOrdersForm(ordersFormPlan(plan));
+            if (!res.ok) throw new Error(`form didn't take the plan: ${res.problems.join(' · ')} — not submitted`);
+            const save = frame.contentDocument.getElementById('savebutton');
+            if (!save) throw new Error('Save Orders button not found');
+            if (!dryRun) {
+                const after = await pressSaveInFrame(frame, save);
+                const okText = /orders saved successfully/i.test(after.body ? after.body.textContent : '');
+                if (!okText) throw new Error('the game did not confirm the save — open the match orders to check');
+            }
+            const c = plan.context;
+            const captain = plan.battingOrder.find(p => p.isCaptain), keeper = plan.battingOrder.find(p => p.role === 'WK');
+            const spells = ['Gibson', 'Southern'].map(end => `${orderPageEndName(end)}: ` + plan.bowling.filter(sp => sp.end === end).sort((a, b) => a.startOver - b.startOver).map(sp => `${sp.player.name.split(' ').slice(-1)[0]} ${sp.startOver}#${sp.overs}`).join(', ')).join(' | ');
+            log(`${dryRun ? '\u{1F441} Orders (preview, not saved)' : '\u2705 Orders saved'}: ${match.teams} (${c.matchType}, ${c.overs} ov, ${c.pitch}/${c.weather}${plan.opponentCache ? ', opponent scouted' : ''}) \u2014 ${plan.tossRec.decision === 'bat' ? 'bat' : 'bowl'} first \u00B7 C ${captain ? captain.name : '?'} \u00B7 WK ${keeper ? keeper.name : '?'} \u00B7 XI: ${plan.battingOrder.map(p => p.name.split(' ').slice(-1)[0]).join(', ')} \u00B7 Bowling ${spells}`);
+        } finally {
+            _pageDocOverride = null;
+            frame.remove();
+        }
+    }
+
+    let _autoPilotRunning = false;
+    async function runAutoPilot(log, dryRun) {
+        if (_autoPilotRunning) return;
+        _autoPilotRunning = true;
+        try {
+            log('\u21BB Refreshing squad, academy, finances, ground\u2026');
+            await fetchAllData({ force: true });
+            try { await autoSubmitTraining(log, dryRun); } catch (e) { log(`\u26A0 Training not submitted: ${e.message}`); }
+            const upcoming = await fetchUpcomingFixtures();
+            if (!upcoming.length) { log('No upcoming matches found.'); return; }
+            const horizon = upcoming[0].matchDate.getTime() + AUTOPILOT_ORDERS_WINDOW_HOURS * 3600 * 1000;
+            for (const m of upcoming.filter((m, i) => i === 0 || m.matchDate.getTime() <= horizon)) {
+                try { await autoSubmitOrders(m, log, dryRun); } catch (e) { log(`\u26A0 ${m.teams}: ${e.message}`); }
+            }
+            log('Done.');
+        } finally {
+            _autoPilotRunning = false;
+        }
     }
 
     // ============================================================
@@ -10807,6 +10947,9 @@ const progMap = { batting: 'batting', bowling: 'bowling', keeping: 'keeperbattin
             ],
             sections: [
                 { id: 'ftp-club-actions', label: '', icon: '', content: `<div style="text-align:center;">
+                    <button id="ftp-autopilot" class="ftp-button ftp-button-primary" style="width:100%;padding:10px;font-size:13px;margin-bottom:6px;">\u{1F916} Refresh &amp; submit: training + next match orders</button>
+                    <label class="vj-text-xs vj-text-muted" style="display:block;text-align:left;margin-bottom:4px;"><input type="checkbox" id="ftp-autopilot-dry"> Preview only \u2014 don't submit</label>
+                    <div id="ftp-autopilot-log" class="vj-text-xs" style="text-align:left;line-height:1.5;margin-bottom:8px;"></div>
                     <button id="ftp-update-all" class="ftp-button ftp-button-primary" style="width:100%;padding:10px;font-size:13px;">\u21BB Update All Data</button>
                     <div class="vj-text-xs vj-text-muted vj-mt-4">Fetches squad, academy, finances, ground, and team data in the background.</div>
                 </div>` },
@@ -10815,6 +10958,17 @@ const progMap = { batting: 'batting', bowling: 'bowling', keeping: 'keeperbattin
                 { id: 'ftp-club-supporters', label: 'Supporters', icon: '\u{1F465}', iconColor: 'blue' },
                 { id: 'ftp-club-opponents', label: 'Scouted Opponents', icon: '\u{1F50D}', iconColor: 'blue' }
             ]
+        });
+
+        document.getElementById('ftp-autopilot').addEventListener('click', async () => {
+            const btn = document.getElementById('ftp-autopilot');
+            const out = document.getElementById('ftp-autopilot-log');
+            btn.disabled = true;
+            out.innerHTML = '';
+            const log = (msg) => { out.insertAdjacentHTML('beforeend', `<div>${escapeHtml(msg)}</div>`); };
+            try { await runAutoPilot(log, document.getElementById('ftp-autopilot-dry').checked); } catch (e) { log(`\u26A0 ${e.message}`); }
+            btn.disabled = false;
+            updateClubStatusUI();
         });
 
         document.getElementById('ftp-update-all').addEventListener('click', async () => {
