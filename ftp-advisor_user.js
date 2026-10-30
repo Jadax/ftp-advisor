@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         FTP Advisor
 // @namespace    http://tampermonkey.net/
-// @version      8.108
+// @version      8.109
 // @description  Tactical/scouting advisor for fromthepavilion.org (cricket sim): team, tactics, pitch, training, transfer market, youth and squad plan advice with projections. Full changelog: github.com/Jadax/ftp-advisor
 // @author       Tushant Sharma
 // @license      MIT
@@ -3554,7 +3554,7 @@
                         }
                         const parser = new DOMParser();
                         const doc = parser.parseFromString(resp.responseText, 'text/html');
-                        const result = { experience: null, wage: null, wageDiscount: null, talents: [], captaincy: null };
+                        const result = { experience: null, wage: null, wageDiscount: null, talents: [], captaincy: null, gameRatings: null, isLeftHanded: null };
 
                         // Quick sanity check: if we got the login page, bail
                         if (doc.querySelector('input[name="username"]') || resp.responseText.length < 500) {
@@ -3576,6 +3576,11 @@
                             const discMatch = infoText.match(/\((\d+)%\s*discount\)/i);
                             if (discMatch) result.wageDiscount = parseInt(discMatch[1], 10) || 0;
                         }
+                        // Second line: "Right hand batsman | Right arm Medium"
+                        // (live-verified player.htm) — the transfer table has no hand.
+                        if (paddedPs.length > 1 && /hand batsman/i.test(paddedPs[1].textContent)) {
+                            result.isLeftHanded = /left hand batsman/i.test(paddedPs[1].textContent);
+                        }
 
                         // Scan ALL th/td pairs across ALL tables
                         const allThs = doc.querySelectorAll('th');
@@ -3590,6 +3595,11 @@
                             } else if (label === 'captaincy' && result.captaincy === null) {
                                 const val = td.textContent.trim().toLowerCase();
                                 result.captaincy = parseSkill(val);
+                            } else if (GAME_ROLE_RATING_LABELS.includes(label)) {
+                                // The game's own per-role rating (Batsman / Bowler /
+                                // Keeper / Allrounder) — its composite, not ours.
+                                result.gameRatings = result.gameRatings || {};
+                                if (result.gameRatings[label] == null) result.gameRatings[label] = parseSkill(td.textContent.trim().toLowerCase());
                             } else if (label === 'talents' && result.talents.length === 0) {
                                 const spans = td.querySelectorAll('span.popuphelp');
                                 spans.forEach(span => {
@@ -3620,6 +3630,85 @@
     }
 
     // Fetch details for all priority buy players with rate limiting
+    const GAME_ROLE_RATING_LABELS = ['batsman', 'bowler', 'keeper', 'allrounder'];
+
+    // Own squad's game role ratings, refreshed at most daily (one player
+    // page each, through the request queue) — cached separately so the
+    // squad-cache self-heal rules are untouched.
+    const GAME_RATINGS_KEY = 'ftp_game_ratings';
+    const GAME_RATINGS_TS_KEY = 'ftp_game_ratings_ts';
+    let _gameRatingsRefreshing = null;
+    function loadGameRatings() {
+        const c = _loadCacheWithAge(GAME_RATINGS_KEY, GAME_RATINGS_TS_KEY);
+        return c ? { byId: c.parsed || {}, ageHours: c.ageHours } : null;
+    }
+    function refreshGameRatings(players) {
+        if (_gameRatingsRefreshing) return _gameRatingsRefreshing;
+        const ids = (players || []).map(p => p.id).filter(Boolean);
+        _gameRatingsRefreshing = (async () => {
+            const byId = {};
+            for (const id of ids) {
+                const d = await fetchPlayerPageDetails(id);
+                if (d.gameRatings) byId[id] = d.gameRatings;
+            }
+            if (Object.keys(byId).length) _saveCache(GAME_RATINGS_KEY, GAME_RATINGS_TS_KEY, byId);
+            _gameRatingsRefreshing = null;
+            return byId;
+        })();
+        return _gameRatingsRefreshing;
+    }
+
+    // Advisor-run transfer searches (live-verified transfer.htm POST form,
+    // 2026-10): skill ids Batting 5 / Bowling 6 / Keeping 8 / Technique 3;
+    // level values are the advisor's scale + 1 (expert = 10); 20 rows a
+    // page, `page` is 0-based. Targets = the user's buying plan: 16-17yo
+    // first-team prospects and 20-21yo development signings, each split by
+    // role so the server-side skill filter does the first cut.
+    const MARKET_SCANS = [
+        { label: '16-17 batters', fromAge: 16, toAge: 17, skill: 5, min: 4 },
+        { label: '16-17 bowlers', fromAge: 16, toAge: 17, skill: 6, min: 4 },
+        { label: '16-17 keepers', fromAge: 16, toAge: 17, skill: 8, min: 4 },
+        { label: '20-21 batters', fromAge: 20, toAge: 21, skill: 5, min: 9 },
+        { label: '20-21 bowlers', fromAge: 20, toAge: 21, skill: 6, min: 9 },
+        { label: '20-21 keepers', fromAge: 20, toAge: 21, skill: 8, min: 9 }
+    ];
+    const MARKET_SCAN_MAX_PAGES = 4;
+    let _lastMarketScan = null;
+    function postTransferSearch(params) {
+        return new Promise((resolve) => {
+            _queuedRequest({
+                method: 'POST',
+                url: 'https://www.fromthepavilion.org/transfer.htm',
+                data: new URLSearchParams(params).toString(),
+                headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+                timeout: 15000,
+                onload: (resp) => {
+                    if (resp.status !== 200) return resolve([]);
+                    resolve(scrapeTransferResults(new DOMParser().parseFromString(resp.responseText, 'text/html')));
+                },
+                onerror: () => resolve([]),
+                ontimeout: () => resolve([])
+            });
+        });
+    }
+    async function runMarketScan(onProgress) {
+        const byId = new Map();
+        for (const scan of MARKET_SCANS) {
+            for (let page = 0; page < MARKET_SCAN_MAX_PAGES; page++) {
+                if (onProgress) onProgress(`${scan.label}${page ? ` (page ${page + 1})` : ''}`);
+                const rows = await postTransferSearch({
+                    sortBy: '2', squad: '0', bats: '0', bowls: '0', action: 'Search',
+                    fromAge: String(scan.fromAge), toAge: String(scan.toAge), fromRating: '25000',
+                    skill1: String(scan.skill), fromSkill1: String(scan.min + 1), page: String(page)
+                });
+                rows.forEach(r => { if (r.id && !byId.has(r.id)) byId.set(r.id, r); });
+                if (rows.length < 20) break;
+            }
+        }
+        _lastMarketScan = [...byId.values()];
+        return _lastMarketScan;
+    }
+
     // Promise per player id: updateTransferAdvisor renders twice per visit
     // (stale cache, then refreshed squad) and both passes auto-fetch.
     const _transferDetailCache = new Map();
@@ -3636,14 +3725,16 @@
             if (details.wageDiscount != null) p.wageDiscount = details.wageDiscount;
             if (details.talents.length > 0) p.talents = details.talents;
             if (details.captaincy !== null) p.captaincy = details.captaincy;
+            if (details.gameRatings) p.gameRatings = details.gameRatings;
+            if (details.isLeftHanded != null) p.isLeftHanded = details.isLeftHanded;
             if (onUpdate) onUpdate(i, players.length);
             if (!cached && i < players.length - 1) await new Promise(r => setTimeout(r, DELAY_MS));
         }
     }
 
-    function scrapeTransferResults() {
+    function scrapeTransferResults(root) {
         const players = [];
-        const tables = document.querySelectorAll('table.data');
+        const tables = (root || document).querySelectorAll('table.data');
         for (const table of tables) {
             const allRows = table.querySelectorAll('tr');
             if (allRows.length < 2) continue;
@@ -5816,6 +5907,28 @@ const MAX_OVERS_PER_BOWLER = { OD: 10, YOD: 8, T20: 4, YT20: 4 };
             ${tiredWarning}
         `;
 
+        // The game's own role ratings (player pages, daily cache) as a second
+        // opinion on selection: flags only — never changes the XI.
+        const gameRatings = loadGameRatings();
+        if (!gameRatings || gameRatings.ageHours >= 24) {
+            refreshGameRatings(enrichedPlayers).then(byId => { if (Object.keys(byId).length) updateOrdersAdvisor(); });
+        } else {
+            const picked = new Set(battingOrder.map(p => String(p.id)));
+            const notes = [];
+            [['batsman', 'batting'], ['bowler', 'bowling']].forEach(([role, skill]) => {
+                const rated = (p) => (gameRatings.byId[p.id] || {})[role];
+                const pickedRole = battingOrder.filter(p => getPrimarySkillInfo(p).name === skill && rated(p) != null);
+                if (!pickedRole.length) return;
+                const weakest = pickedRole.reduce((a, b) => (rated(a) <= rated(b) ? a : b));
+                enrichedPlayers
+                    .filter(p => !picked.has(String(p.id)) && rated(p) != null && rated(p) >= rated(weakest) + 2 && (p.fatigue ?? 10) > FATIGUE_MAP.weary)
+                    .forEach(p => notes.push(`${p.name} (game ${role}: ${skillLabel(rated(p))}) left out over ${weakest.name} (${skillLabel(rated(weakest))})`));
+            });
+            if (notes.length) {
+                document.getElementById('ftp-toss').insertAdjacentHTML('beforeend', `<div class="ftp-alert info" style="margin:4px 0 0 0;"><span>\u2696</span><div>The game's own role ratings disagree: ${notes.join(' \u00B7 ')}. Worth a look before saving.</div></div>`);
+            }
+        }
+
         // Display batting order
         displayBattingOrder(battingOrder, opponentAnalysis, context);
 
@@ -6368,7 +6481,11 @@ const MAX_OVERS_PER_BOWLER = { OD: 10, YOD: 8, T20: 4, YT20: 4 };
         // you can actually set.
         let recHtml = `<div class="ftp-alert info" style="margin-bottom:6px;"><span>⏳</span><div><strong>Pitch changes take real time</strong> — official manual: changing pitch condition takes roughly 2 days for a small shift (e.g. Flat→Slow) up to 4+ days for a bigger one (e.g. Flat→Green). This isn't something to flip before each match — set each competition's pitch to fit your squad's actual strength (batting/seam/spin) and leave it, planning changes days ahead of a big fixture if you do need one.</div></div>`;
 
-        const currentPitches = document.querySelectorAll('table.data tbody tr');
+        // Only rows carrying a pitch-request select are competitions — the
+        // page has three other table.data tables (ground info, pitch
+        // descriptions, weather) whose rows used to be listed as classes.
+        const currentPitches = [...document.querySelectorAll('table.data tr')].filter(r => r.querySelector('select[name$=".requestedPitchType"]'));
+        const pitchFills = [];
         let currentHtml = '<table class="ftp-table"><thead><tr><th>Class</th><th>Current</th><th>Recommended</th></tr></thead><tbody>';
         let matchedAnyClass = false;
         currentPitches.forEach(row => {
@@ -6392,6 +6509,9 @@ const MAX_OVERS_PER_BOWLER = { OD: 10, YOD: 8, T20: 4, YT20: 4 };
                     : (isYouthClass ? youthBatRating : seniorBatRating);
                 const rec = recommendPitchForSquad(seam, spin, bat, isYouthClass ? youthPaceMix : seniorPaceMix);
                 const isMatch = currentPitch && rec.pitch && currentPitch.toLowerCase() === rec.pitch.toLowerCase();
+                const pitchSelect = row.querySelector('select[name$=".requestedPitchType"]');
+                const recOption = pitchSelect && rec.pitch ? [...pitchSelect.options].find(o => o.textContent.trim().toLowerCase().startsWith(rec.pitch.toLowerCase())) : null;
+                if (pitchSelect && recOption && !isMatch && pitchSelect.value !== recOption.value) pitchFills.push({ pitchSelect, recOption, className });
                 if (className) matchedAnyClass = true;
 
                 currentHtml += `<tr><td style="font-weight:600;">${className}</td><td><span class="ftp-stat-badge ${isMatch ? 'green' : 'neutral'}">${currentPitch}</span></td><td><span class="ftp-stat-badge ${isMatch ? 'green' : 'amber'}">${rec.pitch}</span></td></tr>`;
@@ -6412,7 +6532,16 @@ const MAX_OVERS_PER_BOWLER = { OD: 10, YOD: 8, T20: 4, YT20: 4 };
             }
         });
         currentHtml += '</tbody></table>';
+        if (pitchFills.length) {
+            currentHtml += `<div class="vj-flex vj-gap-6 vj-mt-4" style="align-items:center;flex-wrap:wrap;"><button id="ftp-fill-pitches" class="vj-btn vj-btn-sm" style="font-size:12px;padding:4px 10px;cursor:pointer;">\u2B07 Fill recommended pitches</button><span id="ftp-fill-pitches-result" class="vj-text-xs vj-text-muted">Fills only \u2014 press each class's Change Pitch to request it (the option shows when it will be ready).</span></div>`;
+        }
         document.getElementById('ftp-current-pitches').innerHTML = currentHtml;
+        const fillPitchBtn = document.getElementById('ftp-fill-pitches');
+        if (fillPitchBtn) fillPitchBtn.addEventListener('click', () => {
+            pitchFills.forEach(f => { f.pitchSelect.value = f.recOption.value; f.pitchSelect.dispatchEvent(new Event('change', { bubbles: true })); });
+            const out = document.getElementById('ftp-fill-pitches-result');
+            if (out) out.innerHTML = `<span style="color:var(--vj-green);">\u2713 Set ${pitchFills.map(f => `${f.className} \u2192 ${escapeHtml(f.recOption.textContent.trim())}`).join(' \u00B7 ')} \u2014 press Change Pitch on each to request.</span>`;
+        });
 
         if (!matchedAnyClass) {
             // No real class rows found on this page load (e.g. ground.htm
@@ -8001,13 +8130,10 @@ table.ftp-table {
                 console.warn('[FTP Training] No cache for:', name, '(id:', playerId, ') — visit squad page to load skills');
             }
 
-            // Detect talents from row text (popup/tooltip may contain talent info)
-            const talents = [];
-            const rowText = row.textContent;
-            const talentWords = ['Gifted', 'Prodigy', 'Sturdy', 'Natural Leader', 'Accumulator', 'Finisher', 'Specialist', 'Swing', 'Yorker', 'Slower Ball'];
-            talentWords.forEach(talent => {
-                if (rowText.includes(talent)) talents.push(talent);
-            });
+            // The training page never prints talents (live-verified) — the old
+            // row-text scan always found none, so Prodigy/Gifted never reached
+            // a training recommendation. The squad cache has them.
+            const talents = cached && Array.isArray(cached.talents) ? cached.talents : [];
 
             const player = {
                 id: playerId,
@@ -8024,6 +8150,9 @@ table.ftp-table {
                 form: form,
                 currentTraining: currentTraining,
                 talents: talents,
+                experience: cached ? (cached.experience || 0) : 0,
+                captaincy: cached ? (cached.captaincy || 0) : 0,
+                wage: cached ? (cached.wage || 0) : 0,
                 bowlerType: bowlerType,
                 bowlerCategory: bowlerCategory,
                 isLeftHanded: isLeftHanded,
@@ -9723,6 +9852,8 @@ const progMap = { batting: 'batting', bowling: 'bowling', keeping: 'keeperbattin
             ],
             sections: [
                 { id: 'ftp-transfer-gaps', label: 'Squad Gaps', icon: '\u26A0', iconColor: 'amber' },
+                { id: 'ftp-transfer-scan', label: 'Market Scan', icon: '\u{1F50E}', iconColor: 'purple',
+                  content: '<div class="vj-flex vj-gap-6" style="align-items:center;flex-wrap:wrap;"><button id="ftp-market-scan" class="vj-btn vj-btn-sm" style="font-size:12px;padding:4px 10px;cursor:pointer;">\u{1F50E} Scan market: 16-17 prospects + 20-21 signings</button><span id="ftp-market-scan-status" class="vj-text-xs vj-text-muted">Runs the searches for you; results appear below.</span></div>' },
                 { id: 'ftp-transfer-results', label: 'Search Results', icon: '\u{1F50D}', iconColor: 'green',
                   content: '<div class="vj-text-sm vj-text-muted">Search for players on the transfer form to evaluate them here.</div>' },
                 { id: 'ftp-transfer-targets', label: 'Target Thresholds', icon: '\u{1F3AF}', iconColor: 'blue', collapsible: true, collapsed: true },
@@ -9731,10 +9862,19 @@ const progMap = { batting: 'batting', bowling: 'bowling', keeping: 'keeperbattin
             ]
         });
 
-        document.getElementById('ftp-refresh').addEventListener('click', updateTransferAdvisor);
+        document.getElementById('ftp-refresh').addEventListener('click', () => updateTransferAdvisor());
+        const scanBtn = document.getElementById('ftp-market-scan');
+        if (scanBtn) scanBtn.addEventListener('click', async () => {
+            const status = document.getElementById('ftp-market-scan-status');
+            scanBtn.disabled = true;
+            const found = await runMarketScan(label => { if (status) status.textContent = `Searching ${label}\u2026`; });
+            if (status) status.textContent = `${found.length} listed players matched the base filters \u2014 evaluated below.`;
+            scanBtn.disabled = false;
+            updateTransferAdvisor(found);
+        });
     }
 
-    function updateTransferAdvisor() {
+    function updateTransferAdvisor(scannedResults) {
         // ---- Parse live search results from the page ----
         const resultsEl = document.getElementById('ftp-transfer-results');
         const financeInfo = loadFinanceCache();
@@ -9789,7 +9929,9 @@ const progMap = { batting: 'batting', bowling: 'bowling', keeping: 'keeperbattin
         }
 
         if (resultsEl) {
-            const results = scrapeTransferResults();
+            const pageResults = scrapeTransferResults();
+            const results = Array.isArray(scannedResults) ? scannedResults
+                : (pageResults.length ? pageResults : (_lastMarketScan || []));
             if (results.length > 0) {
                 // Academy/squad context for per-candidate Dynasty + Overall Rating
                 // projections, reused by every render pass (initial and after
@@ -10083,6 +10225,8 @@ const progMap = { batting: 'batting', bowling: 'bowling', keeping: 'keeperbattin
                             }
                             if (p.price) detailParts.push(`Price $${p.price.toLocaleString()}`);
                             if (detailsFetched && p.talents && p.talents.length > 0) detailParts.push(`<span style="color:var(--vj-gold);">${p.talents.join(', ')}</span>`);
+                            if (p.gameRatings) detailParts.push(`Game ratings: ${GAME_ROLE_RATING_LABELS.filter(k => p.gameRatings[k] != null).map(k => `${k} ${skillLabel(p.gameRatings[k])}`).join(', ')}`);
+                            if (p.isLeftHanded != null) detailParts.push(p.isLeftHanded ? 'Left-hand bat' : 'Right-hand bat');
 
                             let compareHtml = '';
                             const cmp = p.peerCompare;
