@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         FTP Advisor
 // @namespace    http://tampermonkey.net/
-// @version      8.112
+// @version      8.113
 // @description  Tactical/scouting advisor for fromthepavilion.org (cricket sim): team, tactics, pitch, training, transfer market, youth and squad plan advice with projections. Full changelog: github.com/Jadax/ftp-advisor
 // @author       Tushant Sharma
 // @license      MIT
@@ -2213,6 +2213,13 @@
     // minimal = 1.0x baseline, deluxe = 1.3x. Index 0 = minimal,
     // index 10 = deluxe, matching ACADEMY_LEVELS' `num` field.
     const ACADEMY_SPEED = [1.00, 1.03, 1.06, 1.09, 1.12, 1.15, 1.18, 1.21, 1.24, 1.27, 1.30];
+    // One-off cost to go UP from `levelNum` = 2.5x the NEXT level's weekly
+    // maintenance (live academy page: Excellent -> Superior "$315,000" =
+    // 126,000 x 2.5). Two render sites used the CURRENT level's cost and
+    // showed $255,000.
+    function academyUpgradeCost(levelNum) {
+        return levelNum >= 0 && levelNum < 10 ? Math.round(ACADEMY_LEVELS[levelNum + 1].cost * 2.5) : 0;
+    }
 
     // Multi-week training projections assume the academy improves over
     // the horizon (the user WILL keep upgrading it — the live-scraped
@@ -3003,10 +3010,7 @@
         const currentLevel = ACADEMY_LEVELS[info.levelNum];
         if (currentLevel) {
             info.weeklyCost = currentLevel.cost;
-            // Upgrade cost = 2.5x new level's maintenance
-            if (info.levelNum < 10) {
-                info.upgradeCost = Math.round(ACADEMY_LEVELS[info.levelNum + 1].cost * 2.5);
-            }
+            if (info.levelNum < 10) info.upgradeCost = academyUpgradeCost(info.levelNum);
             // Downgrade refund = 1.25x current level's maintenance
             if (info.levelNum > 0) {
                 info.downgradeRefund = Math.round(currentLevel.cost * 1.25);
@@ -3126,6 +3130,24 @@
         }
 
         info.weeklyNet = info.weeklyIncome - info.weeklyExpenses;
+        // The second stats table is LAST week's actuals (live finances.htm:
+        // this week +$12,992 projected with a home gate, last week -$33,369
+        // without one). Decisions that commit weekly money use the average
+        // of the two so an away week can't flip "can afford".
+        const lastWeekTable = doc.querySelectorAll('table.data.stats, table.stats')[1];
+        if (lastWeekTable) {
+            let inc = null, exp = null;
+            lastWeekTable.querySelectorAll('tr').forEach(row => {
+                const cells = Array.from(row.querySelectorAll('td'));
+                for (let i = 0; i < cells.length - 1; i++) {
+                    const label = cells[i].textContent.trim().toLowerCase();
+                    if (/^weekly income/.test(label)) inc = toAmount(cells[i + 1].textContent.trim());
+                    else if (/^weekly expenses/.test(label)) exp = toAmount(cells[i + 1].textContent.trim());
+                }
+            });
+            if (inc != null && exp != null) info.lastWeekNet = inc - exp;
+        }
+        info.typicalWeeklyNet = info.lastWeekNet != null ? Math.round((info.weeklyNet + info.lastWeekNet) / 2) : info.weeklyNet;
         console.log('[FTP Finance] Parsed (source:', foundAny ? 'table' : 'regex-fallback', ') funds:$' + info.availableFunds, 'net:$' + info.weeklyNet + '/wk');
         return info;
     }
@@ -3842,16 +3864,20 @@
         }
 
         const funds = financeInfo ? financeInfo.availableFunds : 0;
-        const weeklyNet = financeInfo ? financeInfo.weeklyNet : 0;
+        const weeklyNet = financeInfo ? (financeInfo.typicalWeeklyNet ?? financeInfo.weeklyNet) : 0;
         const level = academyInfo.levelNum;
         const levelName = academyInfo.level;
         const currentLevel = ACADEMY_LEVELS[level];
         const nextLevel = level < 10 ? ACADEMY_LEVELS[level + 1] : null;
 
-        rec.upgradeCost = currentLevel ? currentLevel.cost * 2.5 : 0;
+        rec.upgradeCost = academyInfo.upgradeCost || academyUpgradeCost(level);
         rec.downgradeRefund = currentLevel ? Math.round(currentLevel.cost * 1.25) : 0;
         rec.weeklyIncrease = nextLevel ? nextLevel.cost - currentLevel.cost : 0;
-        rec.canAfford = funds >= rec.upgradeCost && (weeklyNet + rec.weeklyIncrease) >= 0;
+        // The extra upkeep comes OFF the weekly balance (this used to ADD it).
+        // Affordable = pay the one-off and still fund a full season (14
+        // weeks) at the resulting typical weekly balance.
+        rec.weeklyNetAfter = weeklyNet - rec.weeklyIncrease;
+        rec.canAfford = funds >= rec.upgradeCost && funds - rec.upgradeCost + 14 * Math.min(0, rec.weeklyNetAfter) >= 0;
         if (rec.weeklyIncrease > 0) {
             rec.breakEvenWeeks = Math.ceil(rec.upgradeCost / rec.weeklyIncrease);
         }
@@ -9058,7 +9084,7 @@ const progMap = { batting: 'batting', bowling: 'bowling', keeping: 'keeperbattin
             const finColor = (financeInfo.weeklyNet || 0) >= 0 ? 'var(--vj-green)' : 'var(--vj-red)';
             html += `<div class="ftp-info-box" style="border-left:3px solid var(--vj-blue);">
                 <div class="ftp-stat-row"><span class="ftp-stat-label">Funds</span><span class="ftp-stat-value">$${(financeInfo.availableFunds || 0).toLocaleString()}</span></div>
-                <div class="ftp-stat-row"><span class="ftp-stat-label">Weekly net</span><span class="ftp-stat-value" style="color:${finColor};">$${(financeInfo.weeklyNet || 0).toLocaleString()}/wk</span></div>
+                <div class="ftp-stat-row"><span class="ftp-stat-label">Weekly net</span><span class="ftp-stat-value" style="color:${finColor};">$${(financeInfo.weeklyNet || 0).toLocaleString()}/wk${financeInfo.lastWeekNet != null ? ` <span class="vj-text-xs vj-text-muted">(last wk $${financeInfo.lastWeekNet.toLocaleString()})</span>` : ''}</span></div>
                 ${financeInfo.seniorWages > 0 ? `<div class="ftp-stat-row"><span class="ftp-stat-label">Senior wages</span><span class="ftp-stat-value">$${financeInfo.seniorWages.toLocaleString()}</span></div>` : ''}
                 ${financeInfo.youthWages > 0 ? `<div class="ftp-stat-row"><span class="ftp-stat-label">Youth wages</span><span class="ftp-stat-value">$${financeInfo.youthWages.toLocaleString()}</span></div>` : ''}
             </div>`;
@@ -9084,7 +9110,7 @@ const progMap = { batting: 'batting', bowling: 'bowling', keeping: 'keeperbattin
             <div class="ftp-rec-reason">${academyRec.reason}</div>`;
 
         if (academyRec.action === 'upgrade' && academyRec.upgradeCost > 0) {
-            html += `<div class="vj-text-xs vj-text-muted vj-mt-4">One-off: $${academyRec.upgradeCost.toLocaleString()} \u00B7 Weekly +$${academyRec.weeklyIncrease.toLocaleString()} \u00B7 ${academyRec.canAfford ? '\u2705 Can afford' : '\u274C Cannot afford'}</div>`;
+            html += `<div class="vj-text-xs vj-text-muted vj-mt-4">One-off: $${academyRec.upgradeCost.toLocaleString()} \u00B7 Weekly +$${academyRec.weeklyIncrease.toLocaleString()}${academyRec.weeklyNetAfter != null ? ` (typical week after: $${academyRec.weeklyNetAfter.toLocaleString()})` : ''} \u00B7 ${academyRec.canAfford ? '\u2705 Can afford' : '\u274C Cannot afford'}</div>`;
         }
 
         if (academyRec.benefits.length > 0) {
@@ -9133,7 +9159,7 @@ const progMap = { batting: 'batting', bowling: 'bowling', keeping: 'keeperbattin
                 <div class="ftp-stat-row"><span class="ftp-stat-label">Training speed</span><span class="ftp-stat-value">${Math.round(speed * 100)}% of baseline</span></div>
                 <div class="ftp-stat-row"><span class="ftp-stat-label">Efficiency</span><span class="ftp-stat-value">Senior ${academyInfo.seniorEfficiency}% \u00B7 Youth ${academyInfo.youthEfficiency}%</span></div>
                 <div class="vj-text-xs vj-text-muted vj-mt-4">
-                    Upgrade: ${nextLevel ? '$' + (ACADEMY_LEVELS[level].cost * 2.5).toLocaleString() : 'N/A (max)'} \u00B7 Downgrade refund: ${prevLevel ? '$' + Math.round(ACADEMY_LEVELS[level].cost * 1.25).toLocaleString() : 'N/A (min)'}
+                    Upgrade: ${nextLevel ? '$' + academyUpgradeCost(level).toLocaleString() : 'N/A (max)'} \u00B7 Downgrade refund: ${prevLevel ? '$' + Math.round(ACADEMY_LEVELS[level].cost * 1.25).toLocaleString() : 'N/A (min)'}
                 </div>
             </div>`;
             document.getElementById('ftp-academy-detail').innerHTML = detailHtml;
@@ -9141,7 +9167,7 @@ const progMap = { batting: 'batting', bowling: 'bowling', keeping: 'keeperbattin
             let levelsHtml = '<table class="ftp-table"><thead><tr><th>Lvl</th><th>Name</th><th>Weekly</th><th>Speed</th><th>Upgrade</th></tr></thead><tbody>';
             for (const lvl of ACADEMY_LEVELS) {
                 const isCurrent = lvl.num === level;
-                const upgradeCost = lvl.num < 10 ? '$' + (ACADEMY_LEVELS[lvl.num].cost * 2.5).toLocaleString() : '---';
+                const upgradeCost = lvl.num < 10 ? '$' + academyUpgradeCost(lvl.num).toLocaleString() : '---';
                 levelsHtml += `<tr style="${isCurrent ? 'background:var(--vj-green-bg);font-weight:700;' : ''}">
                     <td>${lvl.num}</td>
                     <td>${lvl.label}</td>
@@ -9158,7 +9184,7 @@ const progMap = { batting: 'batting', bowling: 'bowling', keeping: 'keeperbattin
             const finColor = (financeInfo.weeklyNet || 0) >= 0 ? 'var(--vj-green)' : 'var(--vj-red)';
             document.getElementById('ftp-academy-finance').innerHTML = `<div class="ftp-info-box" style="border-left:3px solid var(--vj-blue);">
                 <div class="ftp-stat-row"><span class="ftp-stat-label">Funds</span><span class="ftp-stat-value">$${(financeInfo.availableFunds || 0).toLocaleString()}</span></div>
-                <div class="ftp-stat-row"><span class="ftp-stat-label">Weekly net</span><span class="ftp-stat-value" style="color:${finColor};">$${(financeInfo.weeklyNet || 0).toLocaleString()}/wk</span></div>
+                <div class="ftp-stat-row"><span class="ftp-stat-label">Weekly net</span><span class="ftp-stat-value" style="color:${finColor};">$${(financeInfo.weeklyNet || 0).toLocaleString()}/wk${financeInfo.lastWeekNet != null ? ` <span class="vj-text-xs vj-text-muted">(last wk $${financeInfo.lastWeekNet.toLocaleString()})</span>` : ''}</span></div>
                 ${financeInfo.seniorWages > 0 ? `<div class="ftp-stat-row"><span class="ftp-stat-label">Senior wages</span><span class="ftp-stat-value">$${financeInfo.seniorWages.toLocaleString()}</span></div>` : ''}
                 ${financeInfo.youthWages > 0 ? `<div class="ftp-stat-row"><span class="ftp-stat-label">Youth wages</span><span class="ftp-stat-value">$${financeInfo.youthWages.toLocaleString()}</span></div>` : ''}
                 ${financeInfo.groundMaintenance > 0 ? `<div class="ftp-stat-row"><span class="ftp-stat-label">Ground maint.</span><span class="ftp-stat-value">$${financeInfo.groundMaintenance.toLocaleString()}</span></div>` : ''}
@@ -9616,7 +9642,7 @@ const progMap = { batting: 'batting', bowling: 'bowling', keeping: 'keeperbattin
     function recommendCapacity(groundInfo, financeInfo, division, teamInfo) {
         const capacity = groundInfo?.capacity || 0;
         const funds = financeInfo?.availableFunds || 0;
-        const weeklyNet = financeInfo?.weeklyNet || 0;
+        const weeklyNet = financeInfo?.typicalWeeklyNet ?? financeInfo?.weeklyNet ?? 0;
         const seniorWages = financeInfo?.seniorWages || 0;
         const supporters = teamInfo?.supporters || 0;
         const supporterGrowth = teamInfo?.supporterGrowth || 0;
@@ -10358,7 +10384,7 @@ const progMap = { batting: 'batting', bowling: 'bowling', keeping: 'keeperbattin
         const targetsEl = document.getElementById('ftp-transfer-targets');
         const funds = financeInfo?.availableFunds || 0;
         const weeklyIncome = financeInfo?.weeklyIncome || 0;
-        const weeklyNet = financeInfo?.weeklyNet || 0;
+        const weeklyNet = financeInfo?.typicalWeeklyNet ?? financeInfo?.weeklyNet ?? 0;
 
         // Senior: don't blow your load on one player
         // Based on community data: 16yo min wage=$500, 20yo skilled=$3K-10K/wk
