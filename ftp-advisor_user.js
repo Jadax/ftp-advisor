@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         FTP Advisor
 // @namespace    http://tampermonkey.net/
-// @version      8.111
+// @version      8.112
 // @description  Tactical/scouting advisor for fromthepavilion.org (cricket sim): team, tactics, pitch, training, transfer market, youth and squad plan advice with projections. Full changelog: github.com/Jadax/ftp-advisor
 // @author       Tushant Sharma
 // @license      MIT
@@ -206,6 +206,12 @@
         'shattered': 1, 'shtrd': 1,
         'clinically dead': 0, 'clin': 0
     };
+    // Fatigue is its own 0-10 scale — printing it through SKILL_LABELS read
+    // Listless (3) as "Ordinary" and Weary (4) as "Average".
+    function fatigueLabel(f) {
+        const name = Object.keys(FATIGUE_MAP).find(k => k.length >= 5 && FATIGUE_MAP[k] === f);
+        return name ? name.charAt(0).toUpperCase() + name.slice(1) : `${f}/10`;
+    }
 
     const SKILL_LABELS = {
         15: 'Legendary', 14: 'Elite', 13: 'World Class', 12: 'Exceptional',
@@ -2222,11 +2228,11 @@
 
     // Youth-week multiplier for MULTI-WEEK PROJECTIONS only (not the training
     // page's weekly estimates). The workbook rates alone took a 16yo exactly on
-    // the user's YOUTH_DEV_CURVE (4/4/4) to 7/7/7 at 20 vs the curve's 9/9/8;
-    // 1.6 is the fit that maps on-curve 16-19yos back onto the curve at 20
-    // (16: +1, 17: exact, 18: -1, 19: exact primary). Re-fit if real
-    // progression data ever disagrees.
-    const YOUTH_PROJECTION_CALIBRATION = 1.6;
+    // the user's YOUTH_DEV_CURVE (4/4/4) to 7/7/7 at 20 vs the curve's 9/9/8.
+    // Fitted at the user's real academy speed (Excellent, 1.18): 1.35 maps
+    // on-curve 16/17/19yos exactly onto the curve at 20 (18yo one level
+    // under). Re-fit if the academy level or real progression data changes.
+    const YOUTH_PROJECTION_CALIBRATION = 1.35;
     // Deliberately youth-only: a 21-24 fit to AGE_SCOUT_THRESHOLDS (a
     // cross-section of per-age minimums, not a trajectory) compounded with
     // this one and drove every 16yo to the skill cap by 25 (no spread left).
@@ -2235,27 +2241,18 @@
         return a < 21 ? YOUTH_PROJECTION_CALIBRATION : 1;
     }
 
-    /**
-     * Real, age-appropriate training speed for a specific player.
-     * Prefers the game's own directly-displayed "Senior/Youth Training
-     * Efficiency %" (scraped from the Academy page, parseAcademyDoc)
-     * over the derived ACADEMY_SPEED curve above — it's live per-team
-     * data straight from the source, not an estimate, and critically
-     * it's the correct AGE-SPECIFIC figure. The official game manual
-     * (rules.htm?rulespage=training) confirms senior and youth academy
-     * effectiveness are tracked separately by the game itself; a single
-     * ACADEMY_SPEED curve applied to every age (as this script did
-     * before) can never capture that distinction, only ACADEMY_SPEED's
-     * derived level-based estimate can, as a fallback before the
-     * Academy page has ever been visited/cached.
-     */
+    // The academy LEVEL is the training boost (manual, rulespage=
+    // youthacademy: "Each academy level above non-existent gives your
+    // players a small training boost"). The page's "Training Efficiency %"
+    // is ONLY overcrowding ("If your squad is overcrowded, their training
+    // speed will decrease"; rulespage=training: up to 25 in either squad)
+    // — that is applied separately per squad (squadSizeForPlayer), so it is
+    // not multiplied in here. Returning the efficiency as the speed (as
+    // before v8.112) dropped an Excellent academy's +18% from every
+    // projection and estimate.
     function getAcademySpeedForPlayer(player, academyInfo) {
-        if (academyInfo) {
-            const isYouthPlayer = (player.age || 0) < 21;
-            const liveEfficiency = isYouthPlayer ? academyInfo.youthEfficiency : academyInfo.seniorEfficiency;
-            if (liveEfficiency != null) return liveEfficiency / 100;
-        }
-        return ACADEMY_SPEED[academyInfo ? academyInfo.levelNum : 0] || 1.00;
+        const lvl = academyInfo && academyInfo.levelNum != null ? academyInfo.levelNum : 0;
+        return ACADEMY_SPEED[lvl] || 1.00;
     }
 
     // A third age-threshold table (AGE_SKILL_THRESHOLDS) lived here and
@@ -7977,8 +7974,7 @@ table.ftp-table {
         </div>`;
 
         if (fatigued.length > 0) {
-            const fatigueName = (f) => Object.keys(FATIGUE_MAP).find(k => k.length >= 5 && FATIGUE_MAP[k] === f) || `${f}/10`;
-            html += `<div class="ftp-alert danger" style="margin-top:6px;"><span>\u26A0</span> <div><strong>Fatigued:</strong> ${fatigued.map(p => `${p.name} (${fatigueName(p.fatigue)})`).join(', ')}</div></div>`;
+            html += `<div class="ftp-alert danger" style="margin-top:6px;"><span>\u26A0</span> <div><strong>Fatigued:</strong> ${fatigued.map(p => `${p.name} (${fatigueLabel(p.fatigue)})`).join(', ')}</div></div>`;
         }
 
         if (isLimitedView) {
@@ -8622,7 +8618,7 @@ const progMap = { batting: 'batting', bowling: 'bowling', keeping: 'keeperbattin
         const isPaceOrWrist = ['rf', 'lf', 'rfm', 'lfm', 'rws', 'lws'].includes(player.bowlerType || '');
         const fieldingTier = isPaceOrWrist ? 11 : 12;
         if (age < 25 && player.fielding < fieldingTier && primarySkill >= 7) {
-            setProgram('fielding', `Age ${age}: Fielding second stage — ${skillLabel(player.fielding)} → ${skillLabel(fieldingTier)}. ${isPaceOrWrist ? 'Spectacular is the target for pace/wrist bowlers.' : 'Exceptional — batsmen, medium bowlers and finger spinners field most.'} Community schedule: primary to ~21, fielding to ${skillLabel(fieldingTier)}, primary to ~25, then strength/endurance.`, 'medium');
+            setProgram('fielding', `Age ${ageYears(age)}: Fielding second stage — ${skillLabel(player.fielding)} → ${skillLabel(fieldingTier)}. ${isPaceOrWrist ? 'Spectacular is the target for pace/wrist bowlers.' : 'Exceptional — batsmen, medium bowlers and finger spinners field most.'} Community schedule: primary to ~21, fielding to ${skillLabel(fieldingTier)}, primary to ~25, then strength/endurance.`, 'medium');
             return;
         }
 
@@ -8639,9 +8635,9 @@ const progMap = { batting: 'batting', bowling: 'bowling', keeping: 'keeperbattin
         // otherwise adjust for — a slow academy may need to start earlier.
         if (age >= 25 && age <= 29 && (player.power < 12 || player.endurance < 12)) {
             if (player.power >= 12) {
-                setProgram('fitness', `Age ${age}: Endurance phase — power is done (${skillLabel(player.power)}), endurance is ${skillLabel(player.endurance)}. Community schedule: Strength and Endurance each to Exceptional by ~29. Fitness trains endurance (and power as secondary).`, 'medium');
+                setProgram('fitness', `Age ${ageYears(age)}: Endurance phase — power is done (${skillLabel(player.power)}), endurance is ${skillLabel(player.endurance)}. Community schedule: Strength and Endurance each to Exceptional by ~29. Fitness trains endurance (and power as secondary).`, 'medium');
             } else {
-                setProgram('strength', `Age ${age}: Strength/Endurance phase — community schedule: both to Exceptional by ~29. Strength trains power (${skillLabel(player.power)}) and endurance (${skillLabel(player.endurance)}) together. Actual pace depends on your academy speed.`, 'medium');
+                setProgram('strength', `Age ${ageYears(age)}: Strength/Endurance phase — community schedule: both to Exceptional by ~29. Strength trains power (${skillLabel(player.power)}) and endurance (${skillLabel(player.endurance)}) together. Actual pace depends on your academy speed.`, 'medium');
             }
             return;
         }
@@ -8667,19 +8663,19 @@ const progMap = { batting: 'batting', bowling: 'bowling', keeping: 'keeperbattin
         const { isBowler, isKeeper } = ctx;
 
         if (player.endurance < 5) {
-            setProgram('fitness', `Age ${age}: Endurance (${skillLabel(player.endurance)}) is declining. Fitness maintains endurance and power.`, 'medium');
+            setProgram('fitness', `Age ${ageYears(age)}: Endurance (${skillLabel(player.endurance)}) is declining. Fitness maintains endurance and power.`, 'medium');
             return;
         }
         if (player.power < 5) {
-            setProgram('strength', `Age ${age}: Power (${skillLabel(player.power)}) is declining. Strength maintains power and endurance.`, 'low');
+            setProgram('strength', `Age ${ageYears(age)}: Power (${skillLabel(player.power)}) is declining. Strength maintains power and endurance.`, 'low');
             return;
         }
         if (isBowler) {
-            setProgram('bowling', `Age ${age}: Maintain bowling skill. Training can slow decline but not stop it.`, 'low');
+            setProgram('bowling', `Age ${ageYears(age)}: Maintain bowling skill. Training can slow decline but not stop it.`, 'low');
         } else if (isKeeper) {
-            setProgram('keeping', `Age ${age}: Maintain keeping skill. Training can slow decline but not stop it.`, 'low');
+            setProgram('keeping', `Age ${ageYears(age)}: Maintain keeping skill. Training can slow decline but not stop it.`, 'low');
         } else {
-            setProgram('batting', `Age ${age}: Maintain batting skill. Training can slow decline but not stop it.`, 'low');
+            setProgram('batting', `Age ${ageYears(age)}: Maintain batting skill. Training can slow decline but not stop it.`, 'low');
         }
     }
 
@@ -8724,7 +8720,7 @@ const progMap = { batting: 'batting', bowling: 'bowling', keeping: 'keeperbattin
         }
         const ageMult = getAgeTrainingMultiplier(player.age);
         if (ageMult.primary <= 0.5) {
-            rec.warnings.push(`Age ${player.age}: primary-skill training at ~${Math.round(ageMult.primary * 100)}% of a youth's rate. Prioritise the skills you still need most.`);
+            rec.warnings.push(`Age ${ageYears(player.age)}: primary-skill training at ~${Math.round(ageMult.primary * 100)}% of a youth's rate. Prioritise the skills you still need most.`);
         }
         ['batting', 'bowling', 'keeping', 'fielding'].forEach(skill => {
             const val = player[skill];
@@ -8941,9 +8937,9 @@ const progMap = { batting: 'batting', bowling: 'bowling', keeping: 'keeperbattin
                 const highRisk = players.filter(p => p.fatigue <= 2);
                 const moderateRisk = players.filter(p => p.fatigue === 3);
                 if (highRisk.length > 0) {
-                    return `<div class="ftp-alert danger" style="margin-top:4px;"><span>\ud83d\udea8</span><div>Injury risk: ${highRisk.map(p => `${p.name} (${SKILL_LABELS[p.fatigue]})`).join(', ')} — REST recommended, training gains severely penalised.</div></div>`;
+                    return `<div class="ftp-alert danger" style="margin-top:4px;"><span>\ud83d\udea8</span><div>Injury risk: ${highRisk.map(p => `${p.name} (${fatigueLabel(p.fatigue)})`).join(', ')} — REST recommended, training gains severely penalised.</div></div>`;
                 } else if (moderateRisk.length > 0) {
-                    return `<div class="ftp-alert warning" style="margin-top:4px;"><span>\u26A0</span><div>Fatigue building: ${moderateRisk.map(p => `${p.name} (${SKILL_LABELS[p.fatigue]})`).join(', ')} — 45% training penalty. Consider Rest.</div></div>`;
+                    return `<div class="ftp-alert warning" style="margin-top:4px;"><span>\u26A0</span><div>Fatigue building: ${moderateRisk.map(p => `${p.name} (${fatigueLabel(p.fatigue)})`).join(', ')} — 45% training penalty. Consider Rest.</div></div>`;
                 }
                 return '';
             })()}
@@ -9002,18 +8998,18 @@ const progMap = { batting: 'batting', bowling: 'bowling', keeping: 'keeperbattin
                 const moderateFatigue = players.filter(p => p.fatigue === 4);
                 if (severeFatigue.length > 0) {
                     matchNote += `<div class="ftp-alert danger" style="margin-top:4px;"><span>\u{1F6A8}</span><div><strong>REST recommended before the match:</strong><div class="vj-text-xs vj-mt-4">` +
-                        severeFatigue.map(p => `${p.name} (${SKILL_LABELS[p.fatigue]} — fatigue ${p.fatigue}/10)`).join(', ') +
+                        severeFatigue.map(p => `${p.name} (${fatigueLabel(p.fatigue)} — fatigue ${p.fatigue}/10)`).join(', ') +
                         `<br>These players will start the match with reduced energy if they train this week. Consider giving them Rest.</div></div></div>`;
                 }
                 if (moderateFatigue.length > 0 && severeFatigue.length === 0) {
                     matchNote += `<div class="ftp-alert warning" style="margin-top:4px;"><span>\u26A0</span><div>` +
-                        `Fatigued starters: ${moderateFatigue.map(p => `${p.name} (${SKILL_LABELS[p.fatigue]})`).join(', ')} — consider Rest if match fitness is priority.</div></div>`;
+                        `Fatigued starters: ${moderateFatigue.map(p => `${p.name} (${fatigueLabel(p.fatigue)})`).join(', ')} — consider Rest if match fitness is priority.</div></div>`;
                 }
             } else if (daysUntil <= 7) {
                 const severeFatigue = players.filter(p => p.fatigue <= 2);
                 if (severeFatigue.length > 0) {
                     matchNote += `<div class="ftp-alert warning" style="margin-top:4px;"><span>\u26A0</span><div>` +
-                        `Match in ${daysUntil} days: ${severeFatigue.map(p => `${p.name} (${SKILL_LABELS[p.fatigue]})`).join(', ')} are very fatigued — schedule Rest this week to recover in time.</div></div>`;
+                        `Match in ${daysUntil} days: ${severeFatigue.map(p => `${p.name} (${fatigueLabel(p.fatigue)})`).join(', ')} are very fatigued — schedule Rest this week to recover in time.</div></div>`;
                 }
             }
 
@@ -9025,7 +9021,11 @@ const progMap = { batting: 'batting', bowling: 'bowling', keeping: 'keeperbattin
 
             const recsContainer = document.getElementById('ftp-training-recs');
             if (recsContainer) {
-                recsContainer.insertAdjacentHTML('afterbegin', matchNote);
+                // The advisor renders twice per visit and each render's fetch
+                // lands here — replace, never stack a second copy.
+                const prev = document.getElementById('ftp-training-matchnote');
+                if (prev) prev.remove();
+                recsContainer.insertAdjacentHTML('afterbegin', `<div id="ftp-training-matchnote">${matchNote}</div>`);
             }
         });
     }
