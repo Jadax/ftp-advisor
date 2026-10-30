@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         FTP Advisor
 // @namespace    http://tampermonkey.net/
-// @version      8.110
+// @version      8.111
 // @description  Tactical/scouting advisor for fromthepavilion.org (cricket sim): team, tactics, pitch, training, transfer market, youth and squad plan advice with projections. Full changelog: github.com/Jadax/ftp-advisor
 // @author       Tushant Sharma
 // @license      MIT
@@ -11513,7 +11513,10 @@ const progMap = { batting: 'batting', bowling: 'bowling', keeping: 'keeperbattin
         // just found a non-grid view with no real skill data, in which
         // case a real background fetch of the actual grid view is the
         // only way to fix the cache.
-        if (pageType !== 'squad' || squadScrapeNeedsBackgroundFix) {
+        // Squad pages run it too (stale/corruption-gated, so normally a
+        // no-op): skipping it meant a cache missing the other age group or
+        // the summary-view fields (talents, hand) was never repaired there.
+        {
             const forceForSquadFix = pageType === 'squad' && squadScrapeNeedsBackgroundFix;
             // Force here too: the cache timestamp may have just been
             // written moments ago (possibly with the bad zero-skill data
