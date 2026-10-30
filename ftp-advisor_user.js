@@ -3805,7 +3805,8 @@ ${sw('ordersOn', 'Submit match orders (within ' + AUTOPILOT_ORDERS_WINDOW_HOURS 
 ${ck(cache && cache.ageHours < 6, `Squad data \u2014 ${cache ? esc(getCacheAgeText(cache.ageDays)) : 'not loaded'}`)}
 ${ck(st.trainingAt && Date.now() - st.trainingAt < PILOT_TRAINING_EVERY_H * 3600e3, `Training submitted \u2014 ${ago(st.trainingAt)}`)}
 ${matches.length ? matches.map(([id, m]) => ck(true, `Orders: ${esc(m.teams)} \u2014 ${ago(m.at)}${m.scouted ? ' \u00B7 opponent scouted' : ''}`)).join('') : ck(false, 'No orders submitted yet')}</div>
-<div class="sec"><div class="btns"><button class="btn pri" data-a="run">Run now</button><button class="btn" data-a="preview">Preview</button></div></div>
+<div class="sec"><div class="btns"><button class="btn pri" data-a="run">Run now</button><button class="btn" data-a="preview">Preview</button></div>
+<div class="btns" style="margin-top:6px;"><button class="btn" data-a="export">Export database (${Object.keys(loadMatchDb()).length} matches)</button></div></div>
 <div class="sec"><div class="h">Activity</div>${(st.log || []).slice(-12).reverse().map(l => `<div class="lg"><em>${esc(ago(l.t))}</em> \u00B7 ${esc(l.msg)}</div>`).join('') || '<div class="lg">Nothing yet.</div>'}</div>`;
         }
         function refresh() {
@@ -3858,12 +3859,21 @@ ${matches.length ? matches.map(([id, m]) => ck(true, `Orders: ${esc(m.teams)} \u
             if (t.dataset.a === 'close') return toggle(false);
             if (t.dataset.a === 'run') return run(false);
             if (t.dataset.a === 'preview') return run(true);
+            if (t.dataset.a === 'export') { const n = exportAdvisorDatabase(); return toast(`Exported ${n} matches \u2014 save the file into the project's data/ folder`); }
         }
         // Background pass: only when switched on, throttled, and never while
         // the user is on the orders/training page itself (their own edits).
         function background(pageType) {
             const st = pilotState();
-            if (!st.enabled || pageType === 'orders' || pageType === 'training') return;
+            if (pageType === 'orders' || pageType === 'training') return;
+            // Recording results is read-only, so it runs even with the
+            // autopilot switched off.
+            if (!st.enabled) {
+                if (Date.now() - (st.ingestAt || 0) > MATCH_DB_INGEST_EVERY_H * 3600e3) {
+                    ingestCompletedMatches((m) => toast(m)).then(() => refresh()).catch(e => console.warn('[FTP Advisor] result recording failed:', e));
+                }
+                return;
+            }
             if (Date.now() - (st.lastRun || 0) < PILOT_BACKGROUND_EVERY_MIN * 6e4) return;
             const lines = [];
             runAutoPilot({ log: (m) => lines.push(m), status }).then(() => {
@@ -9837,6 +9847,7 @@ const progMap = { batting: 'batting', bowling: 'bowling', keeping: 'keeperbattin
                 const st = pilotState();
                 st.orders[gameId] = { sig, at: Date.now(), teams: match.teams, scouted: !!plan.opponentCache };
                 savePilotState(st);
+                try { recordPreMatch(gameId, match, plan); } catch (e) { console.warn('[FTP Advisor] match snapshot failed:', e); }
             }
             const c = plan.context;
             const captain = plan.battingOrder.find(p => p.isCaptain), keeper = plan.battingOrder.find(p => p.role === 'WK');
@@ -9867,6 +9878,167 @@ const progMap = { batting: 'batting', bowling: 'bowling', keeping: 'keeperbattin
         const st = pilotState();
         st.log.push({ t: Date.now(), msg });
         savePilotState(st);
+    }
+
+
+    // ============================================================
+    // MATCH DATABASE — the advisor's own record of every match, so tactics
+    // can be judged against what actually happened without screenshots or
+    // pastes. Per gameId:
+    //   pre      — snapshot when the autopilot saved orders: conditions,
+    //              XI + bench with skills/fatigue/form, bowling plan, toss,
+    //              captain/keeper, the scouted opponent squad.
+    //   result   — ingested after the match from the game's own pages
+    //              (live-verified 2026-10): gamedetails.htm (pitch, weather,
+    //              result, ground, crowd), game.htm (scorecard, same parser
+    //              as pasted HTML, also fed into ftp_match_history so the
+    //              Match Orders/Ground evidence grows by itself) and
+    //              ratings.htm (the ENGINE's team ratings per department —
+    //              ground truth to calibrate the scoring against).
+    // "Export database" downloads it all as one JSON file to keep in the
+    // project's data/ folder for offline review.
+    // ============================================================
+    const MATCH_DB_KEY = 'ftp_match_db';
+    const MATCH_DB_MAX = 300;
+    const MATCH_DB_INGEST_EVERY_H = 6;
+    const MATCH_DB_INGEST_PER_RUN = 12;
+    function loadMatchDb() {
+        try { return JSON.parse(GM_getValue(MATCH_DB_KEY, '{}')) || {}; } catch (e) { return {}; }
+    }
+    function saveMatchDb(db) {
+        Object.keys(db).sort((a, b) => (db[b].date || 0) - (db[a].date || 0)).slice(MATCH_DB_MAX).forEach(id => { delete db[id]; });
+        GM_setValue(MATCH_DB_KEY, JSON.stringify(db));
+    }
+    function matchDbPlayer(p) {
+        return {
+            id: p.id, name: p.name, age: Math.round((p.age || 0) * 100) / 100,
+            bat: p.batting, bowl: p.bowling, tech: p.technique, pow: p.power, keep: p.keeping, field: p.fielding,
+            end: p.endurance, exp: p.experience, capt: p.captaincy, fat: p.fatigue, form: p.form,
+            bt: p.bowlerType || '', lh: !!p.isLeftHanded, talents: p.talents || []
+        };
+    }
+    function recordPreMatch(gameId, match, plan) {
+        const db = loadMatchDb();
+        const c = plan.context;
+        const xiIds = new Set(plan.battingOrder.map(p => String(p.id)));
+        db[gameId] = Object.assign(db[gameId] || {}, {
+            gameId, teams: match.teams, date: match.matchDate.getTime(), league: match.matchClass || '',
+            pre: {
+                at: Date.now(), matchType: c.matchType, overs: c.overs, pitch: c.pitch, weather: c.weather,
+                isHome: c.isHome, isYouth: !!c.isYouthOnly, isFriendly: !!c.isFriendly, toss: plan.tossRec.decision,
+                xi: plan.battingOrder.map(p => Object.assign(matchDbPlayer(p), { pos: p.position, batTactic: p.battingTactic, captain: !!p.isCaptain, wk: p.role === 'WK' })),
+                bench: plan.enrichedPlayers.filter(p => !xiIds.has(String(p.id))).map(matchDbPlayer),
+                bowling: plan.bowling.map(sp => ({ id: sp.player.id, name: sp.player.name, end: sp.end, start: sp.startOver, overs: sp.overs, tactic: sp.tactic })),
+                opponent: plan.opponentCache ? {
+                    teamId: plan.opponentTeamId,
+                    players: plan.opponentCache.players.map(p => ({ name: p.name, age: Math.round((p.age || 0) * 100) / 100, youth: !!p.isYouth, bt: p.bowlerType || '', lh: !!p.isLeftHanded, exp: p.experience, form: p.form, fat: p.fatigue, capt: p.captaincy, rating: p.rating, talents: p.talents || [] }))
+                } : null
+            }
+        });
+        saveMatchDb(db);
+    }
+
+    function fetchGameDoc(url) {
+        return new Promise((resolve) => {
+            _queuedRequest({
+                method: 'GET', url, timeout: 15000,
+                onload: (r) => resolve(r.status === 200 ? new DOMParser().parseFromString(r.responseText, 'text/html') : null),
+                onerror: () => resolve(null), ontimeout: () => resolve(null)
+            });
+        });
+    }
+    function parseGameDetailsDoc(doc) {
+        const out = {};
+        doc.querySelectorAll('th').forEach(th => {
+            const td = th.nextElementSibling;
+            if (!td || td.tagName !== 'TD') return;
+            const k = th.textContent.trim().toLowerCase();
+            const v = td.textContent.replace(/\s+/g, ' ').trim();
+            if (k && v && out[k] == null) out[k] = v;
+        });
+        return { league: out.league || '', date: out.date || '', ground: out.ground || '', result: out.result || '', weather: out.weather || '', pitch: out.pitch || '', home: out.home || '', away: out.away || '', crowd: parseInt((out.crowd || '').replace(/,/g, ''), 10) || 0 };
+    }
+    // ratings.htm: rows "Batting - Top Order | 4,593 | 2,892", "Bowling -
+    // Seam | 3,802 (14) | 2,624 (20)" (bracket = overs bowled by that type).
+    function parseMatchRatingsDoc(doc) {
+        const table = [...doc.querySelectorAll('table')].find(t => /Batting - Top Order/i.test(t.textContent));
+        if (!table) return null;
+        const rows = [...table.querySelectorAll('tr')].map(r => [...r.querySelectorAll('th,td')].map(c => c.textContent.replace(/\s+/g, ' ').trim()));
+        const head = rows.find(r => r.length >= 3 && !/\d/.test(r[1] + r[2])) || ['', 'home', 'away'];
+        const KEY = { 'batting - top order': 'batTop', 'batting - middle order': 'batMiddle', 'batting - tail': 'batTail', 'bowling - seam': 'seam', 'bowling - spin': 'spin', 'fielding/keeping': 'field', 'overall': 'overall' };
+        const val = (t) => { const m = (t || '').match(/([\d,]+)(?:\s*\((\d+)\))?/); return m ? { v: parseInt(m[1].replace(/,/g, ''), 10), overs: m[2] != null ? parseInt(m[2], 10) : undefined } : null; };
+        const a = { team: head[1] }, b = { team: head[2] };
+        rows.forEach(r => { const k = KEY[(r[0] || '').toLowerCase()]; if (k && r.length >= 3) { a[k] = val(r[1]); b[k] = val(r[2]); } });
+        return [a, b];
+    }
+    async function ingestCompletedMatches(log) {
+        const fx = await fetchGameDoc(`https://www.fromthepavilion.org/teamfixtures.htm?teamId=${TEAM_ID}`);
+        if (!fx) return 0;
+        const db = loadMatchDb();
+        const done = [];
+        fx.querySelectorAll('table.data tr').forEach(tr => {
+            const tds = tr.querySelectorAll('td');
+            const link = tr.querySelector('a[href*="game.htm?gameId="]');
+            if (tds.length < 4 || !link) return;
+            const resultText = tds[3].textContent.trim();
+            const gameId = (link.getAttribute('href').match(/gameId=(\d+)/) || [])[1];
+            if (gameId && resultText && !(db[gameId] && db[gameId].result)) done.push({ gameId, dateText: tds[0].textContent.trim(), league: tds[1].textContent.trim(), teams: tds[2].textContent.replace(/\s+/g, ' ').trim() });
+        });
+        let n = 0;
+        for (const m of done.slice(-MATCH_DB_INGEST_PER_RUN)) {
+            const [details, card, ratingsDoc] = [
+                await fetchGameDoc(`https://www.fromthepavilion.org/gamedetails.htm?gameId=${m.gameId}`),
+                await fetchGameDoc(`https://www.fromthepavilion.org/game.htm?gameId=${m.gameId}`),
+                await fetchGameDoc(`https://www.fromthepavilion.org/ratings.htm?gameId=${m.gameId}`)
+            ];
+            if (!details || !card) continue;
+            const d = parseGameDetailsDoc(details);
+            const sc = parseScorecardFromHTMLDoc(card);
+            if (sc) {
+                sc.pitch = sc.pitch || d.pitch || undefined;
+                sc.weather = sc.weather || d.weather || undefined;
+                sc.ground = sc.ground || d.ground || undefined;
+                sc.league = d.league || m.league;
+                sc.gameId = m.gameId;
+                saveMatchesToHistory([sc]);
+            }
+            const date = new Date(m.dateText.replace(/(\d+) (\w+) (\d+) (\d+):(\d+)/, '$2 $1, $3 $4:$5')).getTime() || 0;
+            db[m.gameId] = Object.assign(db[m.gameId] || {}, {
+                gameId: m.gameId, teams: m.teams, date: (db[m.gameId] && db[m.gameId].date) || date, league: d.league || m.league,
+                conditions: { pitch: d.pitch, weather: d.weather, ground: d.ground, crowd: d.crowd, home: d.home, away: d.away },
+                result: {
+                    text: d.result || (sc && sc.result) || '', toss: sc ? sc.toss : '', motm: sc ? sc.motm : '',
+                    innings: sc ? sc.innings.map(i => ({ batting: i.battingTeam, bowling: i.bowlingTeam, runs: i.runs, wickets: i.wickets, overs: i.overs, fall: i.fall, batting_card: i.battingPlayers, bowling_card: i.bowlingPlayers })) : []
+                },
+                ratings: ratingsDoc ? parseMatchRatingsDoc(ratingsDoc) : null,
+                ingestedAt: Date.now()
+            });
+            n++;
+        }
+        if (n) { saveMatchDb(db); if (log) log(`\u{1F4DA} Recorded ${n} completed match${n > 1 ? 'es' : ''} (scorecard, conditions, engine ratings)`); }
+        const st = pilotState(); st.ingestAt = Date.now(); savePilotState(st);
+        return n;
+    }
+
+    function exportAdvisorDatabase() {
+        const opponents = {};
+        GM_listValues().filter(k => k.startsWith(OPPONENT_CACHE_PREFIX)).forEach(k => {
+            try { opponents[k.slice(OPPONENT_CACHE_PREFIX.length)] = JSON.parse(GM_getValue(k, 'null')); } catch (e) { /* skip */ }
+        });
+        const squad = loadPlayerCache();
+        const data = {
+            kind: 'ftp-advisor-db', version: (GM_info && GM_info.script && GM_info.script.version) || '', exportedAt: new Date().toISOString(), teamId: TEAM_ID,
+            matches: loadMatchDb(), matchHistory: loadMatchHistory(), squad: squad ? squad.players : [], opponents,
+            ground: loadGroundCache(), academy: loadAcademyCache(), finance: loadFinanceCache(), autopilot: pilotState()
+        };
+        const blob = new Blob([JSON.stringify(data, null, 1)], { type: 'application/json' });
+        const a = document.createElement('a');
+        a.href = URL.createObjectURL(blob);
+        a.download = `ftp-advisor-db-${new Date().toISOString().slice(0, 10)}.json`;
+        document.body.appendChild(a);
+        a.click();
+        setTimeout(() => { URL.revokeObjectURL(a.href); a.remove(); }, 1000);
+        return Object.keys(data.matches).length;
     }
 
     let _autoPilotRunning = false;
@@ -9900,7 +10072,11 @@ const progMap = { batting: 'batting', bowling: 'bowling', keeping: 'keeperbattin
                     }
                 }
             }
-            if (!dryRun) { const st = pilotState(); st.lastRun = Date.now(); savePilotState(st); }
+            if (!dryRun) {
+                status('Recording results');
+                try { await ingestCompletedMatches(say); } catch (e) { say(`\u26A0 Result recording: ${e.message}`); }
+                const st = pilotState(); st.lastRun = Date.now(); savePilotState(st);
+            }
             return true;
         } finally {
             _autoPilotRunning = false;
