@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         FTP Advisor
 // @namespace    http://tampermonkey.net/
-// @version      8.107
+// @version      8.108
 // @description  Tactical/scouting advisor for fromthepavilion.org (cricket sim): team, tactics, pitch, training, transfer market, youth and squad plan advice with projections. Full changelog: github.com/Jadax/ftp-advisor
 // @author       Tushant Sharma
 // @license      MIT
@@ -5821,11 +5821,124 @@ const MAX_OVERS_PER_BOWLER = { OD: 10, YOD: 8, T20: 4, YT20: 4 };
 
         // Display bowling
         displayBowling(bowling, opponentAnalysis, context.overs, context.matchType);
+
+        const coverageOk = !context.overs || validateSpellCoverage(bowling, context.overs).ok;
+        const tossEl = document.getElementById('ftp-toss');
+        if (tossEl && coverageOk) {
+            tossEl.insertAdjacentHTML('afterbegin', `<div class="vj-flex vj-gap-6 vj-mb-8" style="align-items:center;flex-wrap:wrap;"><button id="ftp-fill-orders" class="vj-btn vj-btn-sm" style="font-size:12px;padding:4px 10px;cursor:pointer;">\u2B07 Fill orders into the form</button><span id="ftp-fill-result" class="vj-text-xs vj-text-muted">Fills only \u2014 you review and press Save Orders.</span></div>`);
+            document.getElementById('ftp-fill-orders').addEventListener('click', () => {
+                const res = fillOrdersForm({
+                    batting: battingOrder.map(p => ({ id: p.id, name: p.name, tactic: p.battingTactic })),
+                    captainId: (battingOrder.find(p => p.isCaptain) || {}).id,
+                    keeperId: (battingOrder.find(p => p.role === 'WK') || {}).id,
+                    batFirst: tossRec.decision === 'bat',
+                    spells: bowling.map(sp => ({ id: sp.player.id, name: sp.player.name, startOver: sp.startOver, overs: sp.overs, tactic: sp.tactic }))
+                });
+                const out = document.getElementById('ftp-fill-result');
+                if (out) out.innerHTML = res.ok
+                    ? '<span style="color:var(--vj-green);">\u2713 Filled and checked against the page \u2014 review, then press Save Orders.</span>'
+                    : `<span style="color:var(--vj-red);">\u26A0 ${res.problems.map(escapeHtml).join(' \u00B7 ')} \u2014 fix those by hand before saving.</span>`;
+            });
+        }
         } catch (err) {
             console.error('[FTP Advisor] Error in updateOrdersAdvisor:', err);
             const ctx = document.getElementById('ftp-context');
             if (ctx) ctx.innerHTML = `<div class="ftp-alert danger">Error: ${err.message}<div class="vj-text-xs vj-mt-4">Check console (F12) for details.</div></div>`;
         }
+    }
+
+    // Writes a plan into the game's own orders form WITHOUT submitting —
+    // the user reviews and presses Save Orders. Live-verified DOM
+    // (orders.htm, 2026-10): batting[i].player selects + .battingtactics
+    // text inputs (toggle 2 Normal / 4 Defensive / 5 Aggressive), #captain,
+    // #keeper, gameTeam.tossBatFirst ("true" = bat), and per end
+    // #bowlingEndOdd / #bowlingEndEven .spell blocks (.bowler, .spellLength,
+    // .bowlingtactics toggle 2/3/1, .startOver which the page renumbers
+    // itself from spell lengths). Spell count per end is changed with the
+    // page's own .addSpell / .deleteSpell buttons (min _minSpells, max
+    // _maxSpells per end); its submit handler renames every spell's fields,
+    // so cloned slots are safe. Bowler changes only re-tally overs (no
+    // duplicate-clearing), so one bowler in two spells is fine.
+    function fillOrdersForm(plan) {
+        const problems = [];
+        const setVal = (el, v) => {
+            if (!el) return false;
+            el.value = String(v);
+            if (String(el.value) !== String(v)) return false;
+            el.dispatchEvent(new Event('change', { bubbles: true }));
+            return true;
+        };
+        const setTactic = (input, value, codes) => {
+            if (!input) return;
+            input.value = String(value);
+            input.setAttribute('value', String(value));
+            const title = value === codes.defensive ? 'Defensive' : value === codes.aggressive ? 'Aggressive' : 'Normal';
+            const btn = input.parentElement && input.parentElement.querySelector('input[type=button]');
+            if (btn) { btn.className = 'tactics' + title; btn.title = title; }
+        };
+        const BAT = { normal: 2, defensive: 4, aggressive: 5 };
+        const BOWL = { normal: 2, defensive: 3, aggressive: 1 };
+
+        plan.batting.forEach((b, i) => {
+            if (!setVal(document.querySelector(`select[name="batting[${i}].player"]`), b.id)) problems.push(`batting #${i + 1}: ${b.name} not selectable`);
+            setTactic(document.querySelector(`input[name="batting[${i}].battingTactic"]`), b.tactic || BAT.normal, BAT);
+        });
+        if (plan.captainId != null && !setVal(document.getElementById('captain'), plan.captainId)) problems.push('captain not selectable');
+        if (plan.keeperId != null && !setVal(document.getElementById('keeper'), plan.keeperId)) problems.push('keeper not selectable');
+        if (plan.batFirst != null) setVal(document.querySelector('select[name="gameTeam.tossBatFirst"]'), plan.batFirst ? 'true' : 'false');
+
+        [['#bowlingEndOdd', 1], ['#bowlingEndEven', 0]].forEach(([sel, parity]) => {
+            const end = document.querySelector(sel);
+            if (!end) { problems.push(`${sel} not found`); return; }
+            const want = plan.spells.filter(s => s.startOver % 2 === parity).sort((a, b) => a.startOver - b.startOver);
+            const slots = () => end.querySelectorAll('.spell');
+            for (let guard = 0; slots().length < want.length && guard < 20; guard++) {
+                const add = end.querySelector('.addSpell');
+                if (!add) break;
+                add.click();
+            }
+            for (let guard = 0; slots().length > want.length && guard < 20; guard++) {
+                const all = slots();
+                const del = all[all.length - 1].querySelector('.deleteSpell');
+                const before = all.length;
+                if (!del) break;
+                del.click();
+                if (slots().length === before) break; // page refused (min spells per end)
+            }
+            const s = slots();
+            if (s.length !== want.length) problems.push(`${sel}: needs ${want.length} spells, page allows ${s.length}`);
+            want.forEach((sp, i) => {
+                if (!s[i]) return;
+                if (!setVal(s[i].querySelector('.bowler'), sp.id)) problems.push(`spell ${sp.startOver}: ${sp.name} not selectable`);
+                if (!setVal(s[i].querySelector('.spellLength'), sp.overs)) problems.push(`spell ${sp.startOver}: length ${sp.overs} not allowed`);
+                setTactic(s[i].querySelector('.bowlingtactics'), sp.tactic || BOWL.normal, BOWL);
+            });
+            for (let i = want.length; i < s.length; i++) setVal(s[i].querySelector('.bowler'), '');
+        });
+
+        // Read back what the page now holds — the page renumbers start
+        // overs itself, so this proves the plan landed on the right overs.
+        const landed = [];
+        document.querySelectorAll('#bowlingEndOdd .spell, #bowlingEndEven .spell').forEach(s => {
+            const id = s.querySelector('.bowler') && s.querySelector('.bowler').value;
+            if (id) landed.push({ id, startOver: parseInt(s.querySelector('.startOver').value, 10), overs: parseInt(s.querySelector('.spellLength').value, 10) });
+        });
+        plan.spells.forEach(sp => {
+            if (!landed.some(l => String(l.id) === String(sp.id) && l.startOver === sp.startOver && l.overs === sp.overs)) {
+                problems.push(`${sp.name} ${sp.startOver}#${sp.overs} did not land as planned`);
+            }
+        });
+        return { ok: problems.length === 0, problems, landed };
+    }
+
+    // The allocator's internal end keys ('Gibson' = odd overs, 'Southern' =
+    // even) predate reading the page; the orders page names its ends per
+    // ground ("Northern End"), so show those to make transcription obvious.
+    function orderPageEndName(endKey) {
+        const el = document.querySelector(endKey === 'Gibson' ? '#bowlingEndOdd' : '#bowlingEndEven');
+        const label = el && el.querySelector('h3,h4,.endname,th,b');
+        const text = label ? label.textContent.trim().replace(/\s*end$/i, '') : '';
+        return text || (endKey === 'Gibson' ? 'Odd-over' : 'Even-over');
     }
 
     function displayBattingOrder(battingOrder, opponentAnalysis, context) {
@@ -6054,7 +6167,7 @@ const MAX_OVERS_PER_BOWLER = { OD: 10, YOD: 8, T20: 4, YT20: 4 };
                     (x.spell.end || (x.index % 2 === 0 ? 'Gibson' : 'Southern')) === end)
                 .sort((a, b) => (a.spell.startOver || 0) - (b.spell.startOver || 0));
             if (endSpells.length === 0) return;
-            html += `<div class="ftp-spell-end-heading ${end === 'Gibson' ? 'gibson' : 'southern'}">${end === 'Gibson' ? '\u25B6' : '\u25C0'} ${end} end</div>`;
+            html += `<div class="ftp-spell-end-heading ${end === 'Gibson' ? 'gibson' : 'southern'}">${end === 'Gibson' ? '\u25B6' : '\u25C0'} ${orderPageEndName(end)} end</div>`;
             endSpells.forEach(({ spell }) => {
                 const tacLabel = spell.tactic === 1 ? 'A' : spell.tactic === 3 ? 'D' : 'N';
                 const tacClass = 'ftp-tactic-' + tacLabel;
@@ -6062,7 +6175,7 @@ const MAX_OVERS_PER_BOWLER = { OD: 10, YOD: 8, T20: 4, YT20: 4 };
                 html += `<div class="ftp-spell ${end === 'Gibson' ? 'gibson' : 'southern'}">
                     <div class="ftp-spell-main">
                         <div class="ftp-spell-line1">
-                            <span class="ftp-spell-end ${end === 'Gibson' ? 'gibson' : 'southern'}">${end === 'Gibson' ? '\u25B6' : '\u25C0'} ${end}</span>
+                            <span class="ftp-spell-end ${end === 'Gibson' ? 'gibson' : 'southern'}">${end === 'Gibson' ? '\u25B6' : '\u25C0'} ${orderPageEndName(end)}</span>
                             <span class="ftp-spell-inputs">1st Over: ${spell.startOver} \u00B7 #: ${spell.overs}</span>
                             <span class="${tacClass}">${tacLabel}</span>
                         </div>
@@ -7799,7 +7912,14 @@ table.ftp-table {
         'batting': 'Batting', 'bowling': 'Bowling', 'keeping': 'Keeping',
         'fielding': 'Fielding', 'fitness': 'Fitness', 'allrounder': 'All-rounder',
         'battingtech': 'Batting technique', 'bowlingtech': 'Bowling technique',
-        'strength': 'Strength', 'rest': 'Rest', 'keeperbatting': 'Keeper-Batting'
+        'strength': 'Strength', 'rest': 'Rest', 'keeperbatting': 'Keeper-Batsman'
+    };
+    // The training form's option VALUES (live-verified training.htm, 2026-10)
+    // — matched first because labels drifted once ("Keeper-Batting" vs the
+    // game's "Keeper-Batsman" silently skipped every such recommendation).
+    const TRAINING_PROGRAM_IDS = {
+        batting: '1', bowling: '2', keeping: '3', fielding: '4', fitness: '5', allrounder: '6',
+        battingtech: '7', bowlingtech: '8', strength: '9', rest: '10', keeperbatting: '11'
     };
 
     // Reverse map from display name to key
@@ -9269,8 +9389,15 @@ const progMap = { batting: 'batting', bowling: 'bowling', keeping: 'keeperbattin
             const programLabel = TRAINING_PROGRAM_LABELS[programKey];
             if (!programLabel) return;
 
-            // Find the option with matching text
             const select = p.selectElement;
+            const wantId = TRAINING_PROGRAM_IDS[programKey];
+            const byId = [...select.options].findIndex(o => o.value === wantId && o.textContent.trim().toLowerCase().startsWith(programLabel.toLowerCase().slice(0, 4)));
+            if (byId >= 0) {
+                select.selectedIndex = byId;
+                select.dispatchEvent(new Event('change', { bubbles: true }));
+                applied++;
+                return;
+            }
             for (let i = 0; i < select.options.length; i++) {
                 if (select.options[i].textContent.trim().toLowerCase() === programLabel.toLowerCase()) {
                     select.selectedIndex = i;
