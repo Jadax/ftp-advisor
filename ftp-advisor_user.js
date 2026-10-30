@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         FTP Advisor
 // @namespace    http://tampermonkey.net/
-// @version      8.109
+// @version      8.110
 // @description  Tactical/scouting advisor for fromthepavilion.org (cricket sim): team, tactics, pitch, training, transfer market, youth and squad plan advice with projections. Full changelog: github.com/Jadax/ftp-advisor
 // @author       Tushant Sharma
 // @license      MIT
@@ -1645,6 +1645,39 @@
 
     // ── Squad cache (senior + youth) ──────────────────────────
     function savePlayerCache(players) { _saveCache(CACHE_KEY, CACHE_TIMESTAMP_KEY, players); }
+    // A squad PAGE shows one age group in the grid view, which has no
+    // talents / batting hand / current training (those come from the
+    // summary view). Saving the page as the whole cache dropped the other
+    // group and every one of those fields until the next background
+    // refetch (seen live: 32 players -> 15 seniors with no youths). Merge
+    // instead: page fields win, cache-only fields survive, and only players
+    // of the page's own group who are no longer listed are dropped.
+    const CACHE_ONLY_FIELDS = ['talents', 'isLeftHanded', 'currentTraining', 'wage', 'rating'];
+    function mergePagePlayersIntoCache(pagePlayers) {
+        const cache = loadPlayerCache();
+        const cached = cache && Array.isArray(cache.players) ? cache.players : [];
+        const pageIsYouth = pagePlayers.length > 0 && pagePlayers.every(p => p.isYouth === true || (p.isSenior !== true && (p.age || 0) < 21));
+        const byId = new Map(cached.map(p => [String(p.id), p]));
+        const merged = pagePlayers.map(p => {
+            const old = byId.get(String(p.id));
+            if (!old) return p;
+            const out = Object.assign({}, old, p);
+            CACHE_ONLY_FIELDS.forEach(f => {
+                const v = p[f];
+                const empty = v == null || v === 0 || v === '' || (Array.isArray(v) && v.length === 0) || (f === 'isLeftHanded' && v === false);
+                if (empty && old[f] != null) out[f] = old[f];
+            });
+            return out;
+        });
+        const pageIds = new Set(pagePlayers.map(p => String(p.id)));
+        cached.forEach(p => {
+            if (pageIds.has(String(p.id))) return;
+            const cachedIsYouth = p.isYouth === true || (p.isSenior !== true && (p.age || 0) < 21);
+            if (cachedIsYouth !== pageIsYouth) merged.push(p);
+        });
+        savePlayerCache(merged);
+        return merged;
+    }
     function loadPlayerCache() {
         const r = _loadCacheWithAge(CACHE_KEY, CACHE_TIMESTAMP_KEY);
         return r ? { players: r.parsed, timestamp: r.timestamp, ageHours: r.ageHours, ageDays: r.ageDays } : null;
@@ -3128,46 +3161,8 @@
                 url: url,
                 timeout: 15000,
                 onload: function(response) {
-                    if (response.status === 200) {
-                        const parser = new DOMParser();
-                        const doc = parser.parseFromString(response.responseText, 'text/html');
-                        const info = { pitch: 'Even', weather: 'Sunny', pitchValue: 5, capacity: 0, groundName: '', lastUpgraded: '', nextUpgrade: '' };
-                        const allThs = doc.querySelectorAll('th');
-                        allThs.forEach(th => {
-                            const thText = th.textContent.trim();
-                            const td = th.nextElementSibling;
-                            if (!td) return;
-                            const label = thText.toLowerCase();
-                            if (label.includes('pitch')) {
-                                const popuphelp = td.querySelector('.popuphelp');
-                                if (popuphelp) {
-                                    const title = popuphelp.getAttribute('title') || '';
-                                    info.pitch = title.split('|')[0].trim() || td.textContent.trim();
-                                } else {
-                                    info.pitch = td.textContent.trim();
-                                }
-                            } else if (label.includes('weather')) {
-                                const popuphelp = td.querySelector('.popuphelp');
-                                if (popuphelp) {
-                                    const title = popuphelp.getAttribute('title') || '';
-                                    info.weather = title.split('|')[0].trim() || td.textContent.trim();
-                                } else {
-                                    info.weather = td.textContent.trim();
-                                }
-                            } else if (label.includes('capacity')) {
-                                info.capacity = parseInt(td.textContent.trim().replace(/,/g, '')) || 0;
-                            } else if (label.includes('ground name')) {
-                                info.groundName = td.textContent.trim();
-                            } else if (label.includes('last upgraded')) {
-                                info.lastUpgraded = td.textContent.trim();
-                            } else if (label.includes('next upgrade')) {
-                                info.nextUpgrade = td.textContent.trim();
-                            }
-                        });
-                        resolve(info);
-                    } else {
-                        reject(new Error(`HTTP ${response.status}`));
-                    }
+                    if (response.status === 200) resolve(parseGroundDoc(new DOMParser().parseFromString(response.responseText, 'text/html')));
+                    else reject(new Error(`HTTP ${response.status}`));
                 },
                 onerror: function(err) { reject(err); },
                 ontimeout: function() { reject(new Error('Timeout')); }
@@ -4070,6 +4065,10 @@
         if ((!foundPitchRow || !foundWeatherRow) && context.isHome === true) {
             const ground = loadGroundCache();
             if (ground) {
+                // Each competition has its own pitch — prefer the class this
+                // match is played under.
+                const classPitch = ground.pitches && ground.pitches[GROUND_CLASS_FOR_FORMAT[context.matchType]];
+                if (classPitch) ground.pitch = classPitch;
                 if (!foundPitchRow && ground.pitch && PITCH_EFFECTS[ground.pitch]) {
                     context.pitch = ground.pitch;
                     context.pitchFromCache = true;
@@ -7959,7 +7958,7 @@ table.ftp-table {
         }
 
         if (isMyTeam) {
-            savePlayerCache(players);
+            mergePagePlayersIntoCache(players);
         } else {
             saveOpponentCache(teamId, players);
         }
@@ -7978,7 +7977,8 @@ table.ftp-table {
         </div>`;
 
         if (fatigued.length > 0) {
-            html += `<div class="ftp-alert danger" style="margin-top:6px;"><span>\u26A0</span> <div><strong>Fatigued:</strong> ${fatigued.map(p => `${p.name} (${skillLabel(p.fatigue).slice(0,3)})`).join(', ')}</div></div>`;
+            const fatigueName = (f) => Object.keys(FATIGUE_MAP).find(k => k.length >= 5 && FATIGUE_MAP[k] === f) || `${f}/10`;
+            html += `<div class="ftp-alert danger" style="margin-top:6px;"><span>\u26A0</span> <div><strong>Fatigued:</strong> ${fatigued.map(p => `${p.name} (${fatigueName(p.fatigue)})`).join(', ')}</div></div>`;
         }
 
         if (isLimitedView) {
@@ -9561,20 +9561,48 @@ const progMap = { batting: 'batting', bowling: 'bowling', keeping: 'keeperbattin
     // GROUND PAGE SCRAPER (when user visits the page)
     // Parses capacity, ground name, last upgraded from DOM.
     // ============================================================
-    function scrapeGroundPage() {
-        const info = { capacity: 0, groundName: '', lastUpgraded: '', nextUpgrade: '' };
-        const rows = document.querySelectorAll('table.data tr');
-        rows.forEach(row => {
+    // Live-verified ground.htm (2026-10): info rows are th/td pairs
+    // ("Capacity:"), each competition's pitch is a row whose first td is the
+    // class ("One Day") and second td a popuphelp "Uneven|…", and the
+    // forecast is rows of "Fri 30 Oct 26" + popuphelp "Humid|…". The page
+    // has no "Pitch"/"Weather" label cells, so the old parser always fell
+    // back to its Even/Sunny defaults. Shared by the page scrape and the
+    // background fetch (they had drifted: the page scrape saved no pitch).
+    const GROUND_CLASS_FOR_FORMAT = { OD: 'One Day', T20: 'Twenty20', YOD: 'Youth', YT20: 'Youth Twenty20' };
+    function parseGroundDoc(doc) {
+        const info = { pitch: '', weather: '', pitches: {}, forecast: [], capacity: 0, groundName: '', lastUpgraded: '', nextUpgrade: '' };
+        const tipName = (el) => {
+            const tip = el && el.querySelector('.popuphelp');
+            return tip ? ((tip.getAttribute('title') || '').split('|')[0].trim() || tip.textContent.trim()) : '';
+        };
+        doc.querySelectorAll('table.data tr').forEach(row => {
             const th = row.querySelector('th');
-            const td = row.querySelector('td');
-            if (!th || !td) return;
-            const label = th.textContent.trim().toLowerCase();
-            const value = td.textContent.trim();
-            if (label.includes('capacity')) info.capacity = parseInt(value.replace(/,/g, '')) || 0;
-            else if (label.includes('ground name')) info.groundName = value;
-            else if (label.includes('last upgraded')) info.lastUpgraded = value;
-            else if (label.includes('next upgrade')) info.nextUpgrade = value;
+            const tds = row.querySelectorAll('td');
+            if (th && tds.length) {
+                const label = th.textContent.trim().toLowerCase();
+                const value = tds[0].textContent.trim();
+                if (label.includes('capacity')) info.capacity = parseInt(value.replace(/,/g, ''), 10) || 0;
+                else if (label.includes('ground name')) info.groundName = value;
+                else if (label.includes('last upgraded')) info.lastUpgraded = value;
+                else if (label.includes('next upgrade')) info.nextUpgrade = value;
+                return;
+            }
+            if (tds.length < 2) return;
+            const first = tds[0].textContent.trim();
+            const named = tipName(tds[1]);
+            if (!named) return;
+            if (/^(Mon|Tue|Wed|Thu|Fri|Sat|Sun)\s+\d{1,2}\s+\w{3}\s+\d{2}$/.test(first)) {
+                if (WEATHER_EFFECTS[named]) info.forecast.push({ date: first, weather: named });
+            } else if (PITCH_EFFECTS[named]) {
+                info.pitches[escapeHtml(first)] = named;
+            }
         });
+        info.pitch = info.pitches['One Day'] || Object.values(info.pitches)[0] || '';
+        info.weather = info.forecast.length ? info.forecast[0].weather : '';
+        return info;
+    }
+    function scrapeGroundPage() {
+        const info = parseGroundDoc(document);
         saveGroundCache(info);
         return info;
     }
@@ -9765,31 +9793,36 @@ const progMap = { batting: 'batting', bowling: 'bowling', keeping: 'keeperbattin
     // ============================================================
     // CLUB PAGE SCRAPER — parses supporters, mood, division from DOM
     // ============================================================
-    function scrapeClubPage() {
+    // Live-verified club.htm (2026-10): "Supporters" td.mood reads
+    // "blowing you kisses  1267 (+13)" (mood is plain text before the count,
+    // no span), and the division is in "Senior One Day" → "#3 in One Day 4.2".
+    function parseClubDoc(doc) {
         const info = { supporters: 0, supporterGrowth: 0, mood: '', division: 4 };
-        const rows = document.querySelectorAll('table.data tr');
-        rows.forEach(row => {
+        doc.querySelectorAll('table.data tr').forEach(row => {
             const th = row.querySelector('th');
             const td = row.querySelector('td');
             if (!th || !td) return;
             const label = th.textContent.trim().toLowerCase();
+            const text = td.textContent.replace(/\s+/g, ' ').trim();
             if (label.includes('supporter')) {
-                const moodSpan = td.querySelector('.skillup, .skilldown, .skillneutral');
-                if (moodSpan) info.mood = moodSpan.textContent.trim();
-                const text = td.textContent.trim();
                 const countMatch = text.match(/(\d[\d,]*)\s*\(([+-]?\d+)\)/);
                 if (countMatch) {
-                    info.supporters = parseInt(countMatch[1].replace(/,/g, '')) || 0;
-                    info.supporterGrowth = parseInt(countMatch[2]) || 0;
+                    info.supporters = parseInt(countMatch[1].replace(/,/g, ''), 10) || 0;
+                    info.supporterGrowth = parseInt(countMatch[2], 10) || 0;
+                    info.mood = escapeHtml(text.slice(0, countMatch.index).trim());
                 } else {
                     const numMatch = text.match(/(\d[\d,]*)/);
-                    if (numMatch) info.supporters = parseInt(numMatch[1].replace(/,/g, '')) || 0;
+                    if (numMatch) info.supporters = parseInt(numMatch[1].replace(/,/g, ''), 10) || 0;
                 }
-            } else if (label.includes('country') || label.includes('division')) {
-                const divMatch = td.textContent.match(/One Day\s*([\d.]+)/i) || td.textContent.match(/Div(?:ision)?\s*([\d.]+)/i);
-                if (divMatch) info.division = Math.round(parseFloat(divMatch[1])) || 4;
+            } else if (label === 'senior one day' || label.includes('division')) {
+                const divMatch = text.match(/One Day\s*(\d+)/i) || text.match(/Div(?:ision)?\s*(\d+)/i);
+                if (divMatch) info.division = parseInt(divMatch[1], 10) || 4;
             }
         });
+        return info;
+    }
+    function scrapeClubPage() {
+        const info = parseClubDoc(document);
         saveTeamInfoCache(info);
         return info;
     }
@@ -9801,37 +9834,8 @@ const progMap = { batting: 'batting', bowling: 'bowling', keeping: 'keeperbattin
                 url: url,
                 timeout: 15000,
                 onload: function(response) {
-                    if (response.status === 200) {
-                        const parser = new DOMParser();
-                        const doc = parser.parseFromString(response.responseText, 'text/html');
-                        const info = { supporters: 0, supporterGrowth: 0, mood: '', division: 4 };
-                        const rows = doc.querySelectorAll('table.data tr');
-                        rows.forEach(row => {
-                            const th = row.querySelector('th');
-                            const td = row.querySelector('td');
-                            if (!th || !td) return;
-                            const label = th.textContent.trim().toLowerCase();
-                            if (label.includes('supporter')) {
-                                const moodSpan = td.querySelector('.skillup, .skilldown, .skillneutral');
-                                if (moodSpan) info.mood = moodSpan.textContent.trim();
-                                const text = td.textContent.trim();
-                                const countMatch = text.match(/(\d[\d,]*)\s*\(([+-]?\d+)\)/);
-                                if (countMatch) {
-                                    info.supporters = parseInt(countMatch[1].replace(/,/g, '')) || 0;
-                                    info.supporterGrowth = parseInt(countMatch[2]) || 0;
-                                } else {
-                                    const numMatch = text.match(/(\d[\d,]*)/);
-                                    if (numMatch) info.supporters = parseInt(numMatch[1].replace(/,/g, '')) || 0;
-                                }
-                            } else if (label.includes('country') || label.includes('division')) {
-                                const divMatch = td.textContent.match(/One Day\s*([\d.]+)/i) || td.textContent.match(/Div(?:ision)?\s*([\d.]+)/i);
-                                if (divMatch) info.division = Math.round(parseFloat(divMatch[1])) || 4;
-                            }
-                        });
-                        resolve(info);
-                    } else {
-                        reject(new Error(`HTTP ${response.status}`));
-                    }
+                    if (response.status === 200) resolve(parseClubDoc(new DOMParser().parseFromString(response.responseText, 'text/html')));
+                    else reject(new Error(`HTTP ${response.status}`));
                 },
                 onerror: function(err) { reject(err); },
                 ontimeout: function() { reject(new Error('Timeout')); }
@@ -11479,7 +11483,7 @@ const progMap = { batting: 'batting', bowling: 'bowling', keeping: 'keeperbattin
                 const hasRealSkills = players.some(p => p.hasFullSkills);
                 if (!teamId || teamId === String(TEAM_ID)) {
                     if (hasRealSkills) {
-                        savePlayerCache(players);
+                        mergePagePlayersIntoCache(players);
                     } else {
                         console.warn('[FTP Advisor] Squad page has no skill columns (likely not squadViewId=2) — skipping cache save from this page, forcing a background grid re-fetch instead.');
                         squadScrapeNeedsBackgroundFix = true;
