@@ -3724,6 +3724,145 @@
         return _lastMarketScan;
     }
 
+
+    // ============================================================
+    // AUTOPILOT DOCK — slim pill (bottom-left, Alt+A) that pulses while the
+    // autopilot works, opens a compact panel (switches, next-match prep,
+    // run/preview, activity) and toasts results. Shadow DOM so the game's
+    // CSS can't touch it and it can't touch the game's.
+    // ============================================================
+    const pilotDock = (() => {
+        let root = null, toastTimer = null;
+        const CSS = `:host{all:initial}*{box-sizing:border-box;margin:0}
+.r{--bg:#fff;--bg2:#f3f5f7;--fg:#15191d;--mut:#6b737c;--line:#e4e8ec;--acc:#1f7a4d;--warn:#b26a00;--bad:#c0392b;--sh:0 14px 40px rgba(15,25,35,.18),0 1px 3px rgba(15,25,35,.08);font:12px/1.45 Inter,ui-sans-serif,system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;color:var(--fg)}
+@media (prefers-color-scheme:dark){.r{--bg:#14181b;--bg2:#1c2126;--fg:#e8ebee;--mut:#97a0a8;--line:#272d33;--acc:#4cc38a;--warn:#e6a23c;--bad:#f07a6e}}
+button{font:inherit;color:inherit;cursor:pointer}
+.pill{position:fixed;left:14px;bottom:14px;z-index:2147483646;height:34px;padding:0 12px 0 10px;border-radius:17px;border:1px solid var(--line);background:var(--bg);font-weight:700;display:flex;align-items:center;gap:7px;box-shadow:var(--sh);transition:transform .12s}
+.pill:hover{transform:translateY(-1px)}.pill i{width:8px;height:8px;border-radius:50%;background:var(--mut)}
+.pill.on i{background:var(--acc)}.pill.busy i{background:var(--warn);animation:p 1s infinite}.pill.err i{background:var(--bad)}
+.pill span{font-weight:500;color:var(--mut);max-width:220px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+@keyframes p{50%{opacity:.25}}
+.pan{position:fixed;left:14px;bottom:56px;z-index:2147483647;width:min(360px,calc(100vw - 28px));max-height:min(560px,calc(100vh - 80px));background:var(--bg);border:1px solid var(--line);border-radius:14px;box-shadow:var(--sh);display:flex;flex-direction:column;overflow:hidden;opacity:0;transform:translateY(8px) scale(.985);pointer-events:none;transition:opacity .14s,transform .14s}
+.pan.open{opacity:1;transform:none;pointer-events:auto}
+.hd{display:flex;align-items:center;gap:8px;padding:11px 12px 9px 14px;border-bottom:1px solid var(--line)}.hd b{font-size:13px}.hd .v{color:var(--mut);font-size:10.5px;flex:1}
+.x{border:0;background:none;color:var(--mut);font-size:14px;width:24px;height:24px;border-radius:6px}.x:hover{background:var(--bg2)}
+.bd{overflow:auto;padding:4px 0}
+.sec{padding:9px 14px;border-bottom:1px solid var(--line)}.sec:last-child{border:0}
+.h{font-size:10.5px;font-weight:700;letter-spacing:.5px;text-transform:uppercase;color:var(--mut);margin-bottom:6px}
+.row{display:flex;align-items:center;justify-content:space-between;gap:8px;padding:3px 0}
+.sw{position:relative;width:30px;height:17px;border-radius:9px;border:0;background:var(--line);flex:none;transition:background .12s}
+.sw::after{content:"";position:absolute;top:2px;left:2px;width:13px;height:13px;border-radius:50%;background:#fff;box-shadow:0 1px 2px rgba(0,0,0,.25);transition:transform .12s}
+.sw.on{background:var(--acc)}.sw.on::after{transform:translateX(13px)}
+.btns{display:flex;gap:6px}.btn{flex:1;border:1px solid var(--line);background:var(--bg2);border-radius:8px;padding:7px 8px;font-weight:600}
+.btn.pri{background:var(--acc);border-color:var(--acc);color:#fff}.btn:disabled{opacity:.5;cursor:default}
+.ck{display:flex;gap:7px;padding:2px 0}.ck b{width:14px;text-align:center}.ok{color:var(--acc)}.no{color:var(--mut)}
+.lg{font-size:11px;color:var(--mut);padding:2px 0;border-top:1px dashed var(--line)}.lg:first-child{border:0}.lg em{font-style:normal;color:var(--fg)}
+.toast{position:fixed;left:50%;bottom:16px;transform:translate(-50%,8px);background:#15191d;color:#fff;padding:8px 13px;border-radius:9px;font-size:11.5px;z-index:2147483647;opacity:0;transition:opacity .15s,transform .15s;pointer-events:none;max-width:min(560px,88vw);box-shadow:var(--sh)}
+.toast.on{opacity:.96;transform:translate(-50%,0)}`;
+        const esc = (t) => escapeHtml(String(t == null ? '' : t));
+        const ago = (t) => { if (!t) return 'never'; const m = Math.round((Date.now() - t) / 6e4); return m < 1 ? 'just now' : m < 60 ? `${m}m ago` : m < 1440 ? `${Math.round(m / 60)}h ago` : `${Math.round(m / 1440)}d ago`; };
+        function mount() {
+            if (root) return;
+            const host = document.createElement('div');
+            host.id = 'ftp-pilot-host';
+            document.body.appendChild(host);
+            root = host.attachShadow({ mode: 'open' });
+            root.innerHTML = `<style>${CSS}</style><div class="r"><button class="pill" title="FTP Autopilot (Alt+A)"><i></i>FTP<span></span></button><div class="pan"><div class="hd"><b>Autopilot</b><span class="v">v${esc(GM_info && GM_info.script ? GM_info.script.version : '')}</span><button class="x" data-a="close">\u2715</button></div><div class="bd"></div></div><div class="toast"></div></div>`;
+            root.addEventListener('click', onClick);
+            document.addEventListener('keydown', (e) => { if (e.altKey && (e.key === 'a' || e.key === 'A')) { e.preventDefault(); toggle(); } });
+            refresh();
+        }
+        function toggle(open) {
+            const pan = root.querySelector('.pan');
+            const want = open == null ? !pan.classList.contains('open') : open;
+            pan.classList.toggle('open', want);
+            if (want) render();
+        }
+        function render() {
+            const st = pilotState();
+            const cache = loadPlayerCache();
+            const sw = (key, label, on) => `<div class="row"><span>${label}</span><button class="sw ${on ? 'on' : ''}" data-sw="${key}"></button></div>`;
+            const matches = Object.entries(st.orders || {}).sort((a, b) => b[1].at - a[1].at).slice(0, 3);
+            const ck = (ok, text) => `<div class="ck"><b class="${ok ? 'ok' : 'no'}">${ok ? '\u2713' : '\u2022'}</b><span>${text}</span></div>`;
+            root.querySelector('.bd').innerHTML = `
+<div class="sec"><div class="h">Switches</div>
+${sw('enabled', '<b>Autopilot</b> \u2014 runs in the background on any page', st.enabled)}
+${sw('training', 'Submit training (every ' + PILOT_TRAINING_EVERY_H + ' h)', st.training)}
+${sw('ordersOn', 'Submit orders for matches in the next ' + AUTOPILOT_ORDERS_WINDOW_HOURS + ' h', st.ordersOn !== false)}</div>
+<div class="sec"><div class="h">Prep</div>
+${ck(cache && cache.ageHours < 6, `Squad data \u2014 ${cache ? esc(getCacheAgeText(cache.ageDays)) : 'not loaded'}`)}
+${ck(st.trainingAt && Date.now() - st.trainingAt < PILOT_TRAINING_EVERY_H * 3600e3, `Training submitted \u2014 ${ago(st.trainingAt)}`)}
+${matches.length ? matches.map(([id, m]) => ck(true, `Orders: ${esc(m.teams)} \u2014 ${ago(m.at)}${m.scouted ? ' \u00B7 opponent scouted' : ''}`)).join('') : ck(false, 'No orders submitted yet')}</div>
+<div class="sec"><div class="btns"><button class="btn pri" data-a="run">Run now</button><button class="btn" data-a="preview">Preview</button></div></div>
+<div class="sec"><div class="h">Activity</div>${(st.log || []).slice(-12).reverse().map(l => `<div class="lg"><em>${esc(ago(l.t))}</em> \u00B7 ${esc(l.msg)}</div>`).join('') || '<div class="lg">Nothing yet.</div>'}</div>`;
+        }
+        function refresh() {
+            if (!root) return;
+            const st = pilotState();
+            const pill = root.querySelector('.pill');
+            pill.classList.toggle('on', !!st.enabled);
+            if (root.querySelector('.pan').classList.contains('open')) render();
+        }
+        function status(msg) {
+            if (!root) return;
+            const pill = root.querySelector('.pill');
+            pill.classList.toggle('busy', !!msg);
+            pill.querySelector('span').textContent = msg ? msg + '\u2026' : '';
+        }
+        function toast(msg, isErr) {
+            if (!root) return;
+            const t = root.querySelector('.toast');
+            t.textContent = msg;
+            t.classList.add('on');
+            root.querySelector('.pill').classList.toggle('err', !!isErr);
+            clearTimeout(toastTimer);
+            toastTimer = setTimeout(() => t.classList.remove('on'), 4200);
+        }
+        async function run(dryRun) {
+            const btns = root.querySelectorAll('[data-a="run"],[data-a="preview"]');
+            btns.forEach(b => { b.disabled = true; });
+            const lines = [];
+            try {
+                await runAutoPilot({ dryRun, force: true, log: (m) => { lines.push(m); if (dryRun) toast(m); }, status });
+                const bad = lines.filter(l => l.startsWith('\u26A0'));
+                toast(bad.length ? bad.join(' \u00B7 ') : (dryRun ? 'Preview done \u2014 nothing saved' : lines.filter(l => l.startsWith('\u2705')).map(l => l.split(':')[0].replace('\u2705 ', '')).join(' \u00B7 ') || 'Up to date'), bad.length > 0);
+                if (dryRun) { const st = pilotState(); lines.forEach(m => st.log.push({ t: Date.now(), msg: m })); savePilotState(st); }
+            } catch (e) { toast('\u26A0 ' + e.message, true); }
+            btns.forEach(b => { b.disabled = false; });
+            render();
+        }
+        function onClick(e) {
+            const t = e.target.closest('button');
+            if (!t) return;
+            if (t.classList.contains('pill')) return toggle();
+            if (t.dataset.sw) {
+                const st = pilotState();
+                st[t.dataset.sw] = !(t.dataset.sw === 'ordersOn' ? st.ordersOn !== false : st[t.dataset.sw]);
+                savePilotState(st);
+                refresh();
+                if (t.dataset.sw === 'enabled' && st.enabled) toast('Autopilot on \u2014 it will keep training and the next matches submitted');
+                return;
+            }
+            if (t.dataset.a === 'close') return toggle(false);
+            if (t.dataset.a === 'run') return run(false);
+            if (t.dataset.a === 'preview') return run(true);
+        }
+        // Background pass: only when switched on, throttled, and never while
+        // the user is on the orders/training page itself (their own edits).
+        function background(pageType) {
+            const st = pilotState();
+            if (!st.enabled || pageType === 'orders' || pageType === 'training') return;
+            if (Date.now() - (st.lastRun || 0) < PILOT_BACKGROUND_EVERY_MIN * 6e4) return;
+            const lines = [];
+            runAutoPilot({ log: (m) => lines.push(m), status }).then(() => {
+                const done = lines.filter(l => l.startsWith('\u2705')), bad = lines.filter(l => l.startsWith('\u26A0'));
+                if (done.length || bad.length) toast([...done.map(l => l.split(' \u2014 ')[0]), ...bad].join(' \u00B7 '), bad.length > 0);
+                refresh();
+            }).catch(e => toast('\u26A0 Autopilot: ' + e.message, true));
+        }
+        return { mount, status, toast, refresh, background };
+    })();
+
     // Promise per player id: updateTransferAdvisor renders twice per visit
     // (stale cache, then refreshed squad) and both passes auto-fetch.
     const _transferDetailCache = new Map();
@@ -9643,6 +9782,7 @@ const progMap = { batting: 'batting', bowling: 'bowling', keeping: 'keeperbattin
             _pageDocOverride = after;
             const mismatched = scrapeTrainingPage().filter(p => wanted.has(String(p.id)) && p.selectElement && p.selectElement.value !== wanted.get(String(p.id)));
             if (mismatched.length) throw new Error(`saved, but ${mismatched.length} player(s) don't show the new program: ${mismatched.map(p => p.name).join(', ')}`);
+            const st = pilotState(); st.trainingAt = Date.now(); savePilotState(st);
             log(`\u2705 Training saved for ${players.length} players (${changes.length} changed${changes.length ? ': ' + changes.map(r => `${r.player.name} \u2192 ${TRAINING_PROGRAM_LABELS[r.program]}`).join(', ') : ''})`);
         } finally {
             _pageDocOverride = null;
@@ -9650,7 +9790,7 @@ const progMap = { batting: 'batting', bowling: 'bowling', keeping: 'keeperbattin
         }
     }
 
-    async function autoSubmitOrders(match, log, dryRun) {
+    async function autoSubmitOrders(match, log, dryRun, force) {
         const gameId = (match.gameLink.match(/gameId=(\d+)/) || [])[1];
         if (!gameId) throw new Error(`no game id for ${match.teams}`);
         const frame = await loadHiddenFrame(`https://www.fromthepavilion.org/orders.htm?gameId=${gameId}`);
@@ -9666,7 +9806,11 @@ const progMap = { batting: 'batting', bowling: 'bowling', keeping: 'keeperbattin
             if (!plan) throw new Error('no order form');
             const coverage = validateSpellCoverage(plan.bowling, plan.context.overs);
             if (!coverage.ok) throw new Error(`bowling plan doesn't cover every over (gaps ${coverage.gaps.join(',') || '-'}) — not submitted`);
-            const res = fillOrdersForm(ordersFormPlan(plan));
+            const formPlan = ordersFormPlan(plan);
+            const sig = JSON.stringify(formPlan);
+            const applied = pilotState().orders[gameId];
+            if (!force && !dryRun && applied && applied.sig === sig) { log(`\u2713 ${match.teams}: orders already up to date`); return; }
+            const res = fillOrdersForm(formPlan);
             if (!res.ok) throw new Error(`form didn't take the plan: ${res.problems.join(' · ')} — not submitted`);
             const save = frame.contentDocument.getElementById('savebutton');
             if (!save) throw new Error('Save Orders button not found');
@@ -9674,6 +9818,9 @@ const progMap = { batting: 'batting', bowling: 'bowling', keeping: 'keeperbattin
                 const after = await pressSaveInFrame(frame, save);
                 const okText = /orders saved successfully/i.test(after.body ? after.body.textContent : '');
                 if (!okText) throw new Error('the game did not confirm the save — open the match orders to check');
+                const st = pilotState();
+                st.orders[gameId] = { sig, at: Date.now(), teams: match.teams, scouted: !!plan.opponentCache };
+                savePilotState(st);
             }
             const c = plan.context;
             const captain = plan.battingOrder.find(p => p.isCaptain), keeper = plan.battingOrder.find(p => p.role === 'WK');
@@ -9685,23 +9832,57 @@ const progMap = { batting: 'batting', bowling: 'bowling', keeping: 'keeperbattin
         }
     }
 
+    // Autopilot state (GM): switches, last runs, per-match applied plan
+    // signatures and an activity log. Off by default — it saves orders and
+    // training on the account, so each install opts in once.
+    const PILOT_KEY = 'ftp_autopilot';
+    const PILOT_TRAINING_EVERY_H = 12;
+    const PILOT_BACKGROUND_EVERY_MIN = 20;
+    function pilotState() {
+        const d = { enabled: false, training: true, ordersOn: true, lastRun: 0, trainingAt: 0, orders: {}, log: [] };
+        try { return Object.assign(d, JSON.parse(GM_getValue(PILOT_KEY, '{}'))); } catch (e) { return d; }
+    }
+    function savePilotState(st) {
+        st.log = (st.log || []).slice(-40);
+        Object.keys(st.orders || {}).forEach(id => { if (Date.now() - (st.orders[id].at || 0) > 14 * 864e5) delete st.orders[id]; });
+        GM_setValue(PILOT_KEY, JSON.stringify(st));
+    }
+    function pilotLog(msg) {
+        const st = pilotState();
+        st.log.push({ t: Date.now(), msg });
+        savePilotState(st);
+    }
+
     let _autoPilotRunning = false;
-    async function runAutoPilot(log, dryRun) {
-        if (_autoPilotRunning) return;
+    async function runAutoPilot({ dryRun = false, force = false, log = () => {}, status = () => {} } = {}) {
+        if (_autoPilotRunning) return false;
         _autoPilotRunning = true;
+        const say = (m) => { log(m); if (!dryRun) pilotLog(m); };
+        const st0 = pilotState();
         try {
-            log('\u21BB Refreshing squad, academy, finances, ground\u2026');
-            await fetchAllData({ force: true });
-            try { await autoSubmitTraining(log, dryRun); } catch (e) { log(`\u26A0 Training not submitted: ${e.message}`); }
-            const upcoming = await fetchUpcomingFixtures();
-            if (!upcoming.length) { log('No upcoming matches found.'); return; }
-            const horizon = upcoming[0].matchDate.getTime() + AUTOPILOT_ORDERS_WINDOW_HOURS * 3600 * 1000;
-            for (const m of upcoming.filter((m, i) => i === 0 || m.matchDate.getTime() <= horizon)) {
-                try { await autoSubmitOrders(m, log, dryRun); } catch (e) { log(`\u26A0 ${m.teams}: ${e.message}`); }
+            status('Refreshing data');
+            await fetchAllData({ force });
+            if (force || dryRun || (st0.training && Date.now() - (st0.trainingAt || 0) > PILOT_TRAINING_EVERY_H * 3600e3)) {
+                status('Training');
+                try { await autoSubmitTraining(say, dryRun); } catch (e) { say(`\u26A0 Training not submitted: ${e.message}`); }
             }
-            log('Done.');
+            if (force || dryRun || st0.ordersOn !== false) {
+                status('Fixtures');
+                const upcoming = await fetchUpcomingFixtures();
+                if (!upcoming.length) say('No upcoming matches found.');
+                else {
+                    const horizon = upcoming[0].matchDate.getTime() + AUTOPILOT_ORDERS_WINDOW_HOURS * 3600 * 1000;
+                    for (const m of upcoming.filter((m, i) => i === 0 || m.matchDate.getTime() <= horizon)) {
+                        status(m.teams);
+                        try { await autoSubmitOrders(m, say, dryRun, force); } catch (e) { say(`\u26A0 ${m.teams}: ${e.message}`); }
+                    }
+                }
+            }
+            if (!dryRun) { const st = pilotState(); st.lastRun = Date.now(); savePilotState(st); }
+            return true;
         } finally {
             _autoPilotRunning = false;
+            status(null);
         }
     }
 
@@ -10966,7 +11147,8 @@ const progMap = { batting: 'batting', bowling: 'bowling', keeping: 'keeperbattin
             btn.disabled = true;
             out.innerHTML = '';
             const log = (msg) => { out.insertAdjacentHTML('beforeend', `<div>${escapeHtml(msg)}</div>`); };
-            try { await runAutoPilot(log, document.getElementById('ftp-autopilot-dry').checked); } catch (e) { log(`\u26A0 ${e.message}`); }
+            try { await runAutoPilot({ log, force: true, dryRun: document.getElementById('ftp-autopilot-dry').checked, status: pilotDock.status }); } catch (e) { log(`\u26A0 ${e.message}`); }
+            pilotDock.refresh();
             btn.disabled = false;
             updateClubStatusUI();
         });
@@ -11803,6 +11985,12 @@ const progMap = { batting: 'batting', bowling: 'bowling', keeping: 'keeperbattin
             _attachRefreshBtn(updatePlayerAdvisor);
         }
         });
+
+        try {
+            pilotDock.mount();
+            // After the page's own background refresh has had a head start.
+            setTimeout(() => pilotDock.background(pageType), 4000);
+        } catch (e) { console.warn('[FTP Advisor] Autopilot dock failed:', e); }
     }
 
     if (document.readyState === 'loading') {
