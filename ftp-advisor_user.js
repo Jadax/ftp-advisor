@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         FTP Advisor
 // @namespace    http://tampermonkey.net/
-// @version      8.117
+// @version      8.118
 // @description  Tactical/scouting advisor for fromthepavilion.org (cricket sim): team, tactics, pitch, training, transfer market, youth and squad plan advice with projections. Full changelog: github.com/Jadax/ftp-advisor
 // @author       Tushant Sharma
 // @license      MIT
@@ -3809,7 +3809,7 @@ ${matches.length ? matches.map(([id, m]) => ck(true, `Orders: ${esc(m.teams)} \u
     const L = loadLearned();
     const rows = Object.entries(L.pitch || {}).sort((a, b) => b[1].n - a[1].n);
     if (!rows.length) return '<div class="lg">Learning starts once completed matches with engine ratings are recorded.</div>';
-    return rows.map(([pitch, e]) => { const f = learnedSpinSeamFactor(pitch); return `<div class="ck"><b class="${f !== 1 ? 'ok' : 'no'}">${f > 1 ? '\u2191' : f < 1 ? '\u2193' : '\u2022'}</b><span>${esc(pitch)}: ${e.n} match${e.n > 1 ? 'es' : ''} \u2014 ${f === 1 ? (e.n < LEARN_MIN_MATCHES ? 'need ' + LEARN_MIN_MATCHES + ' to apply' : 'model already right') : `spin ${f > 1 ? 'stronger' : 'weaker'} vs seam than modelled (\u00D7${f.toFixed(2)} applied)`}</span></div>`; }).join('');
+    return rows.map(([pitch, e]) => { const f = learnedSpinSeamFactor(pitch); return `<div class="ck"><b class="${f !== 1 ? 'ok' : 'no'}">${f > 1 ? '\u2191' : f < 1 ? '\u2193' : '\u2022'}</b><span>${esc(pitch)}: ${e.n} match${e.n > 1 ? 'es' : ''} \u2014 ${f === 1 ? (e.n < LEARN_MIN_MATCHES ? 'need ' + LEARN_MIN_MATCHES + ' to apply' : e.needsOtherPitch ? 'needs a second pitch type to compare against' : 'model already right') : `spin ${f > 1 ? 'stronger' : 'weaker'} vs seam than modelled (\u00D7${f.toFixed(2)} applied)`}</span></div>`; }).join('');
 })()}</div>
 <div class="sec"><div class="btns"><button class="btn pri" data-a="run">Run now</button><button class="btn" data-a="preview">Preview</button></div>
 <div class="btns" style="margin-top:6px;"><button class="btn" data-a="export">Export database (${Object.keys(loadMatchDb()).length} matches)</button></div></div>
@@ -9983,8 +9983,19 @@ const progMap = { batting: 'batting', bowling: 'bowling', keeping: 'keeperbattin
             const e = samples[m.conditions.pitch] || (samples[m.conditions.pitch] = { n: 0, w: 0, sum: 0 });
             e.n++; e.w += w; e.sum += resid * w;
         });
+        // Per-pitch residual RELATIVE to the all-pitch average: a constant
+        // offset (the engine's seam and spin numbers needn't share a scale
+        // with ours) would otherwise read as "spin stronger everywhere".
+        // Hence nothing is learned until two different pitches have data.
         const learned = { pitch: {}, updatedAt: Date.now() };
-        Object.entries(samples).forEach(([pitch, e]) => { learned.pitch[pitch] = { n: e.n, w: Math.round(e.w * 100) / 100, mean: Math.round((e.sum / e.w) * 1000) / 1000 }; });
+        const all = Object.values(samples);
+        const totW = all.reduce((t, e) => t + e.w, 0);
+        const globalMean = totW ? all.reduce((t, e) => t + e.sum, 0) / totW : 0;
+        if (all.length >= 2) {
+            Object.entries(samples).forEach(([pitch, e]) => { learned.pitch[pitch] = { n: e.n, w: Math.round(e.w * 100) / 100, mean: Math.round((e.sum / e.w - globalMean) * 1000) / 1000 }; });
+        } else {
+            Object.entries(samples).forEach(([pitch, e]) => { learned.pitch[pitch] = { n: e.n, w: Math.round(e.w * 100) / 100, mean: 0, needsOtherPitch: true }; });
+        }
         GM_setValue(LEARNED_KEY, JSON.stringify(learned));
         return learned;
     }
