@@ -3805,6 +3805,12 @@ ${sw('ordersOn', 'Submit match orders (within ' + AUTOPILOT_ORDERS_WINDOW_HOURS 
 ${ck(cache && cache.ageHours < 6, `Squad data \u2014 ${cache ? esc(getCacheAgeText(cache.ageDays)) : 'not loaded'}`)}
 ${ck(st.trainingAt && Date.now() - st.trainingAt < PILOT_TRAINING_EVERY_H * 3600e3, `Training submitted \u2014 ${ago(st.trainingAt)}`)}
 ${matches.length ? matches.map(([id, m]) => ck(true, `Orders: ${esc(m.teams)} \u2014 ${ago(m.at)}${m.scouted ? ' \u00B7 opponent scouted' : ''}`)).join('') : ck(false, 'No orders submitted yet')}</div>
+<div class="sec"><div class="h">What I've learned</div>${(() => {
+    const L = loadLearned();
+    const rows = Object.entries(L.pitch || {}).sort((a, b) => b[1].n - a[1].n);
+    if (!rows.length) return '<div class="lg">Learning starts once completed matches with engine ratings are recorded.</div>';
+    return rows.map(([pitch, e]) => { const f = learnedSpinSeamFactor(pitch); return `<div class="ck"><b class="${f !== 1 ? 'ok' : 'no'}">${f > 1 ? '\u2191' : f < 1 ? '\u2193' : '\u2022'}</b><span>${esc(pitch)}: ${e.n} match${e.n > 1 ? 'es' : ''} \u2014 ${f === 1 ? (e.n < LEARN_MIN_MATCHES ? 'need ' + LEARN_MIN_MATCHES + ' to apply' : 'model already right') : `spin ${f > 1 ? 'stronger' : 'weaker'} vs seam than modelled (\u00D7${f.toFixed(2)} applied)`}</span></div>`; }).join('');
+})()}</div>
 <div class="sec"><div class="btns"><button class="btn pri" data-a="run">Run now</button><button class="btn" data-a="preview">Preview</button></div>
 <div class="btns" style="margin-top:6px;"><button class="btn" data-a="export">Export database (${Object.keys(loadMatchDb()).length} matches)</button></div></div>
 <div class="sec"><div class="h">Activity</div>${(st.log || []).slice(-12).reverse().map(l => `<div class="lg"><em>${esc(ago(l.t))}</em> \u00B7 ${esc(l.msg)}</div>`).join('') || '<div class="lg">Nothing yet.</div>'}</div>`;
@@ -4562,8 +4568,7 @@ ${matches.length ? matches.map(([id, m]) => ck(true, `Orders: ${esc(m.teams)} \u
     // TOSS DECISION LOGIC
     // ============================================================
     function recommendTossDecision(context, opponentAnalysis) {
-        const pitchEffect = PITCH_EFFECTS[context.pitch] || PITCH_EFFECTS.Sporting;
-        const weatherEffect = WEATHER_EFFECTS[context.weather] || WEATHER_EFFECTS.Sunny;
+        const { pitchEffect, weatherEffect } = conditionEffects(context);
         const pitch = context.pitch;
         const weather = context.weather;
         const isT20 = context.matchType === 'T20' || context.matchType === 'YT20';
@@ -4677,8 +4682,7 @@ ${matches.length ? matches.map(([id, m]) => ck(true, `Orders: ${esc(m.teams)} \u
         // a hard invariant: the XI and batting order cannot contain a player
         // twice, even if a page/cache scrape briefly duplicates a row.
         availablePlayers = asMatchEnginePlayers(dedupePlayers(availablePlayers), context);
-        const pitchEffect = PITCH_EFFECTS[context.pitch] || PITCH_EFFECTS.Sporting;
-        const weatherEffect = WEATHER_EFFECTS[context.weather] || WEATHER_EFFECTS.Sunny;
+        const { pitchEffect, weatherEffect } = conditionEffects(context);
         const isT20 = context.matchType === 'T20' || context.matchType === 'YT20';
         const isYouth = context.isYouthOnly;
 
@@ -4947,8 +4951,7 @@ const MAX_OVERS_PER_BOWLER = { OD: 10, YOD: 8, T20: 4, YT20: 4 };
         const minPerSpell = context.minSpellLength > 0 ? context.minSpellLength : (isT20 ? 1 : 2);
         const perEnd = totalOvers / 2;
 
-        const pitchEffect = PITCH_EFFECTS[context.pitch] || PITCH_EFFECTS.Sporting;
-        const weatherEffect = WEATHER_EFFECTS[context.weather] || WEATHER_EFFECTS.Sunny;
+        const { pitchEffect, weatherEffect } = conditionEffects(context);
 
         // Forum guidance (Bowling Orders: Tips thread): fatigue/endurance
         // matter for spell planning, not just who to pick — a tired
@@ -6009,8 +6012,7 @@ const MAX_OVERS_PER_BOWLER = { OD: 10, YOD: 8, T20: 4, YT20: 4 };
         }
 
         const context = scrapeMatchContext();
-        const pitchEffect = PITCH_EFFECTS[context.pitch] || PITCH_EFFECTS.Sporting;
-        const weatherEffect = WEATHER_EFFECTS[context.weather] || WEATHER_EFFECTS.Sunny;
+        const { pitchEffect, weatherEffect } = conditionEffects(context);
 
         // Context display
         document.getElementById('ftp-context').innerHTML = `
@@ -9902,6 +9904,91 @@ const progMap = { batting: 'batting', bowling: 'bowling', keeping: 'keeperbattin
     const MATCH_DB_MAX = 300;
     const MATCH_DB_INGEST_EVERY_H = 6;
     const MATCH_DB_INGEST_PER_RUN = 12;
+    // ============================================================
+    // SELF-CALIBRATION — the advisor corrects its own pitch model from the
+    // engine's verdicts. Per completed match with engine ratings
+    // (ratings.htm "Bowling - Seam/Spin", our side), compare the engine's
+    // spin:seam ratio with the ratio our own calculateBowlingScore predicted
+    // for the bowlers who actually bowled (scorecard overs; skills from the
+    // pre-match snapshot when the autopilot took one, else today's squad by
+    // name key, at half weight). The log-residual, averaged per pitch and
+    // shrunk toward 0 by n/(n+LEARN_SHRINK), becomes a spin:seam multiplier
+    // used by every selection/allocation via conditionEffects(). Only the
+    // RATIO is identified (one match can't tell "spin was good" from "seam
+    // was bad"), so it's split sqrt/sqrt. Deterministic given the database.
+    // ============================================================
+    const LEARNED_KEY = 'ftp_learned';
+    const LEARN_SHRINK = 4;
+    const LEARN_MIN_MATCHES = 2;
+    const LEARN_CLAMP = [0.8, 1.25];
+    function loadLearned() {
+        try { return JSON.parse(GM_getValue(LEARNED_KEY, 'null')) || { pitch: {} }; } catch (e) { return { pitch: {} }; }
+    }
+    function learnedSpinSeamFactor(pitch) {
+        const e = loadLearned().pitch[pitch];
+        if (!e || e.n < LEARN_MIN_MATCHES) return 1;
+        const shrunk = e.mean * (e.w / (e.w + LEARN_SHRINK));
+        return Math.max(LEARN_CLAMP[0], Math.min(LEARN_CLAMP[1], Math.exp(shrunk)));
+    }
+    function conditionEffects(context) {
+        const base = PITCH_EFFECTS[context.pitch] || PITCH_EFFECTS.Sporting;
+        const weatherEffect = WEATHER_EFFECTS[context.weather] || WEATHER_EFFECTS.Sunny;
+        const f = learnedSpinSeamFactor(context.pitch);
+        if (f === 1) return { pitchEffect: base, weatherEffect, learnedFactor: 1 };
+        const r = Math.sqrt(f);
+        return { pitchEffect: Object.assign({}, base, { spin: base.spin * r, seam: base.seam / r }), weatherEffect, learnedFactor: f };
+    }
+    function snapshotToPlayer(x) {
+        return {
+            id: x.id, name: x.name, age: x.age, batting: x.bat, bowling: x.bowl, technique: x.tech, power: x.pow, keeping: x.keep,
+            fielding: x.field, endurance: x.end, experience: x.exp, captaincy: x.capt, fatigue: x.fat, form: x.form,
+            bowlerType: x.bt, bowlerCategory: BOWLER_CATEGORY[x.bt] || 'none', bowlerPace: BOWLER_PACE[x.bt] || 0, talents: x.talents || []
+        };
+    }
+    function learnFromMatchDb() {
+        const db = loadMatchDb();
+        const cache = loadPlayerCache();
+        const squadByKey = new Map();
+        (cache ? cache.players : []).forEach(p => { const k = playerNameKey(p.name); squadByKey.set(k, squadByKey.has(k) ? null : p); });
+        const myName = (loadTeamInfoCache() || {}).teamName;
+        const samples = {};
+        Object.values(db).forEach(m => {
+            if (!m.ratings || !m.result || !m.conditions || !PITCH_EFFECTS[m.conditions.pitch]) return;
+            const ours = myName ? (m.ratings.find(r => r.team === myName) || null) : null;
+            const usInnings = (m.result.innings || []).find(i => ours && i.bowling === ours.team);
+            if (!ours || !usInnings || !ours.seam || !ours.spin || !(ours.seam.overs > 0) || !(ours.spin.overs > 0) || !ours.seam.v || !ours.spin.v) return;
+            const preByKey = new Map(((m.pre && m.pre.xi) || []).map(x => [playerNameKey(x.name), snapshotToPlayer(x)]));
+            const isT20 = /twenty20|t20/i.test(m.league || '');
+            const isYouth = /youth/i.test(m.league || '');
+            const pitchEffect = PITCH_EFFECTS[m.conditions.pitch];
+            const weatherEffect = WEATHER_EFFECTS[m.conditions.weather] || WEATHER_EFFECTS.Sunny;
+            const acc = { seam: [0, 0], spin: [0, 0] };
+            let fromSnapshot = true;
+            (usInnings.bowling_card || []).forEach(b => {
+                const key = String(b.name || '').toLowerCase();
+                let pl = preByKey.get(key);
+                if (!pl) { pl = squadByKey.get(key) || null; fromSnapshot = false; }
+                const cat = BOWLER_CATEGORY[b.type] || (pl && pl.bowlerCategory);
+                if (!pl || (cat !== 'seam' && cat !== 'spin') || !(b.overs > 0)) return;
+                const score = calculateBowlingScore(Object.assign({}, pl, { bowlerCategory: cat }), pitchEffect, weatherEffect, isT20, isYouth, m.conditions.home === ours.team);
+                acc[cat][0] += score * b.overs;
+                acc[cat][1] += b.overs;
+            });
+            if (!acc.seam[1] || !acc.spin[1]) return;
+            const predicted = (acc.spin[0] / acc.spin[1]) / (acc.seam[0] / acc.seam[1]);
+            const observed = ours.spin.v / ours.seam.v;
+            if (!(predicted > 0) || !(observed > 0)) return;
+            const resid = Math.max(-0.7, Math.min(0.7, Math.log(observed / predicted)));
+            const w = fromSnapshot ? 1 : 0.5;
+            const e = samples[m.conditions.pitch] || (samples[m.conditions.pitch] = { n: 0, w: 0, sum: 0 });
+            e.n++; e.w += w; e.sum += resid * w;
+        });
+        const learned = { pitch: {}, updatedAt: Date.now() };
+        Object.entries(samples).forEach(([pitch, e]) => { learned.pitch[pitch] = { n: e.n, w: Math.round(e.w * 100) / 100, mean: Math.round((e.sum / e.w) * 1000) / 1000 }; });
+        GM_setValue(LEARNED_KEY, JSON.stringify(learned));
+        return learned;
+    }
+
     function loadMatchDb() {
         try { return JSON.parse(GM_getValue(MATCH_DB_KEY, '{}')) || {}; } catch (e) { return {}; }
     }
@@ -10016,6 +10103,7 @@ const progMap = { batting: 'batting', bowling: 'bowling', keeping: 'keeperbattin
             n++;
         }
         if (n) { saveMatchDb(db); if (log) log(`\u{1F4DA} Recorded ${n} completed match${n > 1 ? 'es' : ''} (scorecard, conditions, engine ratings)`); }
+        if (n || !GM_getValue(LEARNED_KEY, null)) { try { learnFromMatchDb(); } catch (e) { console.warn('[FTP Advisor] learning pass failed:', e); } }
         const st = pilotState(); st.ingestAt = Date.now(); savePilotState(st);
         return n;
     }
@@ -10342,7 +10430,9 @@ const progMap = { batting: 'batting', bowling: 'bowling', keeping: 'keeperbattin
     // "blowing you kisses  1267 (+13)" (mood is plain text before the count,
     // no span), and the division is in "Senior One Day" → "#3 in One Day 4.2".
     function parseClubDoc(doc) {
-        const info = { supporters: 0, supporterGrowth: 0, mood: '', division: 4 };
+        const info = { supporters: 0, supporterGrowth: 0, mood: '', division: 4, teamName: '' };
+        const h1 = doc.querySelector('h1');
+        if (h1) info.teamName = h1.textContent.split('>>')[0].replace(/\s+/g, ' ').trim();
         doc.querySelectorAll('table.data tr').forEach(row => {
             const th = row.querySelector('th');
             const td = row.querySelector('td');
