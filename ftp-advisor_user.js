@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         FTP Advisor
 // @namespace    http://tampermonkey.net/
-// @version      8.118
+// @version      8.119
 // @description  Tactical/scouting advisor for fromthepavilion.org (cricket sim): team, tactics, pitch, training, transfer market, youth and squad plan advice with projections. Full changelog: github.com/Jadax/ftp-advisor
 // @author       Tushant Sharma
 // @license      MIT
@@ -3581,7 +3581,7 @@
                         }
                         const parser = new DOMParser();
                         const doc = parser.parseFromString(resp.responseText, 'text/html');
-                        const result = { experience: null, wage: null, wageDiscount: null, talents: [], captaincy: null, gameRatings: null, isLeftHanded: null };
+                        const result = { experience: null, wage: null, wageDiscount: null, talents: [], captaincy: null, gameRatings: null, isLeftHanded: null, rating: null };
 
                         // Quick sanity check: if we got the login page, bail
                         if (doc.querySelector('input[name="username"]') || resp.responseText.length < 500) {
@@ -3600,6 +3600,8 @@
                             const infoText = paddedPs[0].textContent;
                             const wageMatch = infoText.match(/\$([\d,]+)\s*wage/);
                             if (wageMatch) result.wage = parseInt(wageMatch[1].replace(/,/g, ''));
+                            const ratingMatch = infoText.match(/([\d,]+)\s*rating/);
+                            if (ratingMatch) result.rating = parseInt(ratingMatch[1].replace(/,/g, ''), 10) || null;
                             const discMatch = infoText.match(/\((\d+)%\s*discount\)/i);
                             if (discMatch) result.wageDiscount = parseInt(discMatch[1], 10) || 0;
                         }
@@ -3800,6 +3802,7 @@ button{font:inherit;color:inherit;cursor:pointer}
 <div class="sec"><div class="h">Switches</div>
 ${sw('enabled', '<b>Autopilot</b> \u2014 runs in the background on any page', st.enabled)}
 ${sw('training', 'Submit training (every ' + PILOT_TRAINING_EVERY_H + ' h)', st.training)}
+${sw('recruit', 'Weekly youth recruit \u2014 keep if \u2265' + TRANSFER_MIN_PROJ_AT25 + ' at 25, else retire', st.recruit !== false)}
 ${sw('ordersOn', 'Submit match orders (within ' + AUTOPILOT_ORDERS_WINDOW_HOURS + ' h of the start)', st.ordersOn !== false)}</div>
 <div class="sec"><div class="h">Prep</div>
 ${ck(cache && cache.ageHours < 6, `Squad data \u2014 ${cache ? esc(getCacheAgeText(cache.ageDays)) : 'not loaded'}`)}
@@ -3856,7 +3859,7 @@ ${matches.length ? matches.map(([id, m]) => ck(true, `Orders: ${esc(m.teams)} \u
             if (t.classList.contains('pill')) return toggle();
             if (t.dataset.sw) {
                 const st = pilotState();
-                st[t.dataset.sw] = !(t.dataset.sw === 'ordersOn' ? st.ordersOn !== false : st[t.dataset.sw]);
+                st[t.dataset.sw] = !((t.dataset.sw === 'ordersOn' || t.dataset.sw === 'recruit') ? st[t.dataset.sw] !== false : st[t.dataset.sw]);
                 savePilotState(st);
                 refresh();
                 if (t.dataset.sw === 'enabled' && st.enabled) toast('Autopilot on \u2014 it will keep training and the next matches submitted');
@@ -10140,6 +10143,117 @@ const progMap = { batting: 'batting', bowling: 'bowling', keeping: 'keeperbattin
         return Object.keys(data.matches).length;
     }
 
+
+    // ============================================================
+    // WEEKLY YOUTH RECRUIT (user: pick the type we need, country Random,
+    // Next, Recruit Youth; keep if the recruit projects >= 60 at 25 and
+    // train him, else retire him). Live-verified forms (2026-11):
+    // youthrecruit.htm `youthDev` 1 General / 2 Batsman / 3 Spin Bowler /
+    // 4 Seam Bowler / 5 All-rounder / 6 Keeper, `country` 0 = Random,
+    // submit `_target1` (Next) -> confirm page, submit `_finish` ("Recruit
+    // Youth") commits. The form is absent once this week's recruit is used.
+    // player.htm form: submit action="Retire Player". Manual: 28-player
+    // squad cap; below 12 youths the game auto-drafts poor locals.
+    // ============================================================
+    const RECRUIT_TYPE_IDS = { general: '1', batsman: '2', spin: '3', seam: '4', allrounder: '5', keeper: '6' };
+    const RECRUIT_TYPE_LABELS = { general: 'General', batsman: 'Batsman', spin: 'Spin Bowler', seam: 'Seam Bowler', allrounder: 'All-rounder', keeper: 'Keeper' };
+    // Roles a youth squad of ~17 should carry to field a youth XI with cover.
+    const YOUTH_ROLE_TARGETS = { keeper: 2, spin: 3, seam: 5, batsman: 6 };
+    const YOUTH_MIN_SQUAD = 12, SQUAD_CAP = 28;
+
+    function neededRecruitType(youths) {
+        const count = { keeper: 0, spin: 0, seam: 0, batsman: 0 };
+        youths.forEach(p => {
+            const role = getPrimarySkillInfo(p).name;
+            if (role === 'keeping') count.keeper++;
+            else if (role === 'bowling') count[p.bowlerCategory === 'spin' ? 'spin' : 'seam']++;
+            else count.batsman++;
+        });
+        // Ties broken by scarcity on the market of these roles in youth
+        // squads (keepers and spinners are the hardest to find later).
+        const order = ['keeper', 'spin', 'batsman', 'seam'];
+        let best = 'general', bestGap = 0;
+        order.forEach(k => { const gap = YOUTH_ROLE_TARGETS[k] - count[k]; if (gap > bestGap) { best = k; bestGap = gap; } });
+        return { type: best, count };
+    }
+
+    async function fetchYouthGrid() {
+        return fetchSquadFromPage(`https://www.fromthepavilion.org/youths.htm?squadViewId=2&teamId=${TEAM_ID}`).catch(() => []);
+    }
+
+    async function autoRecruitYouth(log, dryRun) {
+        const frame = await loadHiddenFrame('https://www.fromthepavilion.org/youthrecruit.htm');
+        try {
+            const doc = frame.contentDocument;
+            const typeSel = doc.querySelector('select[name="youthDev"]');
+            const next = doc.querySelector('input[name="_target1"]');
+            if (!typeSel || !next) { log('\u2713 Youth recruit: this week\'s recruit is already used'); return { done: true }; }
+            const before = await fetchYouthGrid();
+            if (!before.length) throw new Error('could not read the youth squad');
+            if (before.length >= SQUAD_CAP) { log(`\u23ED Youth recruit skipped: youth squad is full (${before.length})`); return { done: true }; }
+            const need = neededRecruitType(before);
+            typeSel.value = RECRUIT_TYPE_IDS[need.type];
+            const country = doc.querySelector('select[name="country"]');
+            if (country) country.value = '0';
+            const why = `${RECRUIT_TYPE_LABELS[need.type]} (youth squad has ${need.count.keeper} keepers, ${need.count.spin} spinners, ${need.count.seam} seamers, ${need.count.batsman} batters)`;
+            if (dryRun) { log(`\u{1F441} Youth recruit (preview, not recruited): would request ${why}`); return { done: false }; }
+            const confirmDoc = await pressSaveInFrame(frame, next);
+            const finish = confirmDoc.querySelector('input[name="_finish"]');
+            if (!finish) throw new Error('recruit confirmation page not found — not recruited');
+            await pressSaveInFrame(frame, finish);
+            const after = await fetchYouthGrid();
+            const known = new Set(before.map(p => String(p.id)));
+            const recruit = after.find(p => !known.has(String(p.id)));
+            if (!recruit) throw new Error('recruited, but the new youth was not found in the squad — check the youth squad');
+            const details = await fetchPlayerPageDetails(recruit.id);
+            if (details.experience != null) recruit.experience = details.experience;
+            if (details.wage != null) recruit.wage = details.wage;
+            if (details.talents && details.talents.length) recruit.talents = details.talents;
+            if (details.captaincy != null) recruit.captaincy = details.captaincy;
+            if (details.rating) recruit.rating = details.rating;
+            const cache = loadPlayerCache();
+            const academyInfo = loadAcademyCache();
+            const squadContext = { ...squadCounts([...(cache ? cache.players.filter(p => !isYouthAge(p.age)) : []), ...after]), academyInfo, financeInfo: loadFinanceCache() };
+            const proj = computePlayerCeiling(recruit, getAcademySpeedForPlayer(recruit, academyInfo), squadContext, 25).ceiling;
+            const desc = `${recruit.name} (${formatAgeDisplay(recruit.age)}, ${RECRUIT_TYPE_LABELS[need.type]} request; ${getPrimarySkillInfo(recruit).name} ${skillLabel(getPrimarySkillInfo(recruit).value)}${recruit.talents && recruit.talents.length ? ', ' + recruit.talents.join('/') : ''})`;
+            const st = pilotState();
+            st.recruits = (st.recruits || []).concat([{ at: Date.now(), id: recruit.id, name: recruit.name, proj: Math.round(proj), type: need.type }]).slice(-20);
+            // Same two gates as the transfer list: the user's scout base for
+            // the age (live: a 16yo with Dreadful technique/fielding and a
+            // 16k rating still "projected 61" — the 9-year training sim
+            // alone barely separates weak recruits) AND the 60-at-25 bar.
+            const base = checkScoutBenchmark(recruit);
+            const failedBase = base.hasBenchmark && !base.passed ? base.failed.join('; ') : '';
+            const verdict = failedBase ? failedBase : `projects ${Math.round(proj)} at 25 (below ${TRANSFER_MIN_PROJ_AT25})`;
+            if (proj >= TRANSFER_MIN_PROJ_AT25 && !failedBase) {
+                st.recruits[st.recruits.length - 1].kept = true; savePilotState(st);
+                log(`\u2705 Recruited ${desc} \u2014 projects ${Math.round(proj)} at 25 \u2192 kept`);
+                return { done: true, kept: recruit };
+            }
+            if (after.length - 1 < YOUTH_MIN_SQUAD) {
+                st.recruits[st.recruits.length - 1].kept = true; savePilotState(st);
+                log(`\u26A0 Recruited ${desc} \u2014 ${verdict}, but kept: retiring would drop the youth squad below ${YOUTH_MIN_SQUAD}`);
+                return { done: true, kept: recruit };
+            }
+            const pf = await loadHiddenFrame(`https://www.fromthepavilion.org/player.htm?playerId=${encodeURIComponent(recruit.id)}`);
+            try {
+                const retire = pf.contentDocument.querySelector('input[type=submit][value="Retire Player"]');
+                if (!retire) throw new Error(`Retire button not found for ${recruit.name} — retire him by hand`);
+                let resp = await pressSaveInFrame(pf, retire);
+                // The game may ask to confirm on a follow-up page.
+                const again = [...resp.querySelectorAll('form input[type=submit]')].find(b => /retire|confirm|yes/i.test(b.value || ''));
+                if (again && !/Change Training|Sell Player/i.test(again.value)) resp = await pressSaveInFrame(pf, again);
+            } finally { pf.remove(); }
+            const check = await fetchYouthGrid();
+            if (check.some(p => String(p.id) === String(recruit.id))) throw new Error(`${recruit.name} (${verdict}) is still in the squad after Retire — retire him by hand`);
+            st.recruits[st.recruits.length - 1].kept = false; savePilotState(st);
+            log(`\u{1F5D1} Recruited ${desc} \u2014 ${verdict} \u2192 retired`);
+            return { done: true };
+        } finally {
+            frame.remove();
+        }
+    }
+
     let _autoPilotRunning = false;
     async function runAutoPilot({ dryRun = false, force = false, log = () => {}, status = () => {} } = {}) {
         if (_autoPilotRunning) return false;
@@ -10149,7 +10263,12 @@ const progMap = { batting: 'batting', bowling: 'bowling', keeping: 'keeperbattin
         try {
             status('Refreshing data');
             await fetchAllData({ force });
-            if (force || dryRun || (st0.training && Date.now() - (st0.trainingAt || 0) > PILOT_TRAINING_EVERY_H * 3600e3)) {
+            let recruitKept = null;
+            if (force || dryRun || st0.recruit !== false) {
+                status('Youth recruit');
+                try { const r = await autoRecruitYouth(say, dryRun); recruitKept = r && r.kept; if (r && r.done && !dryRun) await fetchAllData({ force: true }); } catch (e) { say(`\u26A0 Youth recruit: ${e.message}`); }
+            }
+            if (recruitKept || force || dryRun || (st0.training && Date.now() - (st0.trainingAt || 0) > PILOT_TRAINING_EVERY_H * 3600e3)) {
                 status('Training');
                 try { await autoSubmitTraining(say, dryRun); } catch (e) { say(`\u26A0 Training not submitted: ${e.message}`); }
             }
