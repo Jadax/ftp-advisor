@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         FTP Advisor
 // @namespace    http://tampermonkey.net/
-// @version      8.119
+// @version      8.120
 // @description  Tactical/scouting advisor for fromthepavilion.org (cricket sim): team, tactics, pitch, training, transfer market, youth and squad plan advice with projections. Full changelog: github.com/Jadax/ftp-advisor
 // @author       Tushant Sharma
 // @license      MIT
@@ -1309,17 +1309,12 @@
         32: { primary: 0.20, power: 0.50, endurance: 0.80 }
     };
 
-    // Age-based training-speed multipliers, interpolated by WEEKS through
-    // the current year (v8.62). Previously rounded the age to a whole
-    // year, which made a 16y6w player train at the full age-16 rate and a
-    // 16y7w player jump straight to the age-17 rate — a cliff at the
-    // half-year for a decay that actually happens continuously. Training
-    // speed is a continuous quantity, so it now lerps between the current
-    // year's row and the next year's using the player's actual weeks
-    // (e.g. 16y6w primary = 1.20 - (5/14)*(1.20-1.15) ≈ 1.182 — weeks are
-    // 1-based since v8.64, so 16y6w is 5 completed weeks). Age 33+
-    // is not modelled in the source sheet and is clamped to the age-32
-    // rate (the interpolation's top-year clamp does this automatically).
+    // Interpolated by WEEK through the age-year. The workbook's formula
+    // cells use the start-of-year value, but its HARD-CODED cells (100 of
+    // them, presumably measured in-game: e.g. Batting at 17 = 111 where the
+    // formula gives 112) each equal this lerp 1-3 weeks into the year —
+    // the decline is continuous. At week 0 both agree (workbooktest.js).
+    // Clamped to 16..32.
     function getAgeTrainingMultiplier(age) {
         const c = Math.max(16, Math.min(32, age || 0));
         const out = { primary: 0.20, power: 0.50, endurance: 0.80 };
@@ -1330,18 +1325,17 @@
         return out;
     }
 
-    // Skill-level slowdown (Refs!I15:J23). Once a skill reaches
-    // Outstanding (10), each further level is ~15% slower to train than
-    // the one before it. Returns a multiplier <= 1 to apply on top of
-    // the age multiplier above, e.g. a skill at Exceptional (12) is
-    // training at roughly 0.85^2 = 72% of its "pre-slowdown" rate.
+    // Skill slowdown above Outstanding, as the workbook's weekly cells do
+    // it: gain x (1 - 0.15 x levels-above-10) on the CURRENT points
+    // (continuous, linear — Exceptional 12.0 trains at 70%, 14.0 at 40%).
+    // The old 0.85^levels stepped curve overstated top-end growth.
+    // `skillLevel` may be fractional (points / 1000).
     const SKILL_SLOWDOWN_THRESHOLD = 10; // Outstanding
-    const SKILL_SLOWDOWN_PER_LEVEL = 0.15; // 15% per level above threshold
+    const SKILL_SLOWDOWN_PER_LEVEL = 0.15;
 
     function getSkillSlowdownMultiplier(skillLevel) {
-        const levelsAbove = Math.max(0, Math.round(skillLevel) - SKILL_SLOWDOWN_THRESHOLD);
-        if (levelsAbove === 0) return 1;
-        return Math.pow(1 - SKILL_SLOWDOWN_PER_LEVEL, levelsAbove);
+        const above = (skillLevel || 0) - SKILL_SLOWDOWN_THRESHOLD;
+        return above > 0 ? Math.max(0, 1 - SKILL_SLOWDOWN_PER_LEVEL * above) : 1;
     }
 
     // Training Talent bonus: a matching Training Talent (e.g. "Gifted
@@ -2234,32 +2228,12 @@
         return levelNum >= 0 && levelNum < 10 ? Math.round(ACADEMY_LEVELS[levelNum + 1].cost * 2.5) : 0;
     }
 
-    // Multi-week training projections assume the academy improves over
-    // the horizon (the user WILL keep upgrading it — the live-scraped
-    // "Training Efficiency %" rises as the level does, which is why a
-    // better academy tomorrow must make a player's projected rating
-    // higher). The sim ramps each week's academy speed linearly from
-    // today's scraped value toward Deluxe (ACADEMY_SPEED[10] = max)
-    // over this many REAL years from the plan's start. Set to 0 to
-    // freeze the academy at its current level. The game exposes no
-    // upgrade schedule or pace, so 5 years is a tunable assumption,
-    // not a sourced number.
-    const ACADEMY_RAMP_YEARS = 5;
+    // 0 = projections use the academy you have NOW (user's method, and the
+    // workbook's: academy level is an input, not a forecast). > 0 ramps it
+    // toward Deluxe over that many years — an assumption with no game
+    // source, off since v8.120.
+    const ACADEMY_RAMP_YEARS = 0;
 
-    // Youth-week multiplier for MULTI-WEEK PROJECTIONS only (not the training
-    // page's weekly estimates). The workbook rates alone took a 16yo exactly on
-    // the user's YOUTH_DEV_CURVE (4/4/4) to 7/7/7 at 20 vs the curve's 9/9/8.
-    // Fitted at the user's real academy speed (Excellent, 1.18): 1.35 maps
-    // on-curve 16/17/19yos exactly onto the curve at 20 (18yo one level
-    // under). Re-fit if the academy level or real progression data changes.
-    const YOUTH_PROJECTION_CALIBRATION = 1.35;
-    // Deliberately youth-only: a 21-24 fit to AGE_SCOUT_THRESHOLDS (a
-    // cross-section of per-age minimums, not a trajectory) compounded with
-    // this one and drove every 16yo to the skill cap by 25 (no spread left).
-    function projectionCalibration(age) {
-        const a = age || 0;
-        return a < 21 ? YOUTH_PROJECTION_CALIBRATION : 1;
-    }
 
     // The academy LEVEL is the training boost (manual, rulespage=
     // youthacademy: "Each academy level above non-existent gives your
@@ -8459,13 +8433,23 @@ table.ftp-table {
         // Formula: efficiency% = 100 - ((players - 25) × 7.5), then
         // convert to multiplier (e.g. 30 players → 62.5% → 0.625).
         const squadMult = (opts && opts.squadSizePenalty !== undefined) ? opts.squadSizePenalty : 1;
+        const points = opts && opts.points;
         const result = {};
         for (const [skill, basePoints] of Object.entries(rates)) {
             const ageM = skill === 'power' ? ageMult.power : skill === 'endurance' ? ageMult.endurance : ageMult.primary;
             const hasGiftedMatch = isProdigy || talents.some(t => t.toLowerCase().includes('gifted') && t.toLowerCase().includes(skill));
             const talentM = hasGiftedMatch ? (1 + TRAINING_TALENT_BONUS) : 1;
-            const slowdownM = getSkillSlowdownMultiplier(player[skill] || 0);
-            result[skill] = Math.round(basePoints * academyRatio * ageM * talentM * slowdownM * (1 - fatiguePenalty) * squadMult);
+            // Workbook arithmetic exactly: INT(base x age x talent x academy),
+            // then above Outstanding INT(rate x (1 - 0.15 x levels-above-10))
+            // on the current points — applied only once that cut is >= 0.2
+            // points (the sheet's own guard). Verified cell-for-cell against
+            // its weekly-gain grid (workbooktest.js).
+            let gain = Math.floor(basePoints * ageM * talentM * academyRatio + 1e-9);
+            const level = points && points[skill] != null ? points[skill] / 1000 : (player[skill] || 0);
+            const above = level - SKILL_SLOWDOWN_THRESHOLD;
+            if (above > 0 && above * SKILL_SLOWDOWN_PER_LEVEL * gain >= 0.2) gain = Math.floor(gain * getSkillSlowdownMultiplier(level));
+            if (fatiguePenalty || squadMult !== 1) gain = Math.floor(gain * (1 - fatiguePenalty) * squadMult);
+            result[skill] = gain;
         }
         return result;
     }
@@ -8664,12 +8648,13 @@ table.ftp-table {
             }
 
             if (program === 'rest') continue; // no skill gain this week
-            const squadMult = squadPenaltyMultiplier(squadSizeForPlayer(simPlayer, squadContext))
-                * projectionCalibration(simPlayer.age);
+            const squadMult = squadPenaltyMultiplier(squadSizeForPlayer(simPlayer, squadContext));
             const gainOpts = squadMult !== 1 ? { squadSizePenalty: squadMult } : undefined;
             // Academy improves over the horizon — later weeks train at a
             // higher speed than earlier ones (see academySpeedAtWeek).
-            const gains = estimateWeeklyTrainingGain(program, simPlayer, academySpeedAtWeek(academySpeed, week - 1), gainOpts);
+            const points = {};
+            ADAPTIVE_PLAN_SKILLS.forEach(skill => { points[skill] = state[skill].level * 1000 + state[skill].progress; });
+            const gains = estimateWeeklyTrainingGain(program, simPlayer, academySpeedAtWeek(academySpeed, week - 1), Object.assign({}, gainOpts || {}, { points }));
             if (!gains) continue;
             Object.keys(gains).forEach(skill => {
                 if (!state[skill] || state[skill].level >= 15) return;
@@ -10764,8 +10749,8 @@ const progMap = { batting: 'batting', bowling: 'bowling', keeping: 'keeperbattin
                         e.eval.warnings.push(`Age ${age} — past prime years for senior transfer`);
                         return false;
                     }
-                    // User's bar, every age (youth projections are curve-calibrated,
-                    // see YOUTH_PROJECTION_CALIBRATION): must project to 60+ at 25.
+                    // User's bar, every age: must project to 60+ at 25 (projection =
+                    // the workbook's method: current academy, perfect training).
                     // Applied only once experience/talents are fetched: before that
                     // the projection runs 5+ low (Geyer 55 -> 60) and a pre-fetch
                     // margin hid real targets — which then never got fetched.
