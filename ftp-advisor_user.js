@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         FTP Advisor
 // @namespace    http://tampermonkey.net/
-// @version      8.122
+// @version      8.123
 // @description  Tactical/scouting advisor for fromthepavilion.org (cricket sim): team, tactics, pitch, training, transfer market, youth and squad plan advice with projections. Full changelog: github.com/Jadax/ftp-advisor
 // @author       Tushant Sharma
 // @license      MIT
@@ -1350,22 +1350,25 @@
     const TRAINING_TALENT_BONUS = 0.20;
 
     // ============================================================
-    // YOUTH DEVELOPMENT CURVE (user-specified benchmarks)
-    // Age-by-age minimum targets for a youth prospect worth keeping on
-    // track. "primary" = batting for batsmen, bowling for bowlers,
-    // keeping for wicketkeepers (wicketkeepers are also checked against
-    // batting separately, per the user's "keeping AND batting" note).
-    // Where the user gave a range (e.g. "Capable to Reliable") the
-    // lower bound is used as the pass/fail line and the upper bound as
-    // the "ahead of curve" line.
+    // YOUTH DEVELOPMENT CURVE — minimum (on track) and good (ahead) per age.
+    // "primary" = batting / bowling / keeping by role (keepers also checked
+    // on batting). The community curve (16 Average … 19 Accomplished, 20
+    // Expert/Expert/Reliable-Accomplished) was checked against the workbook
+    // training arithmetic at Excellent academy with every split of
+    // Fielding/Batting-Tech/Batting weeks: its 18 -> 19 step (Capable ->
+    // Accomplished) can't be trained in a year, so a 16yo at its own
+    // minimum can't reach its age-20 target. The user chose "keep it
+    // realistic" (2026-11): these minimums are reachable step by step and
+    // over 16 -> 20 for a typical player (half a level into each skill),
+    // and the "good" line (the community curve shifted a step) is too.
     // ============================================================
     const YOUTH_DEV_CURVE = {
-        16: { primary: 4, technique: 4, fielding: 4 },                                   // Average
-        17: { primary: 5, technique: 5, fielding: 5 },                                   // Reasonable
-        18: { primary: 6, primaryGood: 7, technique: 6, techniqueGood: 7, fielding: 6 },  // Capable→Reliable / Capable
-        19: { primary: 8, technique: 8, fielding: 6, fieldingGood: 7 },                   // Accomplished / Capable+
-        20: { primary: 9, technique: 9, fielding: 7, fieldingGood: 8,                    // Expert / Reliable→Accomplished (user, 2026-11)
-             endurance: 3, experience: 3 }                                               // Ordinary+
+        16: { primary: 4, primaryGood: 5, technique: 4, techniqueGood: 5, fielding: 4, fieldingGood: 5 },  // Average / Reasonable
+        17: { primary: 5, primaryGood: 6, technique: 5, techniqueGood: 6, fielding: 5, fieldingGood: 6 },  // Reasonable / Capable
+        18: { primary: 6, primaryGood: 7, technique: 6, techniqueGood: 7, fielding: 6, fieldingGood: 6 },  // Capable / Reliable, fielding Capable
+        19: { primary: 7, primaryGood: 8, technique: 7, techniqueGood: 8, fielding: 6, fieldingGood: 7 },  // Reliable / Accomplished, fielding Capable / Reliable
+        20: { primary: 8, primaryGood: 9, technique: 8, techniqueGood: 9, fielding: 7, fieldingGood: 8,    // Accomplished / Expert, fielding Reliable / Accomplished
+             endurance: 3, experience: 3 }                                                                 // Ordinary+
     };
 
     // Delegates to getPrimarySkillInfo() — this used to be a separate
