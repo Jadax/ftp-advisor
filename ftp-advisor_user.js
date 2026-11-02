@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         FTP Advisor
 // @namespace    http://tampermonkey.net/
-// @version      8.120
+// @version      8.121
 // @description  Tactical/scouting advisor for fromthepavilion.org (cricket sim): team, tactics, pitch, training, transfer market, youth and squad plan advice with projections. Full changelog: github.com/Jadax/ftp-advisor
 // @author       Tushant Sharma
 // @license      MIT
@@ -1364,7 +1364,7 @@
         17: { primary: 5, technique: 5, fielding: 5 },                                   // Reasonable
         18: { primary: 6, primaryGood: 7, technique: 6, techniqueGood: 7, fielding: 6 },  // Capable→Reliable / Capable
         19: { primary: 8, technique: 8, fielding: 6, fieldingGood: 7 },                   // Accomplished / Capable+
-20: { primary: 9, technique: 9, fielding: 8,                                    // Expert / Accomplished
+        20: { primary: 9, technique: 9, fielding: 7, fieldingGood: 8,                    // Expert / Reliable→Accomplished (user, 2026-11)
              endurance: 3, experience: 3 }                                               // Ordinary+
     };
 
@@ -3776,7 +3776,7 @@ button{font:inherit;color:inherit;cursor:pointer}
 <div class="sec"><div class="h">Switches</div>
 ${sw('enabled', '<b>Autopilot</b> \u2014 runs in the background on any page', st.enabled)}
 ${sw('training', 'Submit training (every ' + PILOT_TRAINING_EVERY_H + ' h)', st.training)}
-${sw('recruit', 'Weekly youth recruit \u2014 keep if \u2265' + TRANSFER_MIN_PROJ_AT25 + ' at 25, else retire', st.recruit !== false)}
+${sw('recruit', 'Weekly youth recruit \u2014 keep if on track for your development curve, else retire', st.recruit !== false)}
 ${sw('ordersOn', 'Submit match orders (within ' + AUTOPILOT_ORDERS_WINDOW_HOURS + ' h of the start)', st.ordersOn !== false)}</div>
 <div class="sec"><div class="h">Prep</div>
 ${ck(cache && cache.ageHours < 6, `Squad data \u2014 ${cache ? esc(getCacheAgeText(cache.ageDays)) : 'not loaded'}`)}
@@ -10209,10 +10209,11 @@ const progMap = { batting: 'batting', bowling: 'bowling', keeping: 'keeperbattin
             // alone barely separates weak recruits) AND the 60-at-25 bar.
             const base = checkScoutBenchmark(recruit);
             const failedBase = base.hasBenchmark && !base.passed ? base.failed.join('; ') : '';
-            const verdict = failedBase ? failedBase : `projects ${Math.round(proj)} at 25 (below ${TRANSFER_MIN_PROJ_AT25})`;
-            if (proj >= TRANSFER_MIN_PROJ_AT25 && !failedBase) {
+            const bar = minProjectionAt25(recruit, { academyInfo, squadContext });
+            const verdict = failedBase ? failedBase : `projects ${Math.round(proj)} at 25, below the ${bar} an on-curve ${ageYears(recruit.age)}-year-old reaches`;
+            if (proj >= bar && !failedBase) {
                 st.recruits[st.recruits.length - 1].kept = true; savePilotState(st);
-                log(`\u2705 Recruited ${desc} \u2014 projects ${Math.round(proj)} at 25 \u2192 kept`);
+                log(`\u2705 Recruited ${desc} \u2014 projects ${Math.round(proj)} at 25 (on-curve bar ${bar}) \u2192 kept`);
                 return { done: true, kept: recruit };
             }
             if (after.length - 1 < YOUTH_MIN_SQUAD) {
@@ -10757,8 +10758,9 @@ const progMap = { batting: 'batting', bowling: 'bowling', keeping: 'keeperbattin
                     {
                         const known = (e.experience || 0) > 0 || (e.wage || 0) > 0;
                         const proj = e._dynastyCeiling ? e._dynastyCeiling.ceiling : 0;
-                        if (known && proj < TRANSFER_MIN_PROJ_AT25) {
-                            e.eval.warnings.push(`Projects ${Math.round(proj)} at 25 — below the ${TRANSFER_MIN_PROJ_AT25} bar`);
+                        const bar = minProjectionAt25(e, projOpts);
+                        if (known && proj < bar) {
+                            e.eval.warnings.push(`Projects ${Math.round(proj)} at 25 — below the ${bar} an on-curve player of his age and role reaches`);
                             return false;
                         }
                     }
@@ -11988,7 +11990,36 @@ const progMap = { batting: 'batting', bowling: 'bowling', keeping: 'keeperbattin
     // buy, 16yo included, is ultimately a first-team bet (user's aim).
     // TRANSFER_XI_SLOTS = how deep in a role a player still makes a typical XI.
     const TRANSFER_XI_SLOTS = { batting: 5, bowling: 5, keeping: 1 };
-    const TRANSFER_MIN_PROJ_AT25 = 60; // user's buying bar, all ages (to-25 projection)
+    // The buying/keeping bar (user, 2026-11, answering "where should the
+    // bar sit" with their development curve): a player has good potential
+    // when he projects at 25 at least as well as a player of his age and
+    // role sitting exactly ON the curve (YOUTH_DEV_CURVE minimums, Ordinary
+    // endurance, the base's experience for that age), trained the same way
+    // at the same academy. 21+ are held to the age-20 curve player (the
+    // curve ends at 20). Replaces the flat 60, whose meaning moved when the
+    // projection was aligned to the workbook (v8.120).
+    const _curveBarCache = new Map();
+    function curveBenchmarkProjection(age, role, projOpts) {
+        const a = Math.max(16, Math.min(20, ageYears(age || 16)));
+        const academyInfo = projOpts && projOpts.academyInfo;
+        const speed = getAcademySpeedForPlayer({ age: a }, academyInfo);
+        const key = [a, role, speed].join('|');
+        if (!_curveBarCache.has(key)) {
+            const c = YOUTH_DEV_CURVE[a];
+            const exp = interpAgeTableValue(AGE_SCOUT_THRESHOLDS, a, 'experience') || 1;
+            const p = { id: 'curve-' + key, name: 'curve', age: a, talents: [], fatigue: 10, form: 5,
+                batting: 1, bowling: 1, keeping: 1, technique: c.technique, fielding: c.fielding,
+                endurance: c.endurance || 3, power: 3, experience: c.experience || exp,
+                bowlerType: role === 'bowling' ? 'rm' : '', bowlerCategory: role === 'bowling' ? 'seam' : 'none' };
+            if (role === 'keeping') { p.keeping = c.primary; p.batting = Math.max(1, c.primary - 2); }
+            else p[role === 'bowling' ? 'bowling' : 'batting'] = c.primary;
+            _curveBarCache.set(key, computePlayerCeiling(p, speed, (projOpts && projOpts.squadContext) || {}, 25).ceiling);
+        }
+        return _curveBarCache.get(key);
+    }
+    function minProjectionAt25(player, projOpts) {
+        return Math.round(curveBenchmarkProjection(player.age, getPrimarySkillInfo(player).name, projOpts));
+    }
     function squadRankLines(candidate, squadPlayers, projOpts) {
         const role = getPrimarySkillInfo(candidate).name;
         const youth = isYouthAge(candidate.age);
