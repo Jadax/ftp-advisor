@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         FTP Advisor
 // @namespace    http://tampermonkey.net/
-// @version      8.124
+// @version      8.125
 // @description  Tactical/scouting advisor for fromthepavilion.org (cricket sim): team, tactics, pitch, training, transfer market, youth and squad plan advice with projections. Full changelog: github.com/Jadax/ftp-advisor
 // @author       Tushant Sharma
 // @license      MIT
@@ -1757,6 +1757,16 @@
         _saveCache(ACADEMY_CACHE_KEY, ACADEMY_TIMESTAMP_KEY, info);
     }
     function academyKnown(info) { return !!(info && info.level && info.level !== 'unknown'); }
+    // Projection pages call this when the cached academy is unknown: one
+    // fetch per page load, then `rerender` — so nothing projects at the
+    // no-academy speed when the real level is a request away.
+    let _academyEnsure = null;
+    function ensureAcademyThen(rerender) {
+        if (academyKnown(loadAcademyCache()) || _academyEnsure) return;
+        _academyEnsure = fetchAcademyFromPage(`https://www.fromthepavilion.org/academies.htm?teamId=${TEAM_ID}`)
+            .then(info => { saveAcademyCache(info); if (academyKnown(loadAcademyCache())) rerender(); })
+            .catch(e => console.warn('[FTP Academy] fetch failed', e));
+    }
     function loadAcademyCache() { return _loadCacheRaw(ACADEMY_CACHE_KEY); }
     function saveFinanceCache(info) { _saveCache(FINANCE_CACHE_KEY, FINANCE_TIMESTAMP_KEY, info); }
     function loadFinanceCache() { return _loadCacheRaw(FINANCE_CACHE_KEY); }
@@ -3578,7 +3588,7 @@
                         }
                         const parser = new DOMParser();
                         const doc = parser.parseFromString(resp.responseText, 'text/html');
-                        const result = { experience: null, wage: null, wageDiscount: null, talents: [], captaincy: null, gameRatings: null, isLeftHanded: null, rating: null };
+                        const result = { experience: null, wage: null, wageDiscount: null, talents: [], captaincy: null, gameRatings: null, isLeftHanded: null, rating: null, skills: {} };
 
                         // Quick sanity check: if we got the login page, bail
                         if (doc.querySelector('input[name="username"]') || resp.responseText.length < 500) {
@@ -3615,7 +3625,9 @@
                             let td = th.nextElementSibling;
                             if (!td || td.tagName !== 'TD') continue;
 
-                            if (label === 'experience' && result.experience === null) {
+                            if (PLAYER_PAGE_SKILLS.includes(label) && result.skills[label] == null) {
+                                result.skills[label] = parseSkill(td.textContent.trim().toLowerCase());
+                            } else if (label === 'experience' && result.experience === null) {
                                 const val = td.textContent.trim().toLowerCase();
                                 result.experience = parseSkill(val);
                             } else if (label === 'captaincy' && result.captaincy === null) {
@@ -3657,6 +3669,7 @@
 
     // Fetch details for all priority buy players with rate limiting
     const GAME_ROLE_RATING_LABELS = ['batsman', 'bowler', 'keeper', 'allrounder'];
+    const PLAYER_PAGE_SKILLS = ['batting', 'bowling', 'keeping', 'technique', 'power', 'fielding', 'endurance'];
 
     // Own squad's game role ratings, refreshed at most daily (one player
     // page each, through the request queue) — cached separately so the
@@ -3909,6 +3922,9 @@ ${matches.length ? matches.map(([id, m]) => ck(true, `Orders: ${esc(m.teams)} \u
             if (details.captaincy !== null) p.captaincy = details.captaincy;
             if (details.gameRatings) p.gameRatings = details.gameRatings;
             if (details.isLeftHanded != null) p.isLeftHanded = details.isLeftHanded;
+            // The player page is the authority for skills: a column the search
+            // table doesn't show parses as 0 and would sink the projection.
+            if (details.skills && Object.keys(details.skills).length >= 5) Object.assign(p, details.skills);
             if (onUpdate) onUpdate(i, players.length);
             if (!cached && i < players.length - 1) await new Promise(r => setTimeout(r, DELAY_MS));
         }
@@ -10653,6 +10669,7 @@ const progMap = { batting: 'batting', bowling: 'bowling', keeping: 'keeperbattin
     }
 
     function updateTransferAdvisor(scannedResults) {
+        ensureAcademyThen(() => updateTransferAdvisor(scannedResults));
         // ---- Parse live search results from the page ----
         const resultsEl = document.getElementById('ftp-transfer-results');
         const financeInfo = loadFinanceCache();
@@ -12063,6 +12080,7 @@ const progMap = { batting: 'batting', bowling: 'bowling', keeping: 'keeperbattin
     }
 
     function updatePlayerAdvisor() {
+        ensureAcademyThen(() => updatePlayerAdvisor());
         const verdictEl = document.getElementById('ftp-player-verdict');
         const compareEl = document.getElementById('ftp-player-compare');
         const player = scrapePlayerDetailPage();
