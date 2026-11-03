@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         FTP Advisor
 // @namespace    http://tampermonkey.net/
-// @version      8.123
+// @version      8.124
 // @description  Tactical/scouting advisor for fromthepavilion.org (cricket sim): team, tactics, pitch, training, transfer market, youth and squad plan advice with projections. Full changelog: github.com/Jadax/ftp-advisor
 // @author       Tushant Sharma
 // @license      MIT
@@ -404,9 +404,18 @@
      * purpose so their existing, separately-reasoned gate isn't doubled
      * up or overridden here.
      */
-    const BATTING_RELEVANT_TALENTS = /skilled \(batting\)|skilled \(power\)|gifted \(batting\)|gifted \(power\)|^opener$|finisher|accumulator|boundary hitter/i;
+    const BATTING_RELEVANT_TALENTS = /skilled \(batting\)|gifted \(batting\)|^opener$|finisher|accumulator|boundary hitter/i;
     const BOWLING_RELEVANT_TALENTS = /skilled \(bowling\)|gifted \(bowling\)|new ball bowler|old ball bowler|wrongun|flipper|swing|bouncer|yorker|slower ball|arm ball|doosra/i;
-    function isTalentRoleAligned(talentText, primaryName) {
+    // Power serves batters AND pace bowlers (manual, rulespage=playerskills:
+    // fast/fast-medium/medium bowlers with high power "occasionally" take a
+    // wicket with a faster delivery) — not spinners. Was batting-only, which
+    // told a seamer his Skilled (Power) "contributes nothing".
+    const POWER_TALENTS = /(skilled|gifted) \(power\)/i;
+    function isTalentRoleAligned(talentText, primaryName, player) {
+        if (POWER_TALENTS.test(talentText)) {
+            return primaryName === 'batting' || primaryName === 'keeping'
+                || (primaryName === 'bowling' && (!player || player.bowlerCategory !== 'spin'));
+        }
         if (BATTING_RELEVANT_TALENTS.test(talentText)) return primaryName === 'batting' || primaryName === 'keeping';
         if (BOWLING_RELEVANT_TALENTS.test(talentText)) return primaryName === 'bowling';
         return true; // generic, or handled by its own dedicated gate elsewhere
@@ -435,7 +444,7 @@
     // talent counts 0, see isTalentRoleAligned(); Sturdy via talentWeight().
     function alignedTalentWeight(player) {
         const primaryName = getPrimarySkillInfo(player).name;
-        return (player.talents || []).filter(t => isTalentRoleAligned(t, primaryName))
+        return (player.talents || []).filter(t => isTalentRoleAligned(t, primaryName, player))
             .reduce((sum, t) => sum + talentWeight(t, player.age), 0);
     }
 
@@ -488,7 +497,7 @@
         // talent score. See isTalentRoleAligned().
         const talents = player.talents || [];
         const isYouth = (player.age || 0) < 21;
-        const aligned = (re) => talents.some(t => re.test(t) && isTalentRoleAligned(t, primaryInfo.name));
+        const aligned = (re) => talents.some(t => re.test(t) && isTalentRoleAligned(t, primaryInfo.name, player));
         if (talents.some(t => /prodigy/i.test(t)) && isYouth) sum += 3; // generic — all skills
         if (aligned(/skilled/i)) sum += 2;
         if (aligned(/gifted/i) && isYouth) sum += 1;
@@ -1736,7 +1745,18 @@
     }
 
     // ── Academy / Finance / Ground caches ─────────────────────
-    function saveAcademyCache(info) { _saveCache(ACADEMY_CACHE_KEY, ACADEMY_TIMESTAMP_KEY, info); }
+    // An expired session serves login.html, which parses to level 'unknown'
+    // (levelNum 0 = speed 1.00). Saved, that silently cut every projection
+    // for 24 h (Gannile 58 -> 55 at 25). Keep the last good level and leave
+    // the timestamp stale so the next pass retries.
+    function saveAcademyCache(info) {
+        if (!info || !info.level || info.level === 'unknown') {
+            console.warn('[FTP Academy] Page had no academy level (logged out?) — keeping the cached level');
+            return;
+        }
+        _saveCache(ACADEMY_CACHE_KEY, ACADEMY_TIMESTAMP_KEY, info);
+    }
+    function academyKnown(info) { return !!(info && info.level && info.level !== 'unknown'); }
     function loadAcademyCache() { return _loadCacheRaw(ACADEMY_CACHE_KEY); }
     function saveFinanceCache(info) { _saveCache(FINANCE_CACHE_KEY, FINANCE_TIMESTAMP_KEY, info); }
     function loadFinanceCache() { return _loadCacheRaw(FINANCE_CACHE_KEY); }
@@ -2538,7 +2558,7 @@
             if (hasTalent(/gifted.*technique/i)) { score += 2; strengths.push('Gifted (Technique) — trains technique faster'); }
             if (hasTalent(/gifted.*fielding/i)) { score += 1; strengths.push('Gifted (Fielding) — trains fielding faster'); }
             if (hasTalent(/gifted.*endurance/i)) { score += 1; strengths.push('Gifted (Endurance) — trains endurance faster'); }
-            if (hasTalent(/gifted.*power/i) && battingRelevant) { score += 1; strengths.push('Gifted (Power) — trains power faster'); }
+            if (hasTalent(/gifted.*power/i) && isTalentRoleAligned('Gifted (Power)', primaryName, player)) { score += 1; strengths.push('Gifted (Power) — trains power faster'); }
             if (hasTalent(/natural leader/i)) { score += 1; strengths.push('Natural Leader — captaincy bonus'); }
             if (hasTalent(/sturdy/i)) { score += talentWeight('Sturdy', player.age); strengths.push(sturdyNote(player.age)); }
 
@@ -2571,7 +2591,7 @@
             const ALREADY_EXPLAINED_TALENTS = /gifted \(batting\)|gifted \(bowling\)|skilled \(batting\)|skilled \(bowling\)/i;
             talents.forEach(t => {
                 if (ALREADY_EXPLAINED_TALENTS.test(t)) return;
-                if (!isTalentRoleAligned(t, primaryName)) {
+                if (!isTalentRoleAligned(t, primaryName, player)) {
                     warnings.push(`${t} present but primary role is ${primaryName} — mismatched, contributes nothing`);
                 }
             });
@@ -2709,7 +2729,7 @@
         if (hasTalent(/gifted.*technique/i)) { score += 1; strengths.push('Gifted (Technique) — trains technique faster'); }
         if (hasTalent(/gifted.*fielding/i)) { strengths.push('Gifted (Fielding) — trains fielding faster'); }
         if (hasTalent(/gifted.*endurance/i)) { strengths.push('Gifted (Endurance) — trains endurance faster'); }
-        if (hasTalent(/gifted.*power/i) && battingRelevant) { strengths.push('Gifted (Power) — trains power faster'); }
+        if (hasTalent(/gifted.*power/i) && isTalentRoleAligned('Gifted (Power)', primaryName, player)) { strengths.push('Gifted (Power) — trains power faster'); }
 
         // Match performance talents (immediate value)
         if (hasTalent(/skilled.*batting/i)) {
@@ -2721,7 +2741,7 @@
             else warnings.push('Skilled (Bowling) present but primary role is ' + primaryName + ' — rarely triggers');
         }
         if (hasTalent(/skilled.*technique/i)) { score += 1; strengths.push('Skilled (Technique) — bonus during matches'); }
-        if (hasTalent(/skilled.*power/i) && battingRelevant) { score += 1; strengths.push('Skilled (Power) — bonus during matches'); }
+        if (hasTalent(/skilled.*power/i) && isTalentRoleAligned('Skilled (Power)', primaryName, player)) { score += 1; strengths.push('Skilled (Power) — bonus during matches'); }
         if (hasTalent(/natural leader/i)) { score += 1; strengths.push('Natural Leader — captaincy bonus during matches'); }
         if (hasTalent(/sturdy/i)) { score += talentWeight('Sturdy', player.age); strengths.push(sturdyNote(player.age)); }
 
@@ -2761,7 +2781,7 @@
         const ALREADY_EXPLAINED_TALENTS = /gifted \(batting\)|gifted \(bowling\)|skilled \(batting\)|skilled \(bowling\)/i;
         talents.forEach(t => {
             if (ALREADY_EXPLAINED_TALENTS.test(t)) return;
-            if (!isTalentRoleAligned(t, primaryName)) {
+            if (!isTalentRoleAligned(t, primaryName, player)) {
                 warnings.push(`${t} present but primary role is ${primaryName} — mismatched, contributes nothing`);
             }
         });
@@ -3270,7 +3290,7 @@
         }
 
         // 2. Academy
-        if (force || isStale(ACADEMY_TIMESTAMP_KEY, STALE_ACADEMY_HOURS)) {
+        if (force || isStale(ACADEMY_TIMESTAMP_KEY, STALE_ACADEMY_HOURS) || !academyKnown(loadAcademyCache())) {
             labels.push('academy');
             promises.push(
                 fetchAcademyFromPage(`https://www.fromthepavilion.org/academies.htm?teamId=${TEAM_ID}`)
@@ -9117,7 +9137,7 @@ const progMap = { batting: 'batting', bowling: 'bowling', keeping: 'keeperbattin
             cacheAgeHours,
             playersWithSkills,
             totalPlayers: players.length,
-            hasAcademyInfo: !!academyInfo,
+            hasAcademyInfo: academyKnown(academyInfo),
             hasFinanceInfo: !!financeInfo,
             hasOpponentData: null,
             matchTypeKnown: null,
@@ -10652,7 +10672,7 @@ const progMap = { batting: 'batting', bowling: 'bowling', keeping: 'keeperbattin
                 cacheAgeHours: cache ? cache.ageHours : null,
                 playersWithSkills: allPlayers.filter(p => (p.batting || 0) > 0).length,
                 totalPlayers: allPlayers.length,
-                hasAcademyInfo: !!loadAcademyCache(),
+                hasAcademyInfo: academyKnown(loadAcademyCache()),
                 hasFinanceInfo: !!financeInfo,
                 hasOpponentData: null,
                 matchTypeKnown: null,
@@ -11400,7 +11420,7 @@ const progMap = { batting: 'batting', bowling: 'bowling', keeping: 'keeperbattin
     function youthTalentProtection(player) {
         const talents = player.talents || [];
         const role = getPrimarySkillInfo(player).name;
-        const aligned = (re) => talents.some(t => re.test(t) && isTalentRoleAligned(t, role));
+        const aligned = (re) => talents.some(t => re.test(t) && isTalentRoleAligned(t, role, player));
         let protect = 0;
         if (talents.some(t => /prodigy/i.test(t))) protect += 15;
         if (aligned(/gifted/i)) protect += 6;
@@ -11505,7 +11525,7 @@ const progMap = { batting: 'batting', bowling: 'bowling', keeping: 'keeperbattin
         // silently misleading without this note \u2014 same pattern as the
         // transfer page's academyContext line.
         const squadPlanAcademyInfo = loadAcademyCache();
-        const academyPlanNote = (!squadPlanAcademyInfo || !squadPlanAcademyInfo.level || squadPlanAcademyInfo.level === 'unknown')
+        const academyPlanNote = !academyKnown(squadPlanAcademyInfo)
             ? `<div class="vj-text-xs" style="color:var(--vj-amber);margin-bottom:6px;">\u26a0 Academy not cached yet \u2014 Dynasty ceilings below use a 100% generic training-speed fallback. Visit the Academy page once for accurate numbers (they can shift once the real speed loads).</div>`
             : '';
 
@@ -11960,7 +11980,8 @@ const progMap = { batting: 'batting', bowling: 'bowling', keeping: 'keeperbattin
         if (player._dynastyCeiling && player._dynastyCeiling.ceiling != null) return player._dynastyCeiling;
         const academyInfo = projOpts && projOpts.academyInfo;
         const speed = getAcademySpeedForPlayer(player, academyInfo);
-        const key = [player.id, player.name, player.age, player.batting, player.bowling, player.keeping, player.technique, player.fielding, player.endurance, player.power, player.experience, (player.talents || []).join(','), speed].join('|');
+        const key = [player.id, player.name, player.age, player.batting, player.bowling, player.keeping, player.technique, player.fielding, player.endurance, player.power, player.experience, (player.talents || []).join(','), player.bowlerCategory, speed,
+            squadSizeForPlayer(player, (projOpts && projOpts.squadContext) || {})].join('|');
         if (!_peerProjectionCache.has(key)) {
             _peerProjectionCache.set(key, computePlayerCeiling(player, speed, (projOpts && projOpts.squadContext) || {}, 25));
         }
@@ -12112,7 +12133,7 @@ const progMap = { batting: 'batting', bowling: 'bowling', keeping: 'keeperbattin
                 return vpk != null ? ` · ${vpk.toFixed(1)} skill/$K` : '';
             })()} ${spareRatingBadge(computeSpareRating(player))}</div>
             <div class="vj-text-xs vj-mb-4"><span class="vj-fw-700">Dynasty Score:</span> ${dynastyCeiling.current.toFixed(1)} now → <span class="vj-fw-700" style="color:var(--vj-gold);">${dynastyCeiling.ceiling.toFixed(1)} ceiling</span> (${dynastyCeiling.label}, age/academy/training-aware — same units as the sell lists and transfer market, safe to compare across ages)</div>
-            ${!academyInfo ? `<div class="vj-text-xs" style="color:var(--vj-amber);margin-bottom:4px;">⚠ Academy data not cached yet — Dynasty Score/Overall Rating above are using a 100% generic training-speed fallback, NOT your real academy efficiency. Visit the Academy page once, then reload this page — the ceiling can shift noticeably once the real (usually lower) speed is known.</div>` : ''}`;
+            ${!academyKnown(academyInfo) ? `<div class="vj-text-xs" style="color:var(--vj-amber);margin-bottom:4px;">⚠ Academy level unknown — Dynasty Score/Overall Rating above assume the slowest academy (no training boost). Visit the Academy page (logged in), then reload — projections rise to your real academy's speed.</div>` : ''}`;
 
         if (evalResult.strengths.length > 0) {
             html += `<div class="vj-text-xs vj-mt-4" style="color:var(--vj-green);">✓ ${evalResult.strengths.join(' · ')}</div>`;
