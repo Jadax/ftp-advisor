@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         FTP Advisor
 // @namespace    http://tampermonkey.net/
-// @version      8.129
+// @version      8.130
 // @description  Tactical/scouting advisor for fromthepavilion.org (cricket sim): team, tactics, pitch, training, transfer market, youth and squad plan advice with projections. Full changelog: github.com/Jadax/ftp-advisor
 // @author       Tushant Sharma
 // @license      MIT
@@ -3700,13 +3700,18 @@
     // Advisor-run transfer searches (live-verified transfer.htm POST form,
     // 2026-10): skill ids Batting 5 / Bowling 6 / Keeping 8 / Technique 3;
     // level values are the advisor's scale + 1 (expert = 10); 20 rows a
-    // page, `page` is 0-based. Targets = the user's buying plan: 16-17yo
-    // first-team prospects and 20-21yo development signings, each split by
-    // role so the server-side skill filter does the first cut.
+    // page, `page` is 0-based. Targets = the user's buying plan (2026-11:
+    // "youth 16-18, senior 20-21 only, I don't want to buy anyone else"),
+    // each split by role so the server-side skill filter does the first cut.
+    const TRANSFER_BUY_AGES = [[16, 18], [20, 21]];
+    function buyAgeAllowed(age) {
+        const y = ageYears(age);
+        return TRANSFER_BUY_AGES.some(([lo, hi]) => y >= lo && y <= hi);
+    }
     const MARKET_SCANS = [
-        { label: '16-17 batters', fromAge: 16, toAge: 17, skill: 5, min: 4 },
-        { label: '16-17 bowlers', fromAge: 16, toAge: 17, skill: 6, min: 4 },
-        { label: '16-17 keepers', fromAge: 16, toAge: 17, skill: 8, min: 4 },
+        { label: '16-18 batters', fromAge: 16, toAge: 18, skill: 5, min: 4 },
+        { label: '16-18 bowlers', fromAge: 16, toAge: 18, skill: 6, min: 4 },
+        { label: '16-18 keepers', fromAge: 16, toAge: 18, skill: 8, min: 4 },
         { label: '20-21 batters', fromAge: 20, toAge: 21, skill: 5, min: 9 },
         { label: '20-21 bowlers', fromAge: 20, toAge: 21, skill: 6, min: 9 },
         { label: '20-21 keepers', fromAge: 20, toAge: 21, skill: 8, min: 9 }
@@ -10647,7 +10652,7 @@ const progMap = { batting: 'batting', bowling: 'bowling', keeping: 'keeperbattin
             sections: [
                 { id: 'ftp-transfer-gaps', label: 'Squad Gaps', icon: '\u26A0', iconColor: 'amber' },
                 { id: 'ftp-transfer-scan', label: 'Market Scan', icon: '\u{1F50E}', iconColor: 'purple',
-                  content: '<div class="vj-flex vj-gap-6" style="align-items:center;flex-wrap:wrap;"><button id="ftp-market-scan" class="vj-btn vj-btn-sm" style="font-size:12px;padding:4px 10px;cursor:pointer;">\u{1F50E} Scan market: 16-17 prospects + 20-21 signings</button><span id="ftp-market-scan-status" class="vj-text-xs vj-text-muted">Runs the searches for you; results appear below.</span></div>' },
+                  content: '<div class="vj-flex vj-gap-6" style="align-items:center;flex-wrap:wrap;"><button id="ftp-market-scan" class="vj-btn vj-btn-sm" style="font-size:12px;padding:4px 10px;cursor:pointer;">\u{1F50E} Scan market: 16-18 prospects + 20-21 signings</button><span id="ftp-market-scan-status" class="vj-text-xs vj-text-muted">Runs the searches for you; results appear below.</span></div>' },
                 { id: 'ftp-transfer-results', label: 'Search Results', icon: '\u{1F50D}', iconColor: 'green',
                   content: '<div class="vj-text-sm vj-text-muted">Search for players on the transfer form to evaluate them here.</div>' },
                 { id: 'ftp-transfer-targets', label: 'Target Thresholds', icon: '\u{1F3AF}', iconColor: 'blue', collapsible: true, collapsed: true },
@@ -10766,17 +10771,9 @@ const progMap = { batting: 'batting', bowling: 'bowling', keeping: 'keeperbattin
                 });
 
                 // ---- FILTERS ----
-                // Separate youth (16-20) and senior (21+) evaluations
-                // Youth: evaluated against age curve, no age limit
-                // Seniors: max age 27 (matches the oldest "base" screenshot
-                // benchmark) — the base itself (checkScoutBenchmark) is what
-                // actually gates skill/wage/experience per age.
-                const SENIOR_MAX_AGE = 27;
-
-                const ageFiltered = evaluated.filter(e => {
-                    const age = ageYears(e.age);
-                    return age >= 21 && age > SENIOR_MAX_AGE;
-                }).length;
+                // Only the user's buying ages (TRANSFER_BUY_AGES) — also for
+                // rows from a manual search on the page.
+                const ageFiltered = evaluated.filter(e => !buyAgeAllowed(e.age)).length;
 
                 // Requested behaviour: a senior is only worth showing if he's a
                 // real upgrade in his role — judged at the same age (to-25
@@ -10788,8 +10785,8 @@ const progMap = { batting: 'batting', bowling: 'bowling', keeping: 'keeperbattin
                     // Must beat a current senior, not the youth squad, if he
                     // turns 21 before he'd play youth cricket for you.
                     const isYouth = !joinsAsSenior(e.age);
-                    if (age >= 21 && age > SENIOR_MAX_AGE) {
-                        e.eval.warnings.push(`Age ${age} — past prime years for senior transfer`);
+                    if (!buyAgeAllowed(e.age)) {
+                        e.eval.warnings.push(`Age ${age} — outside your buying ages (16-18, 20-21)`);
                         return false;
                     }
                     // User's bar, every age: must project to 58+ at 25 (projection =
@@ -10925,7 +10922,7 @@ const progMap = { batting: 'batting', bowling: 'bowling', keeping: 'keeperbattin
                     let html = `<div class="vj-flex vj-gap-6 vj-mb-8" style="flex-wrap:wrap;">
                         <span class="ftp-stat-badge green">${players.length} Target${players.length !== 1 ? 's' : ''}</span>
                         <span class="ftp-stat-badge neutral">${totalScanned} Total Scanned</span>
-                        ${ageFilteredCount > 0 ? `<span class="vj-text-xs vj-text-muted" style="align-self:center;">${ageFilteredCount} over age limit</span>` : ''}
+                        ${ageFilteredCount > 0 ? `<span class="vj-text-xs vj-text-muted" style="align-self:center;">${ageFilteredCount} ${ageFilteredCount} outside 16-18 / 20-21</span>` : ''}
                         ${verdictFilteredCount > 0 ? `<span class="vj-text-xs vj-text-muted" style="align-self:center;">${verdictFilteredCount} below threshold or not a squad upgrade</span>` : ''}
                         ${!detailsFetched ? `<button id="ftp-fetch-details-btn" class="vj-btn vj-btn-sm" style="font-size:11px;padding:2px 8px;cursor:pointer;">\u21BB Fetch Experience, Wages & Talents</button>` : `<span class="ftp-stat-badge neutral">\u2713 Details fetched</span>`}
                     </div>`;
@@ -11120,7 +11117,7 @@ const progMap = { batting: 'batting', bowling: 'bowling', keeping: 'keeperbattin
                         // Re-filter with the exact same rule as the initial
                         // pass (elite + genuine squad upgrade for seniors).
                         const reFiltered = priorityBuys.filter(isWorthShowing);
-                        const reAgeFiltered = priorityBuys.filter(p => { const age = ageYears(p.age); return age >= 21 && age > SENIOR_MAX_AGE; }).length;
+                        const reAgeFiltered = priorityBuys.filter(p => !buyAgeAllowed(p.age)).length;
                         const reVerdictFiltered = priorityBuys.length - reAgeFiltered - reFiltered.length;
                         resultsEl.innerHTML = renderTransferResults(reFiltered, evaluated.length, reAgeFiltered, reVerdictFiltered, true);
                     };
