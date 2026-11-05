@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         FTP Advisor
 // @namespace    http://tampermonkey.net/
-// @version      8.125
+// @version      8.126
 // @description  Tactical/scouting advisor for fromthepavilion.org (cricket sim): team, tactics, pitch, training, transfer market, youth and squad plan advice with projections. Full changelog: github.com/Jadax/ftp-advisor
 // @author       Tushant Sharma
 // @license      MIT
@@ -10785,8 +10785,10 @@ const progMap = { batting: 'batting', bowling: 'bowling', keeping: 'keeperbattin
                 // with the compare line shown against your youth peers.
                 function isWorthShowing(e) {
                     const age = ageYears(e.age);
-                    const isYouth = age < 21;
-                    if (!isYouth && age > SENIOR_MAX_AGE) {
+                    // Must beat a current senior, not the youth squad, if he
+                    // turns 21 before he'd play youth cricket for you.
+                    const isYouth = !joinsAsSenior(e.age);
+                    if (age >= 21 && age > SENIOR_MAX_AGE) {
                         e.eval.warnings.push(`Age ${age} — past prime years for senior transfer`);
                         return false;
                     }
@@ -11052,7 +11054,7 @@ const progMap = { batting: 'batting', bowling: 'bowling', keeping: 'keeperbattin
                                     const xi = (rank) => rank <= TRANSFER_XI_SLOTS[r.role] ? ' \u2014 would start' : '';
                                     const pending = !detailsFetched && !((p.experience || 0) > 0) ? ' <span class="vj-text-muted">(exp/talents not fetched)</span>' : '';
                                     return `<div class="vj-text-xs vj-text-muted" style="margin-top:2px;">${p.bowlerType && r.role === 'bowling' ? p.bowlerType.toUpperCase() + ' ' : ''}${role} \u00B7 ${primaryName} ${skillLabel(primarySkill)} \u00B7 Tech ${skillLabel(p.technique)}${p.price ? ` \u00B7 $${p.price.toLocaleString()}` : ''}</div>
-                                        <div class="vj-text-xs" style="margin-top:2px;color:${col(r.nowRank)};"><b>Now:</b> #${r.nowRank} of ${r.nowOf} ${r.nowGroup} ${role}s${xi(r.nowRank)}${pending}</div>
+                                        <div class="vj-text-xs" style="margin-top:2px;color:${col(r.nowRank)};"><b>Now:</b> #${r.nowRank} of ${r.nowOf} ${r.nowGroup} ${role}s${xi(r.nowRank)}${r.seniorSoon != null ? ` <span class="vj-text-muted">(turns 21 in ${r.seniorSoon} wk${r.seniorSoon === 1 ? '' : 's'} — a senior buy)</span>` : ''}${pending}</div>
                                         <div class="vj-text-xs" style="margin-top:1px;color:${col(r.at25Rank)};"><b>At 25:</b> #${r.at25Rank} of ${r.at25Of} senior ${role}s${xi(r.at25Rank)} <span class="vj-text-muted">(proj ${r.proj})</span></div>`;
                                 })()}
                                 ${fairPriceLine(p)}
@@ -12007,9 +12009,16 @@ const progMap = { batting: 'batting', bowling: 'bowling', keeping: 'keeperbattin
     function projectedSkillAt25(player, projOpts) {
         return projectionAt25(player, projOpts).ceiling;
     }
+    // A buy who turns 21 within this many weeks plays (at most) a youth match
+    // or two for you: an auction runs up to a week and he moves the week after.
+    // User: a 20y14w card ranked "#1 of 8 youth bowlers" was senior in a week.
+    const TRANSFER_SENIOR_SOON_WEEKS = 2;
+    function joinsAsSenior(age) {
+        return !isYouthAge(age) || weeksToAge(age, 21) <= TRANSFER_SENIOR_SOON_WEEKS;
+    }
     function comparePlayerToSquadPeers(candidate, squadPlayers, projOpts) {
         const candidateRole = getPrimarySkillInfo(candidate).name; // 'batting' | 'bowling' | 'keeping'
-        const youthGroup = isYouthAge(candidate.age);
+        const youthGroup = !joinsAsSenior(candidate.age);
         const peers = squadPlayers.filter(p => isYouthAge(p.age) === youthGroup
             && !(candidate.id != null && p.id === candidate.id) && p.name !== candidate.name
             && getPrimarySkillInfo(p).name === candidateRole);
@@ -12040,7 +12049,7 @@ const progMap = { batting: 'batting', bowling: 'bowling', keeping: 'keeperbattin
     }
     function squadRankLines(candidate, squadPlayers, projOpts) {
         const role = getPrimarySkillInfo(candidate).name;
-        const youth = isYouthAge(candidate.age);
+        const youth = !joinsAsSenior(candidate.age);
         const others = squadPlayers.filter(p => p.name !== candidate.name && getPrimarySkillInfo(p).name === role);
         const nowPeers = others.filter(p => isYouthAge(p.age) === youth);
         const seniors = others.filter(p => !isYouthAge(p.age));
@@ -12052,7 +12061,8 @@ const progMap = { batting: 'batting', bowling: 'bowling', keeping: 'keeperbattin
             nowGroup: youth ? 'youth' : 'senior',
             at25Rank: 1 + seniors.filter(p => projectedSkillAt25(p, projOpts) > cand.ceiling).length,
             at25Of: seniors.length + 1,
-            proj: Math.round(cand.ceiling)
+            proj: Math.round(cand.ceiling),
+            seniorSoon: isYouthAge(candidate.age) && !youth ? weeksToAge(candidate.age, 21) : null
         };
     }
 
