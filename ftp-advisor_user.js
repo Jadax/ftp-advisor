@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         FTP Advisor
 // @namespace    http://tampermonkey.net/
-// @version      8.127
+// @version      8.128
 // @description  Tactical/scouting advisor for fromthepavilion.org (cricket sim): team, tactics, pitch, training, transfer market, youth and squad plan advice with projections. Full changelog: github.com/Jadax/ftp-advisor
 // @author       Tushant Sharma
 // @license      MIT
@@ -11903,7 +11903,7 @@ const progMap = { batting: 'batting', bowling: 'bowling', keeping: 'keeperbattin
     ];
 
     function scrapePlayerDetailPage() {
-        const doc = document;
+        const doc = pageDoc();
         const nameEl = doc.querySelector('h1, .panel h2, .panel .padded h2');
         const name = nameEl ? escapeHtml(nameEl.textContent.trim()) : 'This player';
 
@@ -11942,7 +11942,7 @@ const progMap = { batting: 'batting', bowling: 'bowling', keeping: 'keeperbattin
         const isLeftHanded = /left hand batsman/i.test(styleText) ? true : /right hand batsman/i.test(styleText) ? false : null;
 
         const player = {
-            id: (window.location.href.match(/playerId=(\d+)/) || [])[1],
+            id: ((doc === document ? window.location.href : '').match(/playerId=(\d+)/) || [])[1],
             name, age: age || 0, rating, wage,
             bowlerType, bowlerCategory: BOWLER_CATEGORY[bowlerType] || 'none', bowlerPace: BOWLER_PACE[bowlerType] || 0, isLeftHanded,
             batting: 0, bowling: 0, keeping: 0, technique: 0, power: 0, fielding: 0, endurance: 0,
