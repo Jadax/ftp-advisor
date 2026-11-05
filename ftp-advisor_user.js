@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         FTP Advisor
 // @namespace    http://tampermonkey.net/
-// @version      8.128
+// @version      8.129
 // @description  Tactical/scouting advisor for fromthepavilion.org (cricket sim): team, tactics, pitch, training, transfer market, youth and squad plan advice with projections. Full changelog: github.com/Jadax/ftp-advisor
 // @author       Tushant Sharma
 // @license      MIT
@@ -11053,8 +11053,14 @@ const progMap = { batting: 'batting', bowling: 'bowling', keeping: 'keeperbattin
                                     const col = (rank) => rank <= TRANSFER_XI_SLOTS[r.role] ? 'var(--vj-green)' : 'var(--vj-text-muted)';
                                     const xi = (rank) => rank <= TRANSFER_XI_SLOTS[r.role] ? ' \u2014 would start' : '';
                                     const pending = !detailsFetched && !((p.experience || 0) > 0) ? ' <span class="vj-text-muted">(exp/talents not fetched)</span>' : '';
+                                    const ROLE_WORD = { BAT: 'batter', BOWL: 'bowler', AR: 'all-rounder', WK: 'keeper' };
+                                    const xiLine = r.xi ? r.xi.map(x => x.starts
+                                        ? `<span style="color:var(--vj-green);">${x.format} ✓ ${ROLE_WORD[x.role] || ''}${x.replaces.length ? ` <span class="vj-text-muted">for ${x.replaces.join(', ')}</span>` : ''}</span>`
+                                        : `<span class="vj-text-muted">${x.format} ✗</span>`).join(' · ') : '';
+                                    const startsNow = r.xi && r.xi.some(x => x.starts);
                                     return `<div class="vj-text-xs vj-text-muted" style="margin-top:2px;">${p.bowlerType && r.role === 'bowling' ? p.bowlerType.toUpperCase() + ' ' : ''}${role} \u00B7 ${primaryName} ${skillLabel(primarySkill)} \u00B7 Tech ${skillLabel(p.technique)}${p.price ? ` \u00B7 $${p.price.toLocaleString()}` : ''}</div>
-                                        <div class="vj-text-xs" style="margin-top:2px;color:${col(r.nowRank)};"><b>Now:</b> #${r.nowRank} of ${r.nowOf} ${r.nowGroup} ${role}s${xi(r.nowRank)}${r.seniorSoon != null ? ` <span class="vj-text-muted">(turns 21 in ${r.seniorSoon} wk${r.seniorSoon === 1 ? '' : 's'} — a senior buy)</span>` : ''}${pending}</div>
+                                        <div class="vj-text-xs" style="margin-top:2px;color:${r.xi ? (startsNow ? 'var(--vj-green)' : 'var(--vj-text-muted)') : col(r.nowRank)};"><b>Now:</b> #${r.nowRank} of ${r.nowOf} ${r.nowGroup} ${role}s${r.xi ? '' : xi(r.nowRank)}${r.seniorSoon != null ? ` <span class="vj-text-muted">(turns 21 in ${r.seniorSoon} wk${r.seniorSoon === 1 ? '' : 's'} — a senior buy)</span>` : ''}${pending}</div>
+                                        ${r.xi ? `<div class="vj-text-xs" style="margin-top:1px;"><b>Starts in your ${r.nowGroup} XI today:</b> ${xiLine}</div>` : ''}
                                         <div class="vj-text-xs" style="margin-top:1px;color:${col(r.at25Rank)};"><b>At 25:</b> #${r.at25Rank} of ${r.at25Of} senior ${role}s${xi(r.at25Rank)} <span class="vj-text-muted">(proj ${r.proj})</span></div>`;
                                 })()}
                                 ${fairPriceLine(p)}
@@ -12052,6 +12058,35 @@ const progMap = { batting: 'batting', bowling: 'bowling', keeping: 'keeperbattin
     function minProjectionAt25() {
         return MIN_PROJECTION_AT_25;
     }
+    // "Would he start for me now?" — answered by the same selector Match
+    // Orders uses (recommendLineup), on your squad of the group he'd join
+    // plus him, both formats, at home on Sporting/Sunny. Everyone rested
+    // with neutral form: those are this week's state, not ability, and the
+    // candidate's aren't known. A skill-sum rank with a top-5 cut (v8.104)
+    // couldn't say whether a #6 bowler beats your 5th bowling option.
+    const _xiBaselineCache = new Map();
+    function startingXiCheck(candidate, squadPlayers) {
+        const senior = joinsAsSenior(candidate.age);
+        const neutral = p => ({ ...p, fatigue: 10, form: 5, talents: p.talents || [] });
+        const group = squadPlayers.filter(p => p.name !== candidate.name && !(candidate.id != null && p.id === candidate.id)
+            && isYouthAge(p.age) !== senior).map(neutral);
+        const cand = neutral({ ...candidate, id: candidate.id || 'candidate' });
+        return (senior ? ['OD', 'T20'] : ['YOD', 'YT20']).map(matchType => {
+            const context = { matchType, isYouthOnly: !senior, isHome: true, isFriendly: false, pitch: 'Sporting', weather: 'Sunny' };
+            const key = matchType + '|' + group.map(p => p.id).join(',');
+            if (!_xiBaselineCache.has(key)) _xiBaselineCache.set(key, recommendLineup(group, context, null).map(p => p.id));
+            const before = _xiBaselineCache.get(key);
+            const xi = recommendLineup([...group, cand], context, null);
+            const me = xi.find(p => p.id === cand.id);
+            const outIds = before.filter(id => !xi.some(p => p.id === id));
+            return {
+                format: matchType.replace(/^Y/, ''),
+                starts: !!me,
+                role: me ? me.role : null,
+                replaces: outIds.map(id => (group.find(p => p.id === id) || {}).name).filter(Boolean)
+            };
+        });
+    }
     function squadRankLines(candidate, squadPlayers, projOpts) {
         const role = getPrimarySkillInfo(candidate).name;
         const youth = !joinsAsSenior(candidate.age);
@@ -12067,7 +12102,8 @@ const progMap = { batting: 'batting', bowling: 'bowling', keeping: 'keeperbattin
             at25Rank: 1 + seniors.filter(p => projectedSkillAt25(p, projOpts) > cand.ceiling).length,
             at25Of: seniors.length + 1,
             proj: Math.round(cand.ceiling),
-            seniorSoon: isYouthAge(candidate.age) && !youth ? weeksToAge(candidate.age, 21) : null
+            seniorSoon: isYouthAge(candidate.age) && !youth ? weeksToAge(candidate.age, 21) : null,
+            xi: (() => { try { return startingXiCheck(candidate, squadPlayers); } catch (e) { console.warn('[FTP Transfer] XI check failed', e); return null; } })()
         };
     }
 
