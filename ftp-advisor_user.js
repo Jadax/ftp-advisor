@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         FTP Advisor
 // @namespace    http://tampermonkey.net/
-// @version      8.126
+// @version      8.127
 // @description  Tactical/scouting advisor for fromthepavilion.org (cricket sim): team, tactics, pitch, training, transfer market, youth and squad plan advice with projections. Full changelog: github.com/Jadax/ftp-advisor
 // @author       Tushant Sharma
 // @license      MIT
@@ -11929,17 +11929,22 @@ const progMap = { batting: 'batting', bowling: 'bowling', keeping: 'keeperbattin
             if (ratingMatch) rating = parseInt(ratingMatch[1].replace(/,/g, ''), 10) || 0;
             const wageMatch = infoText.match(/\$([\d,]+)\s*wage/i);
             if (wageMatch) wage = parseInt(wageMatch[1].replace(/,/g, ''), 10) || 0;
-            if (!bowlerType) {
-                for (const [re, code] of BOWLER_TYPE_PHRASES) {
-                    if (re.test(infoText)) { bowlerType = code; break; }
-                }
+        }
+        // Bowling style is on the SECOND line ("Right hand batsman | Right arm
+        // Fast medium", live player.htm) — reading only the first left every
+        // bowler typeless, projecting him as a non-bowler (Weerasiri 62 vs 61).
+        const styleText = Array.from(paddedPs).slice(0, 2).map(p => p.textContent).join(' | ');
+        if (!bowlerType) {
+            for (const [re, code] of BOWLER_TYPE_PHRASES) {
+                if (re.test(styleText)) { bowlerType = code; break; }
             }
         }
+        const isLeftHanded = /left hand batsman/i.test(styleText) ? true : /right hand batsman/i.test(styleText) ? false : null;
 
         const player = {
             id: (window.location.href.match(/playerId=(\d+)/) || [])[1],
             name, age: age || 0, rating, wage,
-            bowlerType, bowlerCategory: BOWLER_CATEGORY[bowlerType] || 'none', bowlerPace: BOWLER_PACE[bowlerType] || 0,
+            bowlerType, bowlerCategory: BOWLER_CATEGORY[bowlerType] || 'none', bowlerPace: BOWLER_PACE[bowlerType] || 0, isLeftHanded,
             batting: 0, bowling: 0, keeping: 0, technique: 0, power: 0, fielding: 0, endurance: 0,
             experience: 0, captaincy: 0, talents: [], price: 0,
             fatigue: 10, form: 4, currentTraining: null // safe neutral defaults if not found on page
