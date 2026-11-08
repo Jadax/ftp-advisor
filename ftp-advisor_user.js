@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         FTP Advisor
 // @namespace    http://tampermonkey.net/
-// @version      8.130
+// @version      8.131
 // @description  Tactical/scouting advisor for fromthepavilion.org (cricket sim): team, tactics, pitch, training, transfer market, youth and squad plan advice with projections. Full changelog: github.com/Jadax/ftp-advisor
 // @author       Tushant Sharma
 // @license      MIT
@@ -3825,9 +3825,11 @@ ${ck(st.trainingAt && Date.now() - st.trainingAt < PILOT_TRAINING_EVERY_H * 3600
 ${matches.length ? matches.map(([id, m]) => ck(true, `Orders: ${esc(m.teams)} \u2014 ${ago(m.at)}${m.scouted ? ' \u00B7 opponent scouted' : ''}`)).join('') : ck(false, 'No orders submitted yet')}</div>
 <div class="sec"><div class="h">What I've learned</div>${(() => {
     const L = loadLearned();
-    const rows = Object.entries(L.pitch || {}).sort((a, b) => b[1].n - a[1].n);
-    if (!rows.length) return '<div class="lg">Learning starts once completed matches with engine ratings are recorded.</div>';
-    return rows.map(([pitch, e]) => { const f = learnedSpinSeamFactor(pitch); return `<div class="ck"><b class="${f !== 1 ? 'ok' : 'no'}">${f > 1 ? '\u2191' : f < 1 ? '\u2193' : '\u2022'}</b><span>${esc(pitch)}: ${e.n} match${e.n > 1 ? 'es' : ''} \u2014 ${f === 1 ? (e.n < LEARN_MIN_MATCHES ? 'need ' + LEARN_MIN_MATCHES + ' to apply' : e.needsOtherPitch ? 'needs a second pitch type to compare against' : 'model already right') : `spin ${f > 1 ? 'stronger' : 'weaker'} vs seam than modelled (\u00D7${f.toFixed(2)} applied)`}</span></div>`; }).join('');
+    const rows = L.version === LEARN_VERSION ? Object.entries(L.spinSeam || {}) : [];
+    const comps = Object.entries(loadCompTypes()).filter(([, t]) => t.friendly || t.youth);
+    if (!rows.length && !comps.length) return '<div class="lg">Learning starts once completed matches with engine ratings are recorded.</div>';
+    return rows.map(([g, e]) => { const f = learnedSpinSeamFactor(g === 'youth'); return `<div class="ck"><b class="${f !== 1 ? 'ok' : 'no'}">${f > 1 ? '\u2191' : f < 1 ? '\u2193' : '\u2022'}</b><span>${g === 'youth' ? 'Youth' : 'Senior'} bowling: ${e.n} match${e.n > 1 ? 'es' : ''} \u2014 ${f === 1 ? (e.n < LEARN_MIN_MATCHES ? 'need ' + LEARN_MIN_MATCHES + ' to apply' : 'model already right') : `the engine rates your spinners ${f > 1 ? 'higher' : 'lower'} vs your seamers than the model did (\u00D7${f.toFixed(2)} applied)`}</span></div>`; }).join('')
+        + comps.map(([name, t]) => `<div class="ck"><b class="ok">\u2022</b><span>${esc(name)} = ${esc(t.matchType)}${t.youth ? ' \u2014 youth only' : ''}${t.friendly ? ', everyone rested' : ''}</span></div>`).join('');
 })()}</div>
 <div class="sec"><div class="btns"><button class="btn pri" data-a="run">Run now</button><button class="btn" data-a="preview">Preview</button></div>
 <div class="btns" style="margin-top:6px;"><button class="btn" data-a="export">Export database (${Object.keys(loadMatchDb()).length} matches)</button></div></div>
@@ -4230,6 +4232,7 @@ ${matches.length ? matches.map(([id, m]) => ck(true, `Orders: ${esc(m.teams)} \u
             } else if (thText.includes('League')) {
                 const leagueText = td.textContent.trim().toLowerCase();
                 context.matchTypeKnown = true;
+                context.league = td.textContent.trim();
                 // Manual (Friendly Matches): "all players are assumed to be at
                 // 'rested' fatigue in friendly matches" for all match-engine
                 // calculations. Keyword only; absent it, league behaviour.
@@ -4299,6 +4302,16 @@ ${matches.length ? matches.map(([id, m]) => ck(true, `Orders: ${esc(m.teams)} \u
         // the real total; min/max spell lengths override the per-format
         // tables in allocateBowlingSpells() (e.g. a 40-over senior comp
         // still caps a bowler at 8, not the Senior OD 10).
+        // A friendly comp's real type, learned from its competition page
+        // (WCSL2 = "Youth Friendly": youth-only, everyone rested). Format
+        // then comes from the page's overs below.
+        const compType = context.league ? loadCompTypes()[context.league] : null;
+        if (compType && (compType.youth || compType.friendly) && !/twenty20|t20|youth|one day/i.test(context.league)) {
+            if (compType.friendly) context.isFriendly = true;
+            if (compType.youth) { context.isYouthOnly = true; context.maxAge = YOUTH_MAX_AGE; }
+            context.matchTypeKnown = false;
+            context.compType = compType.matchType;
+        }
         const orderSettings = scrapeMatchOrderSettings();
         if (orderSettings.oversPerEnd > 0) {
             context.overs = Math.round(orderSettings.oversPerEnd * 2);
@@ -4313,6 +4326,7 @@ ${matches.length ? matches.map(([id, m]) => ck(true, `Orders: ${esc(m.teams)} \u
                 context.matchType = context.overs === 20 ? 'T20' : context.overs === 40 ? 'YOD' : 'OD';
             }
         }
+        if (context.isYouthOnly) context.matchType = context.matchType === 'T20' || context.matchType === 'YT20' ? 'YT20' : 'YOD';
 
         return context;
     }
@@ -9937,27 +9951,31 @@ const progMap = { batting: 'batting', bowling: 'bowling', keeping: 'keeperbattin
     const MATCH_DB_INGEST_EVERY_H = 6;
     const MATCH_DB_INGEST_PER_RUN = 12;
     // ============================================================
-    // SELF-CALIBRATION — the advisor corrects its own pitch model from the
-    // engine's verdicts. Per completed match with engine ratings
-    // (ratings.htm "Bowling - Seam/Spin", our side), compare the engine's
-    // spin:seam ratio with the ratio our own calculateBowlingScore predicted
-    // for the bowlers who actually bowled (scorecard overs; skills from the
-    // pre-match snapshot when the autopilot took one, else today's squad by
-    // name key, at half weight). The log-residual, averaged per pitch and
-    // shrunk toward 0 by n/(n+LEARN_SHRINK), becomes a spin:seam multiplier
-    // used by every selection/allocation via conditionEffects(). Only the
-    // RATIO is identified (one match can't tell "spin was good" from "seam
-    // was bad"), so it's split sqrt/sqrt. Deterministic given the database.
+    // SELF-CALIBRATION from the engine's own team ratings (ratings.htm).
+    // Those ratings are condition-free skill composites: across 63 live
+    // matches the same opponent XI got an identical rating on different
+    // pitches and weather (the rockers 91,916 on Uneven/Humid and Flat/Hot).
+    // v8.118 compared them with a pitch-AWARE model and learned per-pitch
+    // factors — which only learned to cancel our own pitch effects (Uneven
+    // spin up, Dry/Crumbling spin down). What they do identify is how the
+    // engine values OUR spinners against OUR seamers: vs a pitch-neutral
+    // model the log-residual was flat across pitches and consistent within
+    // an age group (2026-11-08: youth +0.15 sd .12 n31, senior +0.40 sd .13
+    // n15). Learned per age group, shrunk by w/(w+LEARN_SHRINK), clamped,
+    // applied by conditionEffects() on top of the manual's pitch effects.
+    // Deterministic given the database.
     // ============================================================
     const LEARNED_KEY = 'ftp_learned';
+    const LEARN_VERSION = 2;
     const LEARN_SHRINK = 4;
-    const LEARN_MIN_MATCHES = 2;
+    const LEARN_MIN_MATCHES = 5;
     const LEARN_CLAMP = [0.8, 1.25];
     function loadLearned() {
-        try { return JSON.parse(GM_getValue(LEARNED_KEY, 'null')) || { pitch: {} }; } catch (e) { return { pitch: {} }; }
+        try { return JSON.parse(GM_getValue(LEARNED_KEY, 'null')) || { spinSeam: {} }; } catch (e) { return { spinSeam: {} }; }
     }
-    function learnedSpinSeamFactor(pitch) {
-        const e = loadLearned().pitch[pitch];
+    function learnedSpinSeamFactor(isYouth) {
+        const L = loadLearned();
+        const e = L.version === LEARN_VERSION && L.spinSeam ? L.spinSeam[isYouth ? 'youth' : 'senior'] : null;
         if (!e || e.n < LEARN_MIN_MATCHES) return 1;
         const shrunk = e.mean * (e.w / (e.w + LEARN_SHRINK));
         return Math.max(LEARN_CLAMP[0], Math.min(LEARN_CLAMP[1], Math.exp(shrunk)));
@@ -9965,10 +9983,32 @@ const progMap = { batting: 'batting', bowling: 'bowling', keeping: 'keeperbattin
     function conditionEffects(context) {
         const base = PITCH_EFFECTS[context.pitch] || PITCH_EFFECTS.Sporting;
         const weatherEffect = WEATHER_EFFECTS[context.weather] || WEATHER_EFFECTS.Sunny;
-        const f = learnedSpinSeamFactor(context.pitch);
+        const f = learnedSpinSeamFactor(!!context.isYouthOnly);
         if (f === 1) return { pitchEffect: base, weatherEffect, learnedFactor: 1 };
         const r = Math.sqrt(f);
         return { pitchEffect: Object.assign({}, base, { spin: base.spin * r, seam: base.seam / r }), weatherEffect, learnedFactor: f };
+    }
+    // Friendly comps label their League cell with a bare name ("WCSL2"); the
+    // competition page carries the real type ("Match Type: Youth Friendly").
+    // Learned once per name during ingest, read by scrapeMatchContext().
+    const COMP_TYPES_KEY = 'ftp_comp_types';
+    function loadCompTypes() {
+        try { return JSON.parse(GM_getValue(COMP_TYPES_KEY, '{}')) || {}; } catch (e) { return {}; }
+    }
+    async function learnCompetitionType(detailsDoc, league) {
+        const types = loadCompTypes();
+        if (!league || types[league] || !detailsDoc) return;
+        const abs = (a) => new URL(a.getAttribute('href'), 'https://www.fromthepavilion.org/').href;
+        const ovLink = detailsDoc.querySelector('a[href*="leagueoverview.htm"]');
+        const ov = ovLink ? await fetchGameDoc(abs(ovLink)) : null;
+        const cdLink = ov && ov.querySelector('a[href*="competitiondetails.htm"]');
+        if (!cdLink) { if (ov) { types[league] = { official: true, at: Date.now() }; GM_setValue(COMP_TYPES_KEY, JSON.stringify(types)); } return; }
+        const cd = await fetchGameDoc(abs(cdLink));
+        if (!cd) return;
+        let matchType = '';
+        cd.querySelectorAll('th').forEach(th => { if (/^match type$/i.test(th.textContent.trim()) && th.nextElementSibling) matchType = th.nextElementSibling.textContent.trim(); });
+        types[league] = { matchType, youth: /youth/i.test(matchType), friendly: /friendly/i.test(matchType), at: Date.now() };
+        GM_setValue(COMP_TYPES_KEY, JSON.stringify(types));
     }
     function snapshotToPlayer(x) {
         return {
@@ -9983,26 +10023,26 @@ const progMap = { batting: 'batting', bowling: 'bowling', keeping: 'keeperbattin
         const squadByKey = new Map();
         (cache ? cache.players : []).forEach(p => { const k = playerNameKey(p.name); squadByKey.set(k, squadByKey.has(k) ? null : p); });
         const myName = (loadTeamInfoCache() || {}).teamName;
+        const compTypes = loadCompTypes();
         const samples = {};
         Object.values(db).forEach(m => {
-            if (!m.ratings || !m.result || !m.conditions || !PITCH_EFFECTS[m.conditions.pitch]) return;
+            if (!m.ratings || !m.result) return;
             const ours = myName ? (m.ratings.find(r => r.team === myName) || null) : null;
             const usInnings = (m.result.innings || []).find(i => ours && i.bowling === ours.team);
             if (!ours || !usInnings || !ours.seam || !ours.spin || !(ours.seam.overs > 0) || !(ours.spin.overs > 0) || !ours.seam.v || !ours.spin.v) return;
             const preByKey = new Map(((m.pre && m.pre.xi) || []).map(x => [playerNameKey(x.name), snapshotToPlayer(x)]));
             const isT20 = /twenty20|t20/i.test(m.league || '');
-            const isYouth = /youth/i.test(m.league || '');
-            const pitchEffect = PITCH_EFFECTS[m.conditions.pitch];
-            const weatherEffect = WEATHER_EFFECTS[m.conditions.weather] || WEATHER_EFFECTS.Sunny;
+            const isYouth = /youth/i.test(m.league || '') || !!(compTypes[m.league] && compTypes[m.league].youth);
             const acc = { seam: [0, 0], spin: [0, 0] };
             let fromSnapshot = true;
             (usInnings.bowling_card || []).forEach(b => {
                 const key = String(b.name || '').toLowerCase();
                 let pl = preByKey.get(key);
-                if (!pl) { pl = squadByKey.get(key) || null; fromSnapshot = false; }
+                // Today's fatigue says nothing about a past match.
+                if (!pl) { pl = squadByKey.get(key) || null; if (pl) pl = Object.assign({}, pl, { fatigue: 10 }); fromSnapshot = false; }
                 const cat = BOWLER_CATEGORY[b.type] || (pl && pl.bowlerCategory);
                 if (!pl || (cat !== 'seam' && cat !== 'spin') || !(b.overs > 0)) return;
-                const score = calculateBowlingScore(Object.assign({}, pl, { bowlerCategory: cat }), pitchEffect, weatherEffect, isT20, isYouth, m.conditions.home === ours.team);
+                const score = calculateBowlingScore(Object.assign({}, pl, { bowlerCategory: cat }), PITCH_EFFECTS.Sporting, WEATHER_EFFECTS.Sunny, isT20, isYouth, false);
                 acc[cat][0] += score * b.overs;
                 acc[cat][1] += b.overs;
             });
@@ -10012,22 +10052,12 @@ const progMap = { batting: 'batting', bowling: 'bowling', keeping: 'keeperbattin
             if (!(predicted > 0) || !(observed > 0)) return;
             const resid = Math.max(-0.7, Math.min(0.7, Math.log(observed / predicted)));
             const w = fromSnapshot ? 1 : 0.5;
-            const e = samples[m.conditions.pitch] || (samples[m.conditions.pitch] = { n: 0, w: 0, sum: 0 });
+            const group = isYouth ? 'youth' : 'senior';
+            const e = samples[group] || (samples[group] = { n: 0, w: 0, sum: 0 });
             e.n++; e.w += w; e.sum += resid * w;
         });
-        // Per-pitch residual RELATIVE to the all-pitch average: a constant
-        // offset (the engine's seam and spin numbers needn't share a scale
-        // with ours) would otherwise read as "spin stronger everywhere".
-        // Hence nothing is learned until two different pitches have data.
-        const learned = { pitch: {}, updatedAt: Date.now() };
-        const all = Object.values(samples);
-        const totW = all.reduce((t, e) => t + e.w, 0);
-        const globalMean = totW ? all.reduce((t, e) => t + e.sum, 0) / totW : 0;
-        if (all.length >= 2) {
-            Object.entries(samples).forEach(([pitch, e]) => { learned.pitch[pitch] = { n: e.n, w: Math.round(e.w * 100) / 100, mean: Math.round((e.sum / e.w - globalMean) * 1000) / 1000 }; });
-        } else {
-            Object.entries(samples).forEach(([pitch, e]) => { learned.pitch[pitch] = { n: e.n, w: Math.round(e.w * 100) / 100, mean: 0, needsOtherPitch: true }; });
-        }
+        const learned = { version: LEARN_VERSION, spinSeam: {}, updatedAt: Date.now() };
+        Object.entries(samples).forEach(([g, e]) => { learned.spinSeam[g] = { n: e.n, w: Math.round(e.w * 100) / 100, mean: Math.round(e.sum / e.w * 1000) / 1000 }; });
         GM_setValue(LEARNED_KEY, JSON.stringify(learned));
         return learned;
     }
@@ -10123,6 +10153,7 @@ const progMap = { batting: 'batting', bowling: 'bowling', keeping: 'keeperbattin
             ];
             if (!details || !card) continue;
             const d = parseGameDetailsDoc(details);
+            try { await learnCompetitionType(details, d.league || m.league); } catch (e) { /* type stays unknown */ }
             const sc = parseScorecardFromHTMLDoc(card);
             if (sc) {
                 sc.pitch = sc.pitch || d.pitch || undefined;
@@ -10146,7 +10177,13 @@ const progMap = { batting: 'batting', bowling: 'bowling', keeping: 'keeperbattin
             n++;
         }
         if (n) { saveMatchDb(db); if (log) log(`\u{1F4DA} Recorded ${n} completed match${n > 1 ? 'es' : ''} (scorecard, conditions, engine ratings)`); }
-        if (n || !GM_getValue(LEARNED_KEY, null)) { try { learnFromMatchDb(); } catch (e) { console.warn('[FTP Advisor] learning pass failed:', e); } }
+        // Leagues recorded before competition types were learned: one lookup each.
+        const types = loadCompTypes();
+        const untyped = [...new Map(Object.values(db).filter(x => x.league && !types[x.league]).map(x => [x.league, x.gameId])).entries()].slice(0, 3);
+        for (const [league, gameId] of untyped) {
+            try { await learnCompetitionType(await fetchGameDoc(`https://www.fromthepavilion.org/gamedetails.htm?gameId=${gameId}`), league); } catch (e) { /* retry next pass */ }
+        }
+        if (n || untyped.length || loadLearned().version !== LEARN_VERSION) { try { learnFromMatchDb(); } catch (e) { console.warn('[FTP Advisor] learning pass failed:', e); } }
         const st = pilotState(); st.ingestAt = Date.now(); savePilotState(st);
         return n;
     }
