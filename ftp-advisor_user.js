@@ -1,11 +1,14 @@
 // ==UserScript==
 // @name         FTP Advisor
 // @namespace    http://tampermonkey.net/
-// @version      8.131
+// @version      8.132
 // @description  Tactical/scouting advisor for fromthepavilion.org (cricket sim): team, tactics, pitch, training, transfer market, youth and squad plan advice with projections. Full changelog: github.com/Jadax/ftp-advisor
 // @author       Tushant Sharma
 // @license      MIT
 // @match        https://www.fromthepavilion.org/*
+// @match        https://fromthepavilion.org/*
+// @match        http://www.fromthepavilion.org/*
+// @match        http://fromthepavilion.org/*
 // @noframes
 // @grant        GM_xmlhttpRequest
 // @grant        GM_setValue
@@ -14,6 +17,7 @@
 // @grant        GM_deleteValue
 // @grant        GM_addStyle
 // @connect      www.fromthepavilion.org
+// @connect      fromthepavilion.org
 // @updateURL    https://raw.githubusercontent.com/Jadax/ftp-advisor/main/ftp-advisor_user.js
 // @downloadURL  https://raw.githubusercontent.com/Jadax/ftp-advisor/main/ftp-advisor_user.js
 // @supportURL   https://github.com/Jadax/ftp-advisor/issues
@@ -22,6 +26,16 @@
 
 (function() {
     'use strict';
+
+    // The game answers on www. and the bare domain with SEPARATE logins and
+    // no redirect between them (live-checked 2026-11-08); the script only
+    // matched www., so a session on the bare domain got no advisor at all.
+    // Every request and hidden frame goes to the page's own host (its
+    // cookies; frames must be same-origin to be read).
+    const FTP_ORIGIN = /(^|\.)fromthepavilion\.org$/.test(location.hostname) ? location.origin : 'https://www.fromthepavilion.org';
+    // Logged-out pages: nothing to advise on, and no team id to detect
+    // (getTeamId would prompt for one).
+    const SKIP_PAGE = /^\/(login|register)/i.test(location.pathname || '');
 
     // ============================================================
     // FILE MAP — find a concern, jump straight to it.
@@ -133,7 +147,9 @@
         return null;
     }
 
-    const TEAM_ID = getTeamId();
+    // Runs before init(); a throw here used to take the whole script down.
+    let TEAM_ID = null;
+    try { if (!SKIP_PAGE) TEAM_ID = getTeamId(); } catch (e) { console.warn('[FTP Advisor] Team ID detection failed:', e); }
 
     // Cache keys
     const CACHE_KEY = 'ftp_squad_cache';
@@ -1763,7 +1779,7 @@
     let _academyEnsure = null;
     function ensureAcademyThen(rerender) {
         if (academyKnown(loadAcademyCache()) || _academyEnsure) return;
-        _academyEnsure = fetchAcademyFromPage(`https://www.fromthepavilion.org/academies.htm?teamId=${TEAM_ID}`)
+        _academyEnsure = fetchAcademyFromPage(`${FTP_ORIGIN}/academies.htm?teamId=${TEAM_ID}`)
             .then(info => { saveAcademyCache(info); if (academyKnown(loadAcademyCache())) rerender(); })
             .catch(e => console.warn('[FTP Academy] fetch failed', e));
     }
@@ -3245,15 +3261,15 @@
         if (force || isStale(CACHE_TIMESTAMP_KEY, STALE_SQUAD_HOURS) || squadCacheCorrupted || !existingSquadCache) {
             labels.push('squad');
             promises.push(
-                fetchSquadFromPage(`https://www.fromthepavilion.org/seniors.htm?squadViewId=2&teamId=${TEAM_ID}`)
+                fetchSquadFromPage(`${FTP_ORIGIN}/seniors.htm?squadViewId=2&teamId=${TEAM_ID}`)
                     .then(async (seniors) => {
                         const [youth, summarySeniors, summaryYouth] = await Promise.all([
-                            fetchSquadFromPage(`https://www.fromthepavilion.org/youths.htm?teamId=${TEAM_ID}`).catch(() => []),
+                            fetchSquadFromPage(`${FTP_ORIGIN}/youths.htm?teamId=${TEAM_ID}`).catch(() => []),
                             // squadViewId=1 is the only view that exposes
                             // Talents — the grid view (=2) above never has
                             // them, for own squad or opponents.
-                            fetchSquadSummaryView(`https://www.fromthepavilion.org/seniors.htm?squadViewId=1&teamId=${TEAM_ID}`),
-                            fetchSquadSummaryView(`https://www.fromthepavilion.org/youths.htm?squadViewId=1&teamId=${TEAM_ID}`)
+                            fetchSquadSummaryView(`${FTP_ORIGIN}/seniors.htm?squadViewId=1&teamId=${TEAM_ID}`),
+                            fetchSquadSummaryView(`${FTP_ORIGIN}/youths.htm?squadViewId=1&teamId=${TEAM_ID}`)
                         ]);
                         const existing = loadPlayerCache();
                         // If one group (seniors or youth) comes back empty
@@ -3303,7 +3319,7 @@
         if (force || isStale(ACADEMY_TIMESTAMP_KEY, STALE_ACADEMY_HOURS) || !academyKnown(loadAcademyCache())) {
             labels.push('academy');
             promises.push(
-                fetchAcademyFromPage(`https://www.fromthepavilion.org/academies.htm?teamId=${TEAM_ID}`)
+                fetchAcademyFromPage(`${FTP_ORIGIN}/academies.htm?teamId=${TEAM_ID}`)
                     .then(info => {
                         saveAcademyCache(info);
                         console.log('[FTP Data] Academy refreshed:', info.level);
@@ -3315,7 +3331,7 @@
         if (force || isStale(FINANCE_TIMESTAMP_KEY, STALE_FINANCE_HOURS)) {
             labels.push('finance');
             promises.push(
-                fetchFinanceFromPage(`https://www.fromthepavilion.org/finances.htm?teamId=${TEAM_ID}`)
+                fetchFinanceFromPage(`${FTP_ORIGIN}/finances.htm?teamId=${TEAM_ID}`)
                     .then(info => {
                         saveFinanceCache(info);
                         console.log('[FTP Data] Finance refreshed: $' + info.availableFunds);
@@ -3327,7 +3343,7 @@
         if (force || isStale(GROUND_TIMESTAMP_KEY, STALE_GROUND_HOURS)) {
             labels.push('ground');
             promises.push(
-                fetchGroundFromPage(`https://www.fromthepavilion.org/ground.htm?teamId=${TEAM_ID}`)
+                fetchGroundFromPage(`${FTP_ORIGIN}/ground.htm?teamId=${TEAM_ID}`)
                     .then(info => {
                         saveGroundCache(info);
                         console.log('[FTP Data] Ground refreshed:', info.pitch, info.weather, 'cap:', info.capacity);
@@ -3339,7 +3355,7 @@
         if (force || isStale(TEAM_INFO_TIMESTAMP_KEY, STALE_TEAM_INFO_HOURS)) {
             labels.push('team info');
             promises.push(
-                fetchClubFromPage(`https://www.fromthepavilion.org/club.htm?teamId=${TEAM_ID}`)
+                fetchClubFromPage(`${FTP_ORIGIN}/club.htm?teamId=${TEAM_ID}`)
                     .then(info => {
                         saveTeamInfoCache(info);
                         console.log('[FTP Data] Team info refreshed: supporters:', info.supporters, 'mood:', info.mood);
@@ -3578,7 +3594,7 @@
         return new Promise((resolve) => {
             _queuedRequest({
                 method: 'GET',
-                url: `https://www.fromthepavilion.org/player.htm?playerId=${playerId}`,
+                url: `${FTP_ORIGIN}/player.htm?playerId=${playerId}`,
                 timeout: 10000,
                 onload: (resp) => {
                     try {
@@ -3722,7 +3738,7 @@
         return new Promise((resolve) => {
             _queuedRequest({
                 method: 'POST',
-                url: 'https://www.fromthepavilion.org/transfer.htm',
+                url: `${FTP_ORIGIN}/transfer.htm`,
                 data: new URLSearchParams(params).toString(),
                 headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
                 timeout: 15000,
@@ -3982,10 +3998,10 @@ ${matches.length ? matches.map(([id, m]) => ck(true, `Orders: ${esc(m.teams)} \u
         // limitation is the game's own scouting design, not fixed by
         // this view.
         const [seniors, youth, summarySeniors, summaryYouth] = await Promise.all([
-            fetchSquadFromPage(`https://www.fromthepavilion.org/seniors.htm?squadViewId=2&orderBy=&teamId=${teamId}&playerType=0`).catch(() => []),
-            fetchSquadFromPage(`https://www.fromthepavilion.org/youths.htm?teamId=${teamId}`).catch(() => []),
-            fetchSquadSummaryView(`https://www.fromthepavilion.org/seniors.htm?squadViewId=1&orderBy=&teamId=${teamId}&playerType=0`),
-            fetchSquadSummaryView(`https://www.fromthepavilion.org/youths.htm?squadViewId=1&teamId=${teamId}`)
+            fetchSquadFromPage(`${FTP_ORIGIN}/seniors.htm?squadViewId=2&orderBy=&teamId=${teamId}&playerType=0`).catch(() => []),
+            fetchSquadFromPage(`${FTP_ORIGIN}/youths.htm?teamId=${teamId}`).catch(() => []),
+            fetchSquadSummaryView(`${FTP_ORIGIN}/seniors.htm?squadViewId=1&orderBy=&teamId=${teamId}&playerType=0`),
+            fetchSquadSummaryView(`${FTP_ORIGIN}/youths.htm?squadViewId=1&teamId=${teamId}`)
         ]);
 
         // Merge and deduplicate by player ID
@@ -7613,7 +7629,7 @@ const MAX_OVERS_PER_BOWLER = { OD: 10, YOD: 8, T20: 4, YT20: 4 };
         return new Promise((resolve) => {
             _queuedRequest({
                 method: 'GET',
-                url: `https://www.fromthepavilion.org/teamfixtures.htm?teamId=${TEAM_ID}#curr`,
+                url: `${FTP_ORIGIN}/teamfixtures.htm?teamId=${TEAM_ID}#curr`,
                 timeout: 10000,
                 onload: function(response) {
                     if (response.status !== 200) { resolve([]); return; }
@@ -9835,7 +9851,7 @@ const progMap = { batting: 'batting', bowling: 'bowling', keeping: 'keeperbattin
     }
 
     async function autoSubmitTraining(log, dryRun) {
-        const frame = await loadHiddenFrame(`https://www.fromthepavilion.org/training.htm?teamId=${TEAM_ID}`);
+        const frame = await loadHiddenFrame(`${FTP_ORIGIN}/training.htm?teamId=${TEAM_ID}`);
         try {
             _pageDocOverride = frame.contentDocument;
             const players = scrapeTrainingPage();
@@ -9867,7 +9883,7 @@ const progMap = { batting: 'batting', bowling: 'bowling', keeping: 'keeperbattin
     async function autoSubmitOrders(match, log, dryRun, force) {
         const gameId = (match.gameLink.match(/gameId=(\d+)/) || [])[1];
         if (!gameId) throw new Error(`no game id for ${match.teams}`);
-        const frame = await loadHiddenFrame(`https://www.fromthepavilion.org/orders.htm?gameId=${gameId}`);
+        const frame = await loadHiddenFrame(`${FTP_ORIGIN}/orders.htm?gameId=${gameId}`);
         try {
             _pageDocOverride = frame.contentDocument;
             if (!scrapeAvailablePlayers().length) { log(`\u23ED ${match.teams}: orders are locked (match started or finished)`); return; }
@@ -9998,7 +10014,7 @@ const progMap = { batting: 'batting', bowling: 'bowling', keeping: 'keeperbattin
     async function learnCompetitionType(detailsDoc, league) {
         const types = loadCompTypes();
         if (!league || types[league] || !detailsDoc) return;
-        const abs = (a) => new URL(a.getAttribute('href'), 'https://www.fromthepavilion.org/').href;
+        const abs = (a) => new URL(a.getAttribute('href'), FTP_ORIGIN + '/').href;
         const ovLink = detailsDoc.querySelector('a[href*="leagueoverview.htm"]');
         const ov = ovLink ? await fetchGameDoc(abs(ovLink)) : null;
         const cdLink = ov && ov.querySelector('a[href*="competitiondetails.htm"]');
@@ -10132,7 +10148,7 @@ const progMap = { batting: 'batting', bowling: 'bowling', keeping: 'keeperbattin
         return [a, b];
     }
     async function ingestCompletedMatches(log) {
-        const fx = await fetchGameDoc(`https://www.fromthepavilion.org/teamfixtures.htm?teamId=${TEAM_ID}`);
+        const fx = await fetchGameDoc(`${FTP_ORIGIN}/teamfixtures.htm?teamId=${TEAM_ID}`);
         if (!fx) return 0;
         const db = loadMatchDb();
         const done = [];
@@ -10147,9 +10163,9 @@ const progMap = { batting: 'batting', bowling: 'bowling', keeping: 'keeperbattin
         let n = 0;
         for (const m of done.slice(-MATCH_DB_INGEST_PER_RUN)) {
             const [details, card, ratingsDoc] = [
-                await fetchGameDoc(`https://www.fromthepavilion.org/gamedetails.htm?gameId=${m.gameId}`),
-                await fetchGameDoc(`https://www.fromthepavilion.org/game.htm?gameId=${m.gameId}`),
-                await fetchGameDoc(`https://www.fromthepavilion.org/ratings.htm?gameId=${m.gameId}`)
+                await fetchGameDoc(`${FTP_ORIGIN}/gamedetails.htm?gameId=${m.gameId}`),
+                await fetchGameDoc(`${FTP_ORIGIN}/game.htm?gameId=${m.gameId}`),
+                await fetchGameDoc(`${FTP_ORIGIN}/ratings.htm?gameId=${m.gameId}`)
             ];
             if (!details || !card) continue;
             const d = parseGameDetailsDoc(details);
@@ -10181,7 +10197,7 @@ const progMap = { batting: 'batting', bowling: 'bowling', keeping: 'keeperbattin
         const types = loadCompTypes();
         const untyped = [...new Map(Object.values(db).filter(x => x.league && !types[x.league]).map(x => [x.league, x.gameId])).entries()].slice(0, 3);
         for (const [league, gameId] of untyped) {
-            try { await learnCompetitionType(await fetchGameDoc(`https://www.fromthepavilion.org/gamedetails.htm?gameId=${gameId}`), league); } catch (e) { /* retry next pass */ }
+            try { await learnCompetitionType(await fetchGameDoc(`${FTP_ORIGIN}/gamedetails.htm?gameId=${gameId}`), league); } catch (e) { /* retry next pass */ }
         }
         if (n || untyped.length || loadLearned().version !== LEARN_VERSION) { try { learnFromMatchDb(); } catch (e) { console.warn('[FTP Advisor] learning pass failed:', e); } }
         const st = pilotState(); st.ingestAt = Date.now(); savePilotState(st);
@@ -10244,11 +10260,11 @@ const progMap = { batting: 'batting', bowling: 'bowling', keeping: 'keeperbattin
     }
 
     async function fetchYouthGrid() {
-        return fetchSquadFromPage(`https://www.fromthepavilion.org/youths.htm?squadViewId=2&teamId=${TEAM_ID}`).catch(() => []);
+        return fetchSquadFromPage(`${FTP_ORIGIN}/youths.htm?squadViewId=2&teamId=${TEAM_ID}`).catch(() => []);
     }
 
     async function autoRecruitYouth(log, dryRun) {
-        const frame = await loadHiddenFrame('https://www.fromthepavilion.org/youthrecruit.htm');
+        const frame = await loadHiddenFrame(`${FTP_ORIGIN}/youthrecruit.htm`);
         try {
             const doc = frame.contentDocument;
             const typeSel = doc.querySelector('select[name="youthDev"]');
@@ -10302,7 +10318,7 @@ const progMap = { batting: 'batting', bowling: 'bowling', keeping: 'keeperbattin
                 log(`\u26A0 Recruited ${desc} \u2014 ${verdict}, but kept: retiring would drop the youth squad below ${YOUTH_MIN_SQUAD}`);
                 return { done: true, kept: recruit };
             }
-            const pf = await loadHiddenFrame(`https://www.fromthepavilion.org/player.htm?playerId=${encodeURIComponent(recruit.id)}`);
+            const pf = await loadHiddenFrame(`${FTP_ORIGIN}/player.htm?playerId=${encodeURIComponent(recruit.id)}`);
             try {
                 const retire = pf.contentDocument.querySelector('input[type=submit][value="Retire Player"]');
                 if (!retire) throw new Error(`Retire button not found for ${recruit.name} — retire him by hand`);
@@ -11075,7 +11091,7 @@ const progMap = { batting: 'batting', bowling: 'bowling', keeping: 'keeperbattin
 
                             html += `<div class="ftp-rec low" style="padding:6px 8px;margin:3px 0;">
                                 <div class="vj-flex-between">
-                                    <span class="vj-fw-700" style="font-size:12px;">#${i+1} <a href="https://www.fromthepavilion.org/player.htm?playerId=${encodeURIComponent(p.id || '')}" target="_blank" rel="noopener" style="color:inherit;text-decoration:underline;text-underline-offset:2px;">${p.name}</a> <span class="vj-text-xs vj-text-muted">(${formatAgeDisplay(p.age)})</span></span>
+                                    <span class="vj-fw-700" style="font-size:12px;">#${i+1} <a href="${FTP_ORIGIN}/player.htm?playerId=${encodeURIComponent(p.id || '')}" target="_blank" rel="noopener" style="color:inherit;text-decoration:underline;text-underline-offset:2px;">${p.name}</a> <span class="vj-text-xs vj-text-muted">(${formatAgeDisplay(p.age)})</span></span>
                                     <div style="display:flex;gap:4px;align-items:center;">
                                         ${overallRatingBadge(overallRating)}
                                         <span class="ftp-stat-badge ${ratingLabelClass}">${ratingLabel.toUpperCase()}</span>
@@ -11688,7 +11704,7 @@ const progMap = { batting: 'batting', bowling: 'bowling', keeping: 'keeperbattin
             // Fetch teamfixtures page to find the next upcoming match
             _queuedRequest({
                 method: 'GET',
-                url: `https://www.fromthepavilion.org/teamfixtures.htm?teamId=${TEAM_ID}#curr`,
+                url: `${FTP_ORIGIN}/teamfixtures.htm?teamId=${TEAM_ID}#curr`,
                 timeout: 15000,
                 onload: function(response) {
                     if (response.status !== 200) {
@@ -12339,7 +12355,7 @@ const progMap = { batting: 'batting', bowling: 'bowling', keeping: 'keeperbattin
         // Only on teamfixtures.htm (own or opponent — that's where completed
         // match HTML actually gets copied from) per explicit user request;
         // it was cluttering every page before this.
-        if (pageType === 'matches') createMatchPasteUI();
+        if (pageType === 'matches') { try { createMatchPasteUI(); } catch (e) { console.warn('[FTP Advisor] Match paste box failed:', e); } }
 
         // v8.99: everything before the page UI is now failure-isolated —
         // a scrape/cleanup/refresh throw here used to abort init() before
@@ -12528,7 +12544,9 @@ const progMap = { batting: 'batting', bowling: 'bowling', keeping: 'keeperbattin
         } catch (e) { console.warn('[FTP Advisor] Autopilot dock failed:', e); }
     }
 
-    if (document.readyState === 'loading') {
+    if (SKIP_PAGE) {
+        // logged out
+    } else if (document.readyState === 'loading') {
         document.addEventListener('DOMContentLoaded', init);
     } else {
         init();
