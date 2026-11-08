@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         FTP Advisor
 // @namespace    http://tampermonkey.net/
-// @version      8.133
+// @version      8.134
 // @description  Tactical/scouting advisor for fromthepavilion.org (cricket sim): team, tactics, pitch, training, transfer market, youth and squad plan advice with projections. Full changelog: github.com/Jadax/ftp-advisor
 // @author       Tushant Sharma
 // @license      MIT
@@ -12080,10 +12080,10 @@ const progMap = { batting: 'batting', bowling: 'bowling', keeping: 'keeperbattin
     function projectedSkillAt25(player, projOpts) {
         return projectionAt25(player, projOpts).ceiling;
     }
-    // A buy who turns 21 within this many weeks plays (at most) a youth match
-    // or two for you: an auction runs up to a week and he moves the week after.
-    // User: a 20y14w card ranked "#1 of 8 youth bowlers" was senior in a week.
-    const TRANSFER_SENIOR_SOON_WEEKS = 2;
+    // User (2026-11-09): anyone past 20 years 6 months is judged against the
+    // senior team. Half of the 14-week age-year = 7 weeks left, i.e. 20y8w
+    // (20.5) and older. Was 2 weeks (v8.126, the 20y14w report).
+    const TRANSFER_SENIOR_SOON_WEEKS = 7;
     function joinsAsSenior(age) {
         return !isYouthAge(age) || weeksToAge(age, 21) <= TRANSFER_SENIOR_SOON_WEEKS;
     }
