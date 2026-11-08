@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         FTP Advisor
 // @namespace    http://tampermonkey.net/
-// @version      8.132
+// @version      8.133
 // @description  Tactical/scouting advisor for fromthepavilion.org (cricket sim): team, tactics, pitch, training, transfer market, youth and squad plan advice with projections. Full changelog: github.com/Jadax/ftp-advisor
 // @author       Tushant Sharma
 // @license      MIT
@@ -694,9 +694,10 @@
     // Best-buy order for the transfer list: the ★ Overall Rating (quality,
     // incl. the age-25 projection) nudged by price vs fair price. Capped
     // small (+3 / -5) because the listed price is the CURRENT bid and can
-    // still rise; unknown fair price = no nudge.
+    // still rise; unknown fair price = no nudge. Behind-curve / under
+    // SENIOR_MINS players are shown (v8.133) but sort 3 lower.
     function bestBuyScore(player) {
-        const base = (player._overallRating && player._overallRating.score) || 0;
+        const base = ((player._overallRating && player._overallRating.score) || 0) - (player.eval && player.eval.softFailed ? 3 : 0);
         const fp = computeFairPrice(player);
         const asking = player.price || 0;
         if (!fp || !fp.fair || asking <= 0) return base;
@@ -2500,6 +2501,7 @@
         const warnings = [];
         const strengths = [];
         let score = 0;
+        let softFailed = false; // behind the curve / under SENIOR_MINS: a transfer-card warning, not a filter
         const isYouth = age < 21;
 
         // ---- YOUTH EVALUATION (16-20) ----
@@ -2526,8 +2528,9 @@
                 // ANY skill below target = filtered out
                 if (belowSkills.length > 0) {
                     score = -5;
+                    softFailed = true;
                     belowSkills.forEach(r => warnings.push(`${r.label} ${skillLabel(r.value)} — below age ${age} target ${skillLabel(r.min)}`));
-                    warnings.push(`${belowSkills.length} skill${belowSkills.length > 1 ? 's' : ''} below age ${age} targets — filtered`);
+                    warnings.push(`${belowSkills.length} skill${belowSkills.length > 1 ? 's' : ''} below age ${age} targets`);
                 } else {
                     score += 3;
                     // A below-target stat that's only 'catching-up' (can still
@@ -2650,7 +2653,7 @@
                 scoutCheck.failed.forEach(w => warnings.push(w));
                 warnings.push(`Does not meet the base for age ${age} — filtered`);
             }
-            return { score, verdict, warnings, strengths, rank: 0 };
+            return { score, verdict, warnings, strengths, rank: 0, baseFailed: scoutCheck.hasBenchmark && !scoutCheck.passed, softFailed };
         }
 
         // ---- SENIOR EVALUATION (21+) ----
@@ -2694,8 +2697,9 @@
         // ANY skill below minimum = filtered out (poor verdict)
         if (belowMins.length > 0) {
             score = -5;
+            softFailed = true;
             belowMins.forEach(s => warnings.push(`${s.name} ${skillLabel(s.value)} — below minimum ${skillLabel(s.min)}`));
-            warnings.push(`${belowMins.length} skill${belowMins.length > 1 ? 's' : ''} below senior minimums — filtered`);
+            warnings.push(`${belowMins.length} skill${belowMins.length > 1 ? 's' : ''} below senior minimums`);
         } else {
             score += 3;
             strengths.push('All skills meet senior minimums');
@@ -2876,7 +2880,7 @@
             warnings.push(`Does not meet the base for age ${age} — filtered`);
         }
 
-        return { score, verdict, warnings, strengths, rank: 0 };
+        return { score, verdict, warnings, strengths, rank: 0, baseFailed: scoutCheck.hasBenchmark && !scoutCheck.passed, softFailed };
     }
 
     // Calculate a 1-10 rank for a player (10 = best)
@@ -3724,6 +3728,10 @@
         const y = ageYears(age);
         return TRANSFER_BUY_AGES.some(([lo, hi]) => y >= lo && y <= hi);
     }
+    // 20-21 search floor = Expert because the base (AGE_SCOUT_THRESHOLDS) is
+    // Expert primary at 20 and 21: an Accomplished floor was tried (v8.133
+    // live, 40 scanned) and every extra row it pulled failed the base after
+    // a wasted player-page fetch.
     const MARKET_SCANS = [
         { label: '16-18 batters', fromAge: 16, toAge: 18, skill: 5, min: 4 },
         { label: '16-18 bowlers', fromAge: 16, toAge: 18, skill: 6, min: 4 },
@@ -10856,15 +10864,17 @@ const progMap = { batting: 'batting', bowling: 'bowling', keeping: 'keeperbattin
                             return false;
                         }
                     }
-                    if (isYouth) {
-                        return e.eval.verdict !== 'poor' && e.eval.verdict !== 'weak';
-                    }
+                    // Hard filters are the user's: buying ages, the base
+                    // (AGE_SCOUT_THRESHOLDS) and the 58 bar above. Being behind
+                    // YOUTH_DEV_CURVE or under SENIOR_MINS predates the bar and
+                    // hid players it passes — now a card warning + lower sort.
+                    if (e.eval.baseFailed) return false;
+                    if (isYouth) return true;
                     // Hard filters (base + senior minimums, age-specific) drop a
                     // candidate to poor/weak; past that, the bar is "projects
                     // better at 25 than a current senior in his role". The old
                     // bar (legacy ELITE + outranks a senior on CURRENT skill)
                     // hid exactly the 21yo development signings the user buys.
-                    if (e.eval.verdict === 'poor' || e.eval.verdict === 'weak') return false;
                     const cmp = e.peerCompare;
                     if (!cmp || cmp.isGap || cmp.wouldReplace.length > 0) return true;
                     // Pre-fetch rows carry experience 0 and no talents, both of
@@ -10916,7 +10926,7 @@ const progMap = { batting: 'batting', bowling: 'bowling', keeping: 'keeperbattin
                     `batters: ${seniorPlayers.filter(p => getPrimarySkillInfo(p).name === 'batting').length}, ` +
                     `bowlers: ${seniorPlayers.filter(p => getPrimarySkillInfo(p).name === 'bowling').length}, ` +
                     `keepers: ${seniorPlayers.filter(p => getPrimarySkillInfo(p).name === 'keeping').length}`);
-                if (youthEval.length > 0 && youthEval.every(e => e.eval.verdict === 'poor' || e.eval.verdict === 'weak')) {
+                if (youthEval.length > 0 && youthEval.every(e => e.eval.baseFailed)) {
                     // Flattened to a plain string, not a logged object —
                     // browser consoles collapse nested objects to "{...}"
                     // when copy-pasted as text, which makes an object-based
