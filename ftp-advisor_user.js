@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         FTP Advisor
 // @namespace    http://tampermonkey.net/
-// @version      8.137
+// @version      8.138
 // @description  Tactical/scouting advisor for fromthepavilion.org (cricket sim): team, tactics, pitch, training, transfer market, youth and squad plan advice with projections. Full changelog: github.com/Jadax/ftp-advisor
 // @author       Tushant Sharma
 // @license      MIT
@@ -927,11 +927,11 @@
         const bt = String(player.bowlerType || '').toLowerCase();
         const cat = BOWLER_CATEGORY[bt];
         if (cat !== 'seam' && cat !== 'spin') return null;
-        const compTypes = loadCompTypes();
-        const ms = Object.values(loadMatchDb()).filter(m => m.conditions && PITCH_EFFECTS[m.conditions.pitch]
-            && !/youth/i.test(m.league || '') && !(compTypes[m.league] && compTypes[m.league].youth));
-        const key = ms.length + '|' + JSON.stringify(loadLearned().spinSeam || {});
+        const key = String(GM_getValue(MATCH_DB_KEY, '')).length + '|' + JSON.stringify(loadLearned().spinSeam || {});
         if (_typeFitCache.key !== key) {
+            const compTypes = loadCompTypes();
+            const ms = Object.values(loadMatchDb()).filter(m => m.conditions && PITCH_EFFECTS[m.conditions.pitch]
+                && !/youth/i.test(m.league || '') && !(compTypes[m.league] && compTypes[m.league].youth));
             const conds = ms.length >= 5 ? ms.map(m => ({ pitch: m.conditions.pitch, weather: m.conditions.weather }))
                 : Object.keys(PITCH_EFFECTS).map(pitch => ({ pitch, weather: 'Sunny' }));
             const typeVal = (t) => {
@@ -945,7 +945,9 @@
             };
             const vals = Object.keys(TYPE_FIT_PROBES).map(typeVal);
             const avg = vals.reduce((a, b) => a + b, 0) / vals.length;
-            _typeFitCache.rel = (t) => typeVal(t) / avg;
+            const relMap = {};
+            Object.keys(BOWLER_CATEGORY).forEach(t => { if (BOWLER_CATEGORY[t] === 'seam' || BOWLER_CATEGORY[t] === 'spin') relMap[t] = typeVal(t) / avg; });
+            _typeFitCache.rel = (t) => relMap[t];
             _typeFitCache.n = ms.length >= 5 ? ms.length : 0;
             _typeFitCache.key = key;
         }
@@ -1054,7 +1056,16 @@
         const talentScore = Math.min(5, alignedTalentWeight(player) * 1.5);
         // Bowlers only, centred on 0 so batters/keepers are unchanged.
         const fit = bowlerTypeFit(player);
-        const typeScore = fit ? Math.max(-2.5, Math.min(2.5, (fit.rel - 1) * 10)) : 0;
+        const cls = fit ? paceClass(player.bowlerType) : null;
+        // The scorecard evidence was produced in this club's conditions, so
+        // the model's conditions term fades as that evidence grows.
+        const learnedType = fit ? bowlerTypeLearnedPoints(cls) : null;
+        const typeParts = fit ? {
+            prior: BOWLER_TYPE_PRIOR[cls] || 0,
+            learned: learnedType,
+            conditions: Math.max(-2.5, Math.min(2.5, (fit.rel - 1) * 10)) * TYPE_LEARN_SHRINK_OVERS / (learnedType.overs + TYPE_LEARN_SHRINK_OVERS)
+        } : null;
+        const typeScore = typeParts ? Math.max(-5, Math.min(5, typeParts.prior + typeParts.learned.points + typeParts.conditions)) : 0;
 
         // ONE weight set for EVERY age (v8.65). The old youth weights
         // (1.0/1.2/0.6/0.4/0.8) discounted a youth's dist/value/talent
@@ -1083,7 +1094,10 @@
         breakdown.push(`${roleLabel} skill shape ${f1(distScore)}/10 x0.8 = ${f1(distScore * 0.8)}`);
         breakdown.push(vpk != null ? `Wage value ${f1(valueScore)}/15 x0.4 = ${f1(valueScore * 0.4)}` : `Wage value unknown (neutral ${f1(valueScore * 0.4)})`);
         breakdown.push(`Role-useful talents ${f1(talentScore)}/5`);
-        if (fit) breakdown.push(`Bowler type in your conditions \u00D7${fit.rel.toFixed(2)} vs average (${fit.n ? fit.n + ' senior matches' : 'all pitches equally'}) ${typeScore >= 0 ? '+' : ''}${f1(typeScore)}`);
+        if (typeParts) {
+            const sg = v => (v >= 0 ? '+' : '') + f1(v);
+            breakdown.push(`Bowler type (${PACE_CLASS_LABEL[cls]}) ${sg(typeScore)}: your rule ${sg(typeParts.prior)} \u00B7 engine results ${sg(typeParts.learned.points)}${typeParts.learned.overs ? ` (${typeParts.learned.overs} overs)` : ' (no data yet)'} \u00B7 your conditions ${sg(typeParts.conditions)}${fit.n ? '' : ' (all pitches)'}`);
+        }
         label = score >= 75 ? 'elite' : score >= 55 ? 'strong' : score >= 35 ? 'reasonable' : 'pass';
 
         return {
@@ -3987,8 +4001,13 @@ ${matches.length ? matches.map(([id, m]) => ck(true, `Orders: ${esc(m.teams)} \u
     const L = loadLearned();
     const rows = L.version === LEARN_VERSION ? Object.entries(L.spinSeam || {}) : [];
     const comps = Object.entries(loadCompTypes()).filter(([, t]) => t.friendly || t.youth);
-    if (!rows.length && !comps.length) return '<div class="lg">Learning starts once completed matches with engine ratings are recorded.</div>';
+    const bt = L.version === LEARN_VERSION ? (L.bowlerType || {}) : {};
+    const tr = L.version === LEARN_VERSION ? (L.training || {}) : {};
+    const typeLines = Object.keys(bt).length ? `<div class="ck"><b class="ok">\u2022</b><span>Bowler types in the engine's scorecards: ${Object.keys(PACE_CLASS_LABEL).filter(c => bt[c]).map(c => `${PACE_CLASS_LABEL[c]} ${bt[c].rel >= 0 ? '+' : ''}${Math.round(bt[c].rel * 100)}% (${bt[c].overs} ov)`).join(' \u00B7 ')}</span></div>` : '';
+    const trainLines = ['youth', 'senior'].filter(g => tr[g]).map(g => { const f = learnedTrainingFactor(g === 'youth'); return `<div class="ck"><b class="${f !== 1 ? 'ok' : 'no'}">\u2022</b><span>${g === 'youth' ? 'Youth' : 'Senior'} training: ${tr[g].pairs} week-pairs, real ${(tr[g].actual / 1000).toFixed(1)} vs predicted ${(tr[g].expected / 1000).toFixed(1)} levels \u2014 ${f === 1 ? 'need ' + TRAIN_LEARN_MIN_POINTS / 1000 + ' predicted levels to apply' : 'projections run \u00D7' + f.toFixed(2)}</span></div>`; }).join('');
+    if (!rows.length && !comps.length && !typeLines && !trainLines) return '<div class="lg">Learning starts once completed matches with engine ratings are recorded.</div>';
     return rows.map(([g, e]) => { const f = learnedSpinSeamFactor(g === 'youth'); return `<div class="ck"><b class="${f !== 1 ? 'ok' : 'no'}">${f > 1 ? '\u2191' : f < 1 ? '\u2193' : '\u2022'}</b><span>${g === 'youth' ? 'Youth' : 'Senior'} bowling: ${e.n} match${e.n > 1 ? 'es' : ''} \u2014 ${f === 1 ? (e.n < LEARN_MIN_MATCHES ? 'need ' + LEARN_MIN_MATCHES + ' to apply' : 'model already right') : `the engine rates your spinners ${f > 1 ? 'higher' : 'lower'} vs your seamers than the model did (\u00D7${f.toFixed(2)} applied)`}</span></div>`; }).join('')
+        + typeLines + trainLines
         + comps.map(([name, t]) => `<div class="ck"><b class="ok">\u2022</b><span>${esc(name)} = ${esc(t.matchType)}${t.youth ? ' \u2014 youth only' : ''}${t.friendly ? ', everyone rested' : ''}</span></div>`).join('');
 })()}</div>
 <div class="sec"><div class="btns"><button class="btn pri" data-a="run">Run now</button><button class="btn" data-a="preview">Preview</button></div>
@@ -8874,9 +8893,10 @@ table.ftp-table {
             ADAPTIVE_PLAN_SKILLS.forEach(skill => { points[skill] = state[skill].level * 1000 + state[skill].progress; });
             const gains = estimateWeeklyTrainingGain(program, simPlayer, academySpeedAtWeek(academySpeed, week - 1), Object.assign({}, gainOpts || {}, { points }));
             if (!gains) continue;
+            const pace = learnedTrainingFactor(simPlayer.age < 21);
             Object.keys(gains).forEach(skill => {
                 if (!state[skill] || state[skill].level >= 15) return;
-                state[skill].progress += gains[skill] || 0;
+                state[skill].progress += pace === 1 ? (gains[skill] || 0) : Math.floor((gains[skill] || 0) * pace);
                 while (state[skill].progress >= 1000 && state[skill].level < 15) {
                     state[skill].progress -= 1000;
                     state[skill].level += 1;
@@ -10126,12 +10146,21 @@ const progMap = { batting: 'batting', bowling: 'bowling', keeping: 'keeperbattin
     // Deterministic given the database.
     // ============================================================
     const LEARNED_KEY = 'ftp_learned';
-    const LEARN_VERSION = 2;
+    const LEARN_VERSION = 3;
     const LEARN_SHRINK = 4;
     const LEARN_MIN_MATCHES = 5;
     const LEARN_CLAMP = [0.8, 1.25];
+    // Read on every simulated training week and every rating — parse once
+    // per stored value.
+    const _learnedMemo = { raw: undefined, val: null };
     function loadLearned() {
-        try { return JSON.parse(GM_getValue(LEARNED_KEY, 'null')) || { spinSeam: {} }; } catch (e) { return { spinSeam: {} }; }
+        const raw = GM_getValue(LEARNED_KEY, 'null');
+        if (raw !== _learnedMemo.raw) {
+            let v = null;
+            try { v = JSON.parse(raw); } catch (e) { v = null; }
+            _learnedMemo.raw = raw; _learnedMemo.val = v || { spinSeam: {} };
+        }
+        return _learnedMemo.val;
     }
     function learnedSpinSeamFactor(isYouth) {
         const L = loadLearned();
@@ -10170,6 +10199,132 @@ const progMap = { batting: 'batting', bowling: 'bowling', keeping: 'keeperbattin
         types[league] = { matchType, youth: /youth/i.test(matchType), friendly: /friendly/i.test(matchType), at: Date.now() };
         GM_setValue(COMP_TYPES_KEY, JSON.stringify(types));
     }
+    // ---- Bowler type, learned from the engine's own scorecards ----
+    // Every recorded innings (both sides, all formats): each bowler's
+    // per-over value (wickets x the innings' runs-per-wicket, minus runs)
+    // relative to that innings' average — the same pitch, weather and
+    // batting line-up, so only the bowler differs. Averaged per pace class,
+    // overs-weighted, as a share of the innings' runs per over.
+    function paceClass(bt) {
+        const cat = BOWLER_CATEGORY[String(bt || '').toLowerCase()];
+        // Wrist and finger spin split: live scorecards +10% vs -18% (2026-11-12).
+        if (cat === 'spin') return /ws$/i.test(bt) ? 'wrist' : 'finger';
+        if (cat !== 'seam') return null;
+        const pace = BOWLER_PACE[String(bt).toLowerCase()] || 3;
+        return pace >= 5 ? 'fast' : pace >= 4 ? 'fastmed' : 'medium';
+    }
+    function learnBowlerTypeFromScorecards(db) {
+        const acc = {};
+        Object.values(db).forEach(m => ((m.result && m.result.innings) || []).forEach(inn => {
+            const card = (inn.bowling_card || []).filter(b => b.overs > 0 && paceClass(b.type));
+            const overs = card.reduce((t, b) => t + b.overs, 0);
+            const runs = card.reduce((t, b) => t + (b.runs || 0), 0);
+            const wkts = card.reduce((t, b) => t + (b.wickets || 0), 0);
+            if (card.length < 3 || overs < 10 || !(runs > 0)) return;
+            const rpw = wkts > 0 ? runs / wkts : runs;
+            const rpo = runs / overs;
+            const val = b => ((b.wickets || 0) * rpw - (b.runs || 0)) / b.overs;
+            const mean = card.reduce((t, b) => t + val(b) * b.overs, 0) / overs;
+            card.forEach(b => {
+                const c = paceClass(b.type);
+                const e = acc[c] || (acc[c] = { overs: 0, sum: 0 });
+                e.overs += b.overs; e.sum += (val(b) - mean) / rpo * b.overs;
+            });
+        }));
+        const out = {};
+        Object.entries(acc).forEach(([c, e]) => { out[c] = { overs: Math.round(e.overs), rel: Math.round(e.sum / e.overs * 1000) / 1000 }; });
+        return out;
+    }
+    // Community/user prior (2026-11-12): fast and fast-medium bowlers are
+    // better than the other types. The scorecard evidence then moves each
+    // class, shrunk by overs/(overs+TYPE_LEARN_SHRINK_OVERS).
+    const BOWLER_TYPE_PRIOR = { fast: 1.5, fastmed: 1.0, medium: 0, finger: 0, wrist: 0 };
+    const PACE_CLASS_LABEL = { fast: 'fast', fastmed: 'fast-medium', medium: 'medium', finger: 'finger spin', wrist: 'wrist spin' };
+    const TYPE_LEARN_SHRINK_OVERS = 300;
+    function bowlerTypeLearnedPoints(cls) {
+        const L = loadLearned();
+        const e = L.version === LEARN_VERSION && L.bowlerType ? L.bowlerType[cls] : null;
+        if (!e || !(e.overs > 0)) return { points: 0, overs: 0, rel: 0 };
+        const pts = Math.max(-2, Math.min(2, e.rel * 15 * e.overs / (e.overs + TYPE_LEARN_SHRINK_OVERS)));
+        return { points: pts, overs: e.overs, rel: e.rel };
+    }
+
+    // ---- Training pace, learned from the squad's REAL progress ----
+    // A weekly snapshot of every player's skills, program and academy;
+    // consecutive snapshots on the same program give actual level gains vs
+    // what estimateWeeklyTrainingGain predicted for those weeks. Levels are
+    // whole numbers, so single pairs are noisy — the ratio is pooled per age
+    // group and only applied once TRAIN_LEARN_MIN_POINTS of expected gain
+    // has been observed, shrunk toward 1 and clamped.
+    const PROGRESS_KEY = 'ftp_progress';
+    const PROGRESS_EVERY_DAYS = 6;
+    const TRAIN_LEARN_MIN_POINTS = 8000;
+    const TRAIN_LEARN_CLAMP = [0.7, 1.3];
+    const PROGRESS_SKILLS = ['batting', 'bowling', 'keeping', 'technique', 'fielding', 'endurance', 'power'];
+    function loadProgress() {
+        try { return JSON.parse(GM_getValue(PROGRESS_KEY, '{}')) || {}; } catch (e) { return {}; }
+    }
+    function recordProgressSnapshot() {
+        const cache = loadPlayerCache();
+        const players = cache ? cache.players : [];
+        if (!players.length) return 0;
+        const acad = loadAcademyCache();
+        if (!academyKnown(acad)) return 0;
+        const counts = squadCounts(players);
+        const prog = loadProgress();
+        const now = Date.now();
+        let n = 0;
+        players.forEach(p => {
+            if (!p.id || !p.hasFullSkills && !(p.batting || p.bowling || p.keeping)) return;
+            const list = prog[p.id] || (prog[p.id] = []);
+            const last = list[list.length - 1];
+            if (last && now - last.t < PROGRESS_EVERY_DAYS * 864e5) return;
+            const snap = { t: now, age: p.age, prog: TRAINING_LABEL_TO_KEY[String(p.currentTraining || '').toLowerCase()] || null,
+                speed: getAcademySpeedForPlayer(p, acad), squad: (p.age || 0) < 21 ? counts.youthCount : counts.seniorCount, talents: p.talents || [] };
+            PROGRESS_SKILLS.forEach(k => { snap[k] = p[k] || 0; });
+            list.push(snap);
+            if (list.length > 40) list.splice(0, list.length - 40);
+            n++;
+        });
+        const live = new Set(players.map(p => String(p.id)));
+        Object.keys(prog).forEach(id => { if (!live.has(String(id))) delete prog[id]; });
+        GM_setValue(PROGRESS_KEY, JSON.stringify(prog));
+        return n;
+    }
+    function learnTrainingFromProgress() {
+        const acc = { youth: { exp: 0, act: 0, pairs: 0 }, senior: { exp: 0, act: 0, pairs: 0 } };
+        Object.values(loadProgress()).forEach(list => {
+            for (let i = 1; i < list.length; i++) {
+                const a = list[i - 1], b = list[i];
+                const weeks = Math.round((b.t - a.t) / (7 * 864e5));
+                if (!a.prog || a.prog !== b.prog || a.prog === 'rest' || weeks < 1 || weeks > 6) continue;
+                const rates = TRAINING_BASE_RATES[a.prog];
+                if (!rates) continue;
+                const skills = Object.keys(rates).filter(k => (a[k] || 0) < 14);
+                let exp = 0;
+                for (let w = 0; w < weeks; w++) {
+                    const pl = Object.assign({}, a, { age: a.age + w / 14, fatigue: 10 });
+                    const g = estimateWeeklyTrainingGain(a.prog, pl, a.speed, { squadSizePenalty: squadPenaltyMultiplier(a.squad || 0) }) || {};
+                    skills.forEach(k => { exp += g[k] || 0; });
+                }
+                const act = skills.reduce((t, k) => t + Math.max(0, (b[k] || 0) - (a[k] || 0)) * 1000, 0);
+                const g = acc[(a.age || 0) < 21 ? 'youth' : 'senior'];
+                g.exp += exp; g.act += act; g.pairs++;
+            }
+        });
+        const out = {};
+        Object.entries(acc).forEach(([k, e]) => { if (e.pairs) out[k] = { pairs: e.pairs, expected: Math.round(e.exp), actual: Math.round(e.act) }; });
+        return out;
+    }
+    function learnedTrainingFactor(isYouth) {
+        const L = loadLearned();
+        const e = L.version === LEARN_VERSION && L.training ? L.training[isYouth ? 'youth' : 'senior'] : null;
+        if (!e || e.expected < TRAIN_LEARN_MIN_POINTS || !(e.expected > 0)) return 1;
+        const raw = e.actual / e.expected;
+        const shrunk = 1 + (raw - 1) * e.expected / (e.expected + TRAIN_LEARN_MIN_POINTS);
+        return Math.max(TRAIN_LEARN_CLAMP[0], Math.min(TRAIN_LEARN_CLAMP[1], shrunk));
+    }
+
     function snapshotToPlayer(x) {
         return {
             id: x.id, name: x.name, age: x.age, batting: x.bat, bowling: x.bowl, technique: x.tech, power: x.pow, keeping: x.keep,
@@ -10216,7 +10371,8 @@ const progMap = { batting: 'batting', bowling: 'bowling', keeping: 'keeperbattin
             const e = samples[group] || (samples[group] = { n: 0, w: 0, sum: 0 });
             e.n++; e.w += w; e.sum += resid * w;
         });
-        const learned = { version: LEARN_VERSION, spinSeam: {}, updatedAt: Date.now() };
+        const learned = { version: LEARN_VERSION, spinSeam: {}, updatedAt: Date.now(),
+            bowlerType: learnBowlerTypeFromScorecards(db), training: learnTrainingFromProgress() };
         Object.entries(samples).forEach(([g, e]) => { learned.spinSeam[g] = { n: e.n, w: Math.round(e.w * 100) / 100, mean: Math.round(e.sum / e.w * 1000) / 1000 }; });
         GM_setValue(LEARNED_KEY, JSON.stringify(learned));
         return learned;
@@ -10337,13 +10493,14 @@ const progMap = { batting: 'batting', bowling: 'bowling', keeping: 'keeperbattin
             n++;
         }
         if (n) { saveMatchDb(db); if (log) log(`\u{1F4DA} Recorded ${n} completed match${n > 1 ? 'es' : ''} (scorecard, conditions, engine ratings)`); }
+        try { recordProgressSnapshot(); } catch (e) { console.warn('[FTP Advisor] progress snapshot failed:', e); }
         // Leagues recorded before competition types were learned: one lookup each.
         const types = loadCompTypes();
         const untyped = [...new Map(Object.values(db).filter(x => x.league && !types[x.league]).map(x => [x.league, x.gameId])).entries()].slice(0, 3);
         for (const [league, gameId] of untyped) {
             try { await learnCompetitionType(await fetchGameDoc(`${FTP_ORIGIN}/gamedetails.htm?gameId=${gameId}`), league); } catch (e) { /* retry next pass */ }
         }
-        if (n || untyped.length || loadLearned().version !== LEARN_VERSION) { try { learnFromMatchDb(); } catch (e) { console.warn('[FTP Advisor] learning pass failed:', e); } }
+        if (n || untyped.length || loadLearned().version !== LEARN_VERSION || Date.now() - (loadLearned().updatedAt || 0) > 24 * 3600e3) { try { learnFromMatchDb(); } catch (e) { console.warn('[FTP Advisor] learning pass failed:', e); } }
         const st = pilotState(); st.ingestAt = Date.now(); savePilotState(st);
         return n;
     }
