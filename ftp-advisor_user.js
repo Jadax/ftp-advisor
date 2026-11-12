@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         FTP Advisor
 // @namespace    http://tampermonkey.net/
-// @version      8.134
+// @version      8.135
 // @description  Tactical/scouting advisor for fromthepavilion.org (cricket sim): team, tactics, pitch, training, transfer market, youth and squad plan advice with projections. Full changelog: github.com/Jadax/ftp-advisor
 // @author       Tushant Sharma
 // @license      MIT
@@ -696,8 +696,16 @@
     // small (+3 / -5) because the listed price is the CURRENT bid and can
     // still rise; unknown fair price = no nudge. Behind-curve / under
     // SENIOR_MINS players are shown (v8.133) but sort 3 lower.
+    // Best-to-worst (user, 2026-11-12): the ★ rating (projection at 25 +
+    // wage value) first, then where he'd sit in your side at 25 (#1 +3,
+    // #2 +1.5), +2 if he'd start in your XI today, the price nudge, and -3
+    // for behind-curve / under-minimum warnings.
     function bestBuyScore(player) {
-        const base = ((player._overallRating && player._overallRating.score) || 0) - (player.eval && player.eval.softFailed ? 3 : 0);
+        const r = player._rankLines;
+        const base = ((player._overallRating && player._overallRating.score) || 0)
+            - (player.eval && player.eval.softFailed ? 3 : 0)
+            + (r ? (r.at25Rank === 1 ? 3 : r.at25Rank === 2 ? 1.5 : 0) : 0)
+            + (r && r.xi && r.xi.some(x => x.starts) ? 2 : 0);
         const fp = computeFairPrice(player);
         const asking = player.price || 0;
         if (!fp || !fp.fair || asking <= 0) return base;
@@ -10850,6 +10858,10 @@ const progMap = { batting: 'batting', bowling: 'bowling', keeping: 'keeperbattin
                         e.eval.warnings.push(`Age ${age} — outside your buying ages (16-18, 20-21)`);
                         return false;
                     }
+                    if ((e.price || 0) > TRANSFER_MAX_PRICE) {
+                        e.eval.warnings.push(`Current bid $${(e.price || 0).toLocaleString()} — over your $${TRANSFER_MAX_PRICE.toLocaleString()} limit`);
+                        return false;
+                    }
                     // User's bar, every age: must project to 58+ at 25 (projection =
                     // the workbook's method: current academy, perfect training).
                     // Applied only once experience/talents are fetched: before that
@@ -10869,6 +10881,16 @@ const progMap = { batting: 'batting', bowling: 'bowling', keeping: 'keeperbattin
                     // YOUTH_DEV_CURVE or under SENIOR_MINS predates the bar and
                     // hid players it passes — now a card warning + lower sort.
                     if (e.eval.baseFailed) return false;
+                    // Rank cap, known-gated like the 58 bar: a pre-fetch
+                    // projection ranks low and a hidden card is never fetched.
+                    if ((e.experience || 0) > 0 || (e.wage || 0) > 0) {
+                        const rr = at25RoleRank(e, allPlayers, projOpts);
+                        const cap = TRANSFER_MAX_AT25_RANK[rr.role] || 3;
+                        if (rr.rank > cap) {
+                            e.eval.warnings.push(`At 25 would be your #${rr.rank} ${rr.role === 'keeping' ? 'keeper' : rr.role === 'bowling' ? 'bowler' : 'batter'} — must be top ${cap}`);
+                            return false;
+                        }
+                    }
                     if (isYouth) return true;
                     // Hard filters (base + senior minimums, age-specific) drop a
                     // candidate to poor/weak; past that, the bar is "projects
@@ -10960,6 +10982,7 @@ const progMap = { batting: 'batting', bowling: 'bowling', keeping: 'keeperbattin
                 }
                 logSquadGapDiagnostic(seniorEval);
                 const priorityBuys = filtered;
+                priorityBuys.forEach(p => { p._rankLines = squadRankLines(p, allPlayers, projOpts); });
 
 
                 // Record every candidate's price into the local price-history
@@ -11000,6 +11023,7 @@ const progMap = { batting: 'batting', bowling: 'bowling', keeping: 'keeperbattin
                         ? `Projections use your <span class="vj-fw-700">${academyInfoForProjection.level}</span> academy (${academyInfoForProjection.seniorEfficiency}% senior / ${academyInfoForProjection.youthEfficiency}% youth efficiency)`
                         : `Academy level not cached yet — visit the <span class="vj-fw-700">Academy</span> page so market projections use your real training speed`;
                     html += `<div class="vj-text-xs vj-text-muted vj-mb-8">${academyContext}</div>`;
+                    html += `<div class="vj-text-xs vj-text-muted vj-mb-8">Shown: ages 16-18 / 20-21, \u2264 $${TRANSFER_MAX_PRICE.toLocaleString()}, \u2265 ${MIN_PROJECTION_AT_25} at 25, top ${TRANSFER_MAX_AT25_RANK.keeping} keeper / top ${TRANSFER_MAX_AT25_RANK.batting} batter or bowler at 25. Best \u2192 worst: \u2605 rating, rank in your side at 25, starts today, price vs fair.</div>`;
                     if (!detailsFetched) {
                         // Talents aren't shown on the transfer search table
                         // at all (game limitation \u2014 only on the player's
@@ -11108,7 +11132,7 @@ const progMap = { batting: 'batting', bowling: 'bowling', keeping: 'keeperbattin
                                     </div>
                                 </div>
                                 ${(() => {
-                                    const r = squadRankLines(p, allPlayers, projOpts);
+                                    const r = p._rankLines || squadRankLines(p, allPlayers, projOpts);
                                     const role = r.role === 'keeping' ? 'keeper' : r.role === 'bowling' ? 'bowler' : 'batter';
                                     const col = (rank) => rank <= TRANSFER_XI_SLOTS[r.role] ? 'var(--vj-green)' : 'var(--vj-text-muted)';
                                     const xi = (rank) => rank <= TRANSFER_XI_SLOTS[r.role] ? ' \u2014 would start' : '';
@@ -11174,6 +11198,7 @@ const progMap = { batting: 'batting', bowling: 'bowling', keeping: 'keeperbattin
                             ev.rank = calculateRank(p, squadStats);
                             p.eval = ev;
                             p.peerCompare = comparePlayerToSquadPeers(p, allPlayers, projOpts);
+                            p._rankLines = squadRankLines(p, allPlayers, projOpts);
                         });
                         priorityBuys.sort(bestBuyOrder);
                         logSquadGapDiagnostic(priorityBuys.filter(p => ageYears(p.age) >= 21));
@@ -12147,20 +12172,32 @@ const progMap = { batting: 'batting', bowling: 'bowling', keeping: 'keeperbattin
             };
         });
     }
+    // User caps (2026-11-12): a buy must rank in the top 2 of your keepers /
+    // top 3 of your batters or bowlers at 25 (vs your SENIORS' to-25
+    // projections — the one horizon a 16yo and a 21yo share), and cost no
+    // more than $100,000 (current bid).
+    const TRANSFER_MAX_AT25_RANK = { keeping: 2, batting: 3, bowling: 3 };
+    const TRANSFER_MAX_PRICE = 100000;
+    function at25RoleRank(candidate, squadPlayers, projOpts) {
+        const role = getPrimarySkillInfo(candidate).name;
+        const seniors = squadPlayers.filter(p => p.name !== candidate.name && !isYouthAge(p.age) && getPrimarySkillInfo(p).name === role);
+        const ceiling = projectionAt25(candidate, projOpts).ceiling;
+        return { role, rank: 1 + seniors.filter(p => projectedSkillAt25(p, projOpts) > ceiling).length, of: seniors.length + 1 };
+    }
     function squadRankLines(candidate, squadPlayers, projOpts) {
         const role = getPrimarySkillInfo(candidate).name;
         const youth = !joinsAsSenior(candidate.age);
         const others = squadPlayers.filter(p => p.name !== candidate.name && getPrimarySkillInfo(p).name === role);
         const nowPeers = others.filter(p => isYouthAge(p.age) === youth);
-        const seniors = others.filter(p => !isYouthAge(p.age));
         const cand = projectionAt25(candidate, projOpts);
+        const at25 = at25RoleRank(candidate, squadPlayers, projOpts);
         return {
             role,
             nowRank: 1 + nowPeers.filter(p => projectionAt25(p, projOpts).current > cand.current).length,
             nowOf: nowPeers.length + 1,
             nowGroup: youth ? 'youth' : 'senior',
-            at25Rank: 1 + seniors.filter(p => projectedSkillAt25(p, projOpts) > cand.ceiling).length,
-            at25Of: seniors.length + 1,
+            at25Rank: at25.rank,
+            at25Of: at25.of,
             proj: Math.round(cand.ceiling),
             seniorSoon: isYouthAge(candidate.age) && !youth ? weeksToAge(candidate.age, 21) : null,
             xi: (() => { try { return startingXiCheck(candidate, squadPlayers); } catch (e) { console.warn('[FTP Transfer] XI check failed', e); return null; } })()
