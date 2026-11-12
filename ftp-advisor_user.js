@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         FTP Advisor
 // @namespace    http://tampermonkey.net/
-// @version      8.136
+// @version      8.137
 // @description  Tactical/scouting advisor for fromthepavilion.org (cricket sim): team, tactics, pitch, training, transfer market, youth and squad plan advice with projections. Full changelog: github.com/Jadax/ftp-advisor
 // @author       Tushant Sharma
 // @license      MIT
@@ -517,7 +517,11 @@
         if (talents.some(t => /prodigy/i.test(t)) && isYouth) sum += 3; // generic — all skills
         if (aligned(/skilled/i)) sum += 2;
         if (aligned(/gifted/i) && isYouth) sum += 1;
-        if (aligned(/new ball bowler|old ball bowler|^opener$|finisher/i)) sum += 1;
+        // Manual: triggered talents (Swing, Yorker, Wrongun… Accumulator,
+        // Boundary Hitter) and Spin/Seam Specialist (a batting matchup) are
+        // real but small — same +1 as the situational talents.
+        if (aligned(/new ball bowler|old ball bowler|^opener$|finisher|wrongun|flipper|swing|bouncer|yorker|slower ball|arm ball|doosra|accumulator|boundary hitter/i)
+            || (primaryInfo.name === 'batting' && talents.some(t => /s(ea|pi)n specialist/i.test(t)))) sum += 1;
         if (talents.some(t => /safe hands|natural leader/i.test(t))) sum += 1; // generic — captaincy/fielding
 
         return sum;
@@ -907,6 +911,47 @@
     // training simulation runs once per candidate; computeOverallRating
     // falls back to self-computing it only for direct callers that don't pass
     // it (e.g. test harnesses).
+    // What a bowler's TYPE is worth in the conditions this club actually
+    // plays: the mean of calculateBowlingScore's own type-dependent factors
+    // (pitch x weather, seam x1.1, pace bonus scaled by pace, learned
+    // spin:seam) over the recorded SENIOR matches (every buy is a
+    // first-team bet), relative to the average of the five types. The
+    // manual says fast/wrist are rarest, not intrinsically better — the
+    // value comes from conditions (2026-11-12, 5 senior matches: fast
+    // x1.87, fast-medium x1.79, medium x1.71, spin x0.76). Fewer than 5
+    // recorded = every pitch type equally, Sunny.
+    const _typeFitCache = { key: null, rel: null };
+    const TYPE_FIT_PROBES = { rf: 'fast', rfm: 'fast-medium', rm: 'medium', rfs: 'finger spin', rws: 'wrist spin' };
+    function bowlerTypeFit(player) {
+        if (getPrimarySkillInfo(player).name !== 'bowling') return null;
+        const bt = String(player.bowlerType || '').toLowerCase();
+        const cat = BOWLER_CATEGORY[bt];
+        if (cat !== 'seam' && cat !== 'spin') return null;
+        const compTypes = loadCompTypes();
+        const ms = Object.values(loadMatchDb()).filter(m => m.conditions && PITCH_EFFECTS[m.conditions.pitch]
+            && !/youth/i.test(m.league || '') && !(compTypes[m.league] && compTypes[m.league].youth));
+        const key = ms.length + '|' + JSON.stringify(loadLearned().spinSeam || {});
+        if (_typeFitCache.key !== key) {
+            const conds = ms.length >= 5 ? ms.map(m => ({ pitch: m.conditions.pitch, weather: m.conditions.weather }))
+                : Object.keys(PITCH_EFFECTS).map(pitch => ({ pitch, weather: 'Sunny' }));
+            const typeVal = (t) => {
+                const c = BOWLER_CATEGORY[t], pace = BOWLER_PACE[t] || 0;
+                return conds.reduce((sum, cd) => {
+                    const { pitchEffect, weatherEffect } = conditionEffects({ pitch: cd.pitch, weather: cd.weather, isYouthOnly: false });
+                    let f = (c === 'spin' ? pitchEffect.spin * (weatherEffect.spin || 1) : pitchEffect.seam * (weatherEffect.seam || 1) * 1.1);
+                    if (c === 'seam' && pitchEffect.paceBonus) f *= 1 + (pitchEffect.paceBonus - 1) * pace / 5;
+                    return sum + f;
+                }, 0) / conds.length;
+            };
+            const vals = Object.keys(TYPE_FIT_PROBES).map(typeVal);
+            const avg = vals.reduce((a, b) => a + b, 0) / vals.length;
+            _typeFitCache.rel = (t) => typeVal(t) / avg;
+            _typeFitCache.n = ms.length >= 5 ? ms.length : 0;
+            _typeFitCache.key = key;
+        }
+        return { rel: _typeFitCache.rel(bt), n: _typeFitCache.n };
+    }
+
     function computeOverallRating(player, opts) {
         if (!opts) return { score: 0, label: 'no-context', parts: {}, breakdown: [] };
         const breakdown = [];
@@ -973,7 +1018,11 @@
             const support = ((player.technique||0) + (player.power||0)) / 2;
             distScore = 4 + Math.min(6, ((player.batting||0) - 5) + (support - 4) * 0.5);
         } else if (role === 'bowling') {
-            const support = ((player.endurance||0) + (player.technique||0)) / 2;
+            // Manual: fast/fast-medium/medium bowlers use power for a wicket-
+            // taking faster ball; spinners don't.
+            const support = player.bowlerCategory === 'seam'
+                ? ((player.endurance||0) + (player.technique||0) + (player.power||0)) / 3
+                : ((player.endurance||0) + (player.technique||0)) / 2;
             distScore = 4 + Math.min(6, ((player.bowling||0) - 5) + (support - 4) * 0.5);
         } else if (role === 'keeping') {
             // keepers must bat too (keeperBattingMin logic)
@@ -1003,6 +1052,9 @@
         //    already counted in skill-sum, but reward a meaningful talent
         //    set explicitly here.
         const talentScore = Math.min(5, alignedTalentWeight(player) * 1.5);
+        // Bowlers only, centred on 0 so batters/keepers are unchanged.
+        const fit = bowlerTypeFit(player);
+        const typeScore = fit ? Math.max(-2.5, Math.min(2.5, (fit.rel - 1) * 10)) : 0;
 
         // ONE weight set for EVERY age (v8.65). The old youth weights
         // (1.0/1.2/0.6/0.4/0.8) discounted a youth's dist/value/talent
@@ -1021,7 +1073,7 @@
         let score, label;
         // Wage value x0.4: a tiebreak between near-equal players, not a skill
         // tier (at x0.8 a Spectacular bat on $3.5k tied an Expert on $2k).
-        score = qualityScore * 1.0 + ageScore * 1.2 + distScore * 0.8 + valueScore * 0.4 + talentScore * 1.0;
+        score = qualityScore * 1.0 + ageScore * 1.2 + distScore * 0.8 + valueScore * 0.4 + talentScore * 1.0 + typeScore;
         score = Math.max(0, Math.min(100, score));
         // Shown as the badge tooltip — the user buys on this number alone,
         // so every point must be traceable to its term.
@@ -1031,12 +1083,13 @@
         breakdown.push(`${roleLabel} skill shape ${f1(distScore)}/10 x0.8 = ${f1(distScore * 0.8)}`);
         breakdown.push(vpk != null ? `Wage value ${f1(valueScore)}/15 x0.4 = ${f1(valueScore * 0.4)}` : `Wage value unknown (neutral ${f1(valueScore * 0.4)})`);
         breakdown.push(`Role-useful talents ${f1(talentScore)}/5`);
+        if (fit) breakdown.push(`Bowler type in your conditions \u00D7${fit.rel.toFixed(2)} vs average (${fit.n ? fit.n + ' senior matches' : 'all pitches equally'}) ${typeScore >= 0 ? '+' : ''}${f1(typeScore)}`);
         label = score >= 75 ? 'elite' : score >= 55 ? 'strong' : score >= 35 ? 'reasonable' : 'pass';
 
         return {
             score: Math.round(score * 10) / 10,
             label, role, roleLabel,
-            parts: { quality: qualityScore, age: ageScore, dist: distScore, value: valueScore, talent: talentScore },
+            parts: { quality: qualityScore, age: ageScore, dist: distScore, value: valueScore, talent: talentScore, type: typeScore },
             breakdown
         };
     }
@@ -3590,7 +3643,7 @@
         });
         if (!items.length) return '<div class="vj-text-xs vj-text-muted">No one yet \u2014 press \u2606 on a transfer card to shortlist him.</div>';
         const ROLE = { batting: 'batter', bowling: 'bowler', keeping: 'keeper' };
-        return `<details open><summary class="vj-text-sm vj-fw-700" style="cursor:pointer;">\u2B50 Shortlist (${items.length})</summary>` + items.map(e => {
+        return `<details open><summary class="vj-text-sm vj-fw-700" style="cursor:pointer;">\u2B50 Shortlist (${items.length}) \u2014 ending soonest first</summary>` + items.map(e => {
             const ended = e.deadlineTs && e.deadlineTs <= Date.now();
             const soon = e.deadlineTs && !ended && e.deadlineTs - Date.now() < 6 * 3600e3;
             return `<div class="ftp-rec low" style="padding:6px 8px;margin:4px 0;${ended ? 'opacity:.55;' : ''}">
