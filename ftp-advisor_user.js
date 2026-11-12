@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         FTP Advisor
 // @namespace    http://tampermonkey.net/
-// @version      8.135
+// @version      8.136
 // @description  Tactical/scouting advisor for fromthepavilion.org (cricket sim): team, tactics, pitch, training, transfer market, youth and squad plan advice with projections. Full changelog: github.com/Jadax/ftp-advisor
 // @author       Tushant Sharma
 // @license      MIT
@@ -3533,6 +3533,75 @@
         return null;
     }
 
+    // "13 Nov 2026 01:51" as shown on the transfer list (the game's own
+    // clock, read as local time — good enough for a deadline reminder).
+    const MONTHS = { jan: 0, feb: 1, mar: 2, apr: 3, may: 4, jun: 5, jul: 6, aug: 7, sep: 8, oct: 9, nov: 10, dec: 11 };
+    function parseTransferDeadline(text) {
+        const m = String(text || '').match(/(\d{1,2})\s+([A-Za-z]{3})\w*\s+(\d{4})\s*(\d{1,2}):(\d{2})/);
+        if (!m || MONTHS[m[2].toLowerCase()] == null) return 0;
+        return new Date(+m[3], MONTHS[m[2].toLowerCase()], +m[1], +m[4], +m[5]).getTime();
+    }
+    function deadlineText(ts) {
+        if (!ts) return '';
+        const d = new Date(ts);
+        const when = d.toLocaleDateString(undefined, { weekday: 'short', day: 'numeric', month: 'short' }) + ' ' + d.toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit' });
+        const left = ts - Date.now();
+        if (left <= 0) return `Ended ${when}`;
+        const h = Math.floor(left / 3600e3), dd = Math.floor(h / 24);
+        return `Ends ${when} \u00B7 ${dd ? `${dd}d ${h % 24}h` : h ? `${h}h ${Math.floor(left / 60e3) % 60}m` : `${Math.max(1, Math.floor(left / 60e3))}m`} left`;
+    }
+
+    // Private shortlist (the game's own watch list is a paid feature).
+    // A snapshot per player: refreshed whenever he shows up in a market scan
+    // again, not polled.
+    const SHORTLIST_KEY = 'ftp_shortlist';
+    function loadShortlist() {
+        try { return JSON.parse(GM_getValue(SHORTLIST_KEY, '{}')) || {}; } catch (e) { return {}; }
+    }
+    function saveShortlist(list) { GM_setValue(SHORTLIST_KEY, JSON.stringify(list)); }
+    function shortlistSnapshot(p, prev) {
+        const role = getPrimarySkillInfo(p);
+        const r = p._rankLines;
+        return Object.assign({}, prev || {}, {
+            id: String(p.id), name: p.name, age: p.age, role: role.name, primary: role.value, bowlerType: p.bowlerType || '',
+            proj: r ? r.proj : (p._dynastyCeiling ? Math.round(p._dynastyCeiling.ceiling) : null),
+            at25Rank: r ? r.at25Rank : null, star: p._overallRating ? Math.round(p._overallRating.score * 10) / 10 : null,
+            price: p.price || 0, deadlineTs: p.deadlineTs || (prev && prev.deadlineTs) || 0,
+            addedAt: (prev && prev.addedAt) || Date.now(), seenAt: Date.now()
+        });
+    }
+    function toggleShortlist(p) {
+        const list = loadShortlist();
+        const id = String(p.id);
+        if (list[id]) delete list[id]; else list[id] = shortlistSnapshot(p);
+        saveShortlist(list);
+        return !!list[id];
+    }
+    function refreshShortlistFrom(players) {
+        const list = loadShortlist();
+        let changed = false;
+        players.forEach(p => { const id = String(p.id); if (list[id]) { list[id] = shortlistSnapshot(p, list[id]); changed = true; } });
+        if (changed) saveShortlist(list);
+    }
+    function renderShortlistHtml() {
+        const items = Object.values(loadShortlist()).sort((a, b) => {
+            const now = Date.now(), ae = a.deadlineTs && a.deadlineTs <= now, be = b.deadlineTs && b.deadlineTs <= now;
+            return (ae - be) || (a.deadlineTs || Infinity) - (b.deadlineTs || Infinity);
+        });
+        if (!items.length) return '<div class="vj-text-xs vj-text-muted">No one yet \u2014 press \u2606 on a transfer card to shortlist him.</div>';
+        const ROLE = { batting: 'batter', bowling: 'bowler', keeping: 'keeper' };
+        return `<details open><summary class="vj-text-sm vj-fw-700" style="cursor:pointer;">\u2B50 Shortlist (${items.length})</summary>` + items.map(e => {
+            const ended = e.deadlineTs && e.deadlineTs <= Date.now();
+            const soon = e.deadlineTs && !ended && e.deadlineTs - Date.now() < 6 * 3600e3;
+            return `<div class="ftp-rec low" style="padding:6px 8px;margin:4px 0;${ended ? 'opacity:.55;' : ''}">
+                <div class="vj-flex-between"><span class="vj-fw-700" style="font-size:12px;"><a href="${FTP_ORIGIN}/player.htm?playerId=${encodeURIComponent(e.id)}" target="_blank" rel="noopener" style="color:inherit;text-decoration:underline;">${e.name}</a> <span class="vj-text-xs vj-text-muted">(${formatAgeDisplay(e.age)})</span></span>
+                <button class="ftp-sl-remove" data-sl="${escapeHtml(e.id)}" title="Remove from shortlist" style="border:none;background:none;cursor:pointer;font-size:14px;">\u2715</button></div>
+                <div class="vj-text-xs vj-text-muted">${e.bowlerType && e.role === 'bowling' ? e.bowlerType.toUpperCase() + ' ' : ''}${ROLE[e.role] || e.role} \u00B7 ${skillLabel(e.primary)}${e.proj != null ? ` \u00B7 proj ${e.proj} at 25${e.at25Rank ? ` (#${e.at25Rank} in your side)` : ''}` : ''}${e.star != null ? ` \u00B7 \u2605 ${e.star}` : ''}</div>
+                <div class="vj-text-xs" style="color:${ended ? 'var(--vj-text-muted)' : soon ? 'var(--vj-red)' : 'var(--vj-text)'};">\u23F1 ${e.deadlineTs ? deadlineText(e.deadlineTs) : 'deadline unknown'} \u00B7 bid $${(e.price || 0).toLocaleString()} <span class="vj-text-muted">(as of ${new Date(e.seenAt || e.addedAt).toLocaleString(undefined, { day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit' })})</span></div>
+            </div>`;
+        }).join('') + '<div class="vj-text-xs vj-text-muted vj-mt-4">Bids and deadlines update whenever the player turns up in a market scan.</div></details>';
+    }
+
     function parseTransferRow(row, colMap) {
         const cells = row.querySelectorAll('td');
         if (cells.length < 3) return null;
@@ -3560,6 +3629,11 @@
         const bowlerTypes = ['rf','lf','rfs','lfs','rfm','lfm','rm','lm','rws','lws'];
         const bowlerType = bowlerTypes.includes(bowlerTypeRaw) ? bowlerTypeRaw : '';
 
+        // Deadline cell is "13 Nov 2026<br>01:51" (textContent glues the two).
+        const dlIdx = colMap.deadline;
+        const dlText = dlIdx !== undefined && cells[dlIdx] ? cells[dlIdx].innerHTML.replace(/<br\s*\/?>/gi, ' ').replace(/<[^>]*>/g, '').replace(/\s+/g, ' ').trim() : '';
+        const deadlineTs = parseTransferDeadline(dlText);
+
         // Price: the current bid amount (transfer page shows bid, NOT wage)
         const priceText = getCell('price');
         const priceMatch = priceText.match(/\$([\d,]+)/);
@@ -3572,6 +3646,7 @@
             rating: rating,
             wage: 0,
             price: price,
+            deadlineTs: deadlineTs,
             bowlerType: bowlerType,
             bowlerCategory: BOWLER_CATEGORY[bowlerType] || 'none',
             bowlerPace: BOWLER_PACE[bowlerType] || 0,
@@ -10319,7 +10394,7 @@ const progMap = { batting: 'batting', bowling: 'bowling', keeping: 'keeperbattin
             // Same two gates as the transfer list: the user's scout base for
             // the age (live: a 16yo with Dreadful technique/fielding and a
             // 16k rating still "projected 61" — the 9-year training sim
-            // alone barely separates weak recruits) AND the 60-at-25 bar.
+            // alone barely separates weak recruits) AND the MIN_PROJECTION_AT_25 bar.
             const base = checkScoutBenchmark(recruit);
             const failedBase = base.hasBenchmark && !base.passed ? base.failed.join('; ') : '';
             const bar = minProjectionAt25(recruit, { academyInfo, squadContext });
@@ -10742,6 +10817,7 @@ const progMap = { batting: 'batting', bowling: 'bowling', keeping: 'keeperbattin
         });
     }
 
+    let _transferShown = new Map();
     function updateTransferAdvisor(scannedResults) {
         ensureAcademyThen(() => updateTransferAdvisor(scannedResults));
         // ---- Parse live search results from the page ----
@@ -11001,6 +11077,8 @@ const progMap = { batting: 'batting', bowling: 'bowling', keeping: 'keeperbattin
                     (a.price || 0) - (b.price || 0);
                 priorityBuys.sort(bestBuyOrder);
                 function renderTransferResults(players, totalScanned, ageFilteredCount, verdictFilteredCount, detailsFetched) {
+                    const shortlisted = loadShortlist();
+                    _transferShown = new Map(players.map(p => [String(p.id), p]));
                     // peerCompare was already computed per-candidate up in
                     // the `evaluated` map (it now gates which seniors even
                     // make it into `players` — see isWorthShowing above),
@@ -11033,7 +11111,7 @@ const progMap = { batting: 'batting', bowling: 'bowling', keeping: 'keeperbattin
                         // computed WITHOUT talents on this first pass.
                         // Verdicts, and which players even show up here,
                         // can genuinely change once fetched.
-                        html += `<div class="vj-text-xs vj-text-muted vj-mb-8">\u2139\uFE0F Fetching experience &amp; talents automatically \u2014 the 60-at-25 bar applies once they're in.</div>`;
+                        html += `<div class="vj-text-xs vj-text-muted vj-mb-8">\u2139\uFE0F Fetching experience &amp; talents automatically \u2014 the ${MIN_PROJECTION_AT_25}-at-25 bar and the rank caps apply once they're in.</div>`;
                     }
 
                     if (players.length === 0) {
@@ -11127,6 +11205,7 @@ const progMap = { batting: 'batting', bowling: 'bowling', keeping: 'keeperbattin
                                 <div class="vj-flex-between">
                                     <span class="vj-fw-700" style="font-size:12px;">#${i+1} <a href="${FTP_ORIGIN}/player.htm?playerId=${encodeURIComponent(p.id || '')}" target="_blank" rel="noopener" style="color:inherit;text-decoration:underline;text-underline-offset:2px;">${p.name}</a> <span class="vj-text-xs vj-text-muted">(${formatAgeDisplay(p.age)})</span></span>
                                     <div style="display:flex;gap:4px;align-items:center;">
+                                        <button class="ftp-sl-toggle" data-sl="${escapeHtml(String(p.id || ''))}" title="${shortlisted[String(p.id)] ? 'Remove from your shortlist' : 'Add to your shortlist'}" style="border:none;background:none;cursor:pointer;font-size:16px;color:var(--vj-gold);">${shortlisted[String(p.id)] ? '\u2605' : '\u2606'}</button>
                                         ${overallRatingBadge(overallRating)}
                                         <span class="ftp-stat-badge ${ratingLabelClass}">${ratingLabel.toUpperCase()}</span>
                                     </div>
@@ -11143,6 +11222,7 @@ const progMap = { batting: 'batting', bowling: 'bowling', keeping: 'keeperbattin
                                         : `<span class="vj-text-muted">${x.format} ✗</span>`).join(' · ') : '';
                                     const startsNow = r.xi && r.xi.some(x => x.starts);
                                     return `<div class="vj-text-xs vj-text-muted" style="margin-top:2px;">${p.bowlerType && r.role === 'bowling' ? p.bowlerType.toUpperCase() + ' ' : ''}${role} \u00B7 ${primaryName} ${skillLabel(primarySkill)} \u00B7 Tech ${skillLabel(p.technique)}${p.price ? ` \u00B7 $${p.price.toLocaleString()}` : ''}</div>
+                                        ${p.deadlineTs ? `<div class="vj-text-xs vj-fw-700" style="margin-top:2px;color:${p.deadlineTs - Date.now() < 6 * 3600e3 ? 'var(--vj-red)' : 'var(--vj-text)'};">\u23F1 ${deadlineText(p.deadlineTs)}</div>` : ''}
                                         <div class="vj-text-xs" style="margin-top:2px;color:${r.xi ? (startsNow ? 'var(--vj-green)' : 'var(--vj-text-muted)') : col(r.nowRank)};"><b>Now:</b> #${r.nowRank} of ${r.nowOf} ${r.nowGroup} ${role}s${r.xi ? '' : xi(r.nowRank)}${r.seniorSoon != null ? ` <span class="vj-text-muted">(turns 21 in ${r.seniorSoon} wk${r.seniorSoon === 1 ? '' : 's'} — a senior buy)</span>` : ''}${pending}</div>
                                         ${r.xi ? `<div class="vj-text-xs" style="margin-top:1px;"><b>Starts in your ${r.nowGroup} XI today:</b> ${xiLine}</div>` : ''}
                                         <div class="vj-text-xs" style="margin-top:1px;color:${col(r.at25Rank)};"><b>At 25:</b> #${r.at25Rank} of ${r.at25Of} senior ${role}s${xi(r.at25Rank)} <span class="vj-text-muted">(proj ${r.proj})</span></div>`;
@@ -11176,6 +11256,18 @@ const progMap = { batting: 'batting', bowling: 'bowling', keeping: 'keeperbattin
                     return html;
                 }
 
+                refreshShortlistFrom(evaluated);
+                if (!resultsEl._slWired) {
+                    resultsEl._slWired = true;
+                    resultsEl.addEventListener('click', ev => {
+                        const btn = ev.target.closest && ev.target.closest('.ftp-sl-toggle');
+                        const p = btn && _transferShown.get(btn.dataset.sl);
+                        if (!p) return;
+                        const on = toggleShortlist(p);
+                        btn.textContent = on ? '\u2605' : '\u2606';
+                        btn.title = on ? 'Remove from your shortlist' : 'Add to your shortlist';
+                    });
+                }
                 resultsEl.innerHTML = renderTransferResults(priorityBuys, evaluated.length, ageFiltered, verdictFiltered, false);
 
                 // Wire up fetch details button
@@ -11207,10 +11299,11 @@ const progMap = { batting: 'batting', bowling: 'bowling', keeping: 'keeperbattin
                         const reFiltered = priorityBuys.filter(isWorthShowing);
                         const reAgeFiltered = priorityBuys.filter(p => !buyAgeAllowed(p.age)).length;
                         const reVerdictFiltered = priorityBuys.length - reAgeFiltered - reFiltered.length;
+                        refreshShortlistFrom(priorityBuys);
                         resultsEl.innerHTML = renderTransferResults(reFiltered, evaluated.length, reAgeFiltered, reVerdictFiltered, true);
                     };
                     fetchBtn.addEventListener('click', runFetch);
-                    // Automatic: the 60-at-25 bar only applies to fetched rows,
+                    // Automatic: the MIN_PROJECTION_AT_25 bar only applies to fetched rows,
                     // so without this every visit needed a manual click.
                     // Requests go through _queuedRequest and are cached per
                     // player, so the second render pass costs nothing extra.
@@ -11669,6 +11762,7 @@ const progMap = { batting: 'batting', bowling: 'bowling', keeping: 'keeperbattin
                     <button id="ftp-update-all" class="ftp-button ftp-button-primary" style="width:100%;padding:10px;font-size:13px;">\u21BB Update All Data</button>
                     <div class="vj-text-xs vj-text-muted vj-mt-4">Fetches squad, academy, finances, ground, and team data in the background.</div>
                 </div>` },
+                { id: 'ftp-club-shortlist', label: 'Transfer Shortlist', icon: '\u2B50', iconColor: 'amber' },
                 { id: 'ftp-club-scout', label: 'Scout Next Opponent', icon: '\u{1F50D}', iconColor: 'purple' },
                 { id: 'ftp-club-status-body', label: 'Data Freshness', icon: '\u{1F4BE}', iconColor: 'teal' },
                 { id: 'ftp-club-supporters', label: 'Supporters', icon: '\u{1F465}', iconColor: 'blue' },
@@ -11705,6 +11799,21 @@ const progMap = { batting: 'batting', bowling: 'bowling', keeping: 'keeperbattin
     }
 
     function updateClubStatusUI() {
+        const slEl = document.getElementById('ftp-club-shortlist');
+        if (slEl) {
+            slEl.innerHTML = renderShortlistHtml();
+            if (!slEl._slWired) {
+                slEl._slWired = true;
+                slEl.addEventListener('click', ev => {
+                    const btn = ev.target.closest && ev.target.closest('.ftp-sl-remove');
+                    if (!btn) return;
+                    const list = loadShortlist();
+                    delete list[btn.dataset.sl];
+                    saveShortlist(list);
+                    slEl.innerHTML = renderShortlistHtml();
+                });
+            }
+        }
         const body = document.getElementById('ftp-club-status-body');
         if (!body) return;
 
