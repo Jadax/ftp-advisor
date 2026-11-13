@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         FTP Advisor
 // @namespace    http://tampermonkey.net/
-// @version      8.139
+// @version      8.140
 // @description  Tactical/scouting advisor for fromthepavilion.org (cricket sim): team, tactics, pitch, training, transfer market, youth and squad plan advice with projections. Full changelog: github.com/Jadax/ftp-advisor
 // @author       Tushant Sharma
 // @license      MIT
@@ -695,25 +695,30 @@
         };
     }
 
-    // Best-buy order for the transfer list: the ★ Overall Rating (quality,
-    // incl. the age-25 projection) nudged by price vs fair price. Capped
-    // small (+3 / -5) because the listed price is the CURRENT bid and can
-    // still rise; unknown fair price = no nudge. Behind-curve / under
-    // SENIOR_MINS players are shown (v8.133) but sort 3 lower.
-    // Best-to-worst (user, 2026-11-12): the ★ rating (projection at 25 +
-    // wage value) first, then where he'd sit in your side at 25 (#1 +3,
-    // #2 +1.5), +2 if he'd start in your XI today, the price nudge, and -3
-    // for behind-curve / under-minimum warnings.
+    // Transfer list order = the ★ shown on the card (user, 2026-11-13: "the
+    // one at the top is the best … going down like that"). v8.116-v8.139
+    // added a price nudge and rank/starts bonuses, which put a cheaper
+    // 66-projection keeper above 67s with a higher ★ — the top card wasn't
+    // the best by any number on it. Ties: projection at 25, then lower bid.
+    // One all-rounder definition (training staging and the transfer list's
+    // sections): not a keeper, batting and bowling within two levels, both
+    // at least Average.
+    function isAllrounderProfile(player) {
+        const bat = player.batting || 0, bowl = player.bowling || 0;
+        return getPrimarySkillInfo(player).name !== 'keeping' && Math.abs(bat - bowl) <= 2 && bat >= 4 && bowl >= 4;
+    }
+    // Transfer list sections (user, 2026-11-13): keepers, bowlers, batters
+    // and all-rounders are each ranked on their own. The rank caps still use
+    // the primary role.
+    const TRANSFER_SECTIONS = [['keeper', '\u{1F9E4} Keepers'], ['bowler', '\u{1F3AF} Bowlers'], ['batter', '\u{1F3CF} Batters'], ['allrounder', '\u2694\uFE0F All-rounders']];
+    function transferSection(p) {
+        const role = getPrimarySkillInfo(p).name;
+        if (role === 'keeping') return 'keeper';
+        if (isAllrounderProfile(p)) return 'allrounder';
+        return role === 'bowling' ? 'bowler' : 'batter';
+    }
     function bestBuyScore(player) {
-        const r = player._rankLines;
-        const base = ((player._overallRating && player._overallRating.score) || 0)
-            - (player.eval && player.eval.softFailed ? 3 : 0)
-            + (r ? (r.at25Rank === 1 ? 3 : r.at25Rank === 2 ? 1.5 : 0) : 0)
-            + (r && r.xi && r.xi.some(x => x.starts) ? 2 : 0);
-        const fp = computeFairPrice(player);
-        const asking = player.price || 0;
-        if (!fp || !fp.fair || asking <= 0) return base;
-        return base + Math.max(-5, Math.min(3, (1 - asking / fp.fair) * 10));
+        return (player._overallRating && player._overallRating.score) || 0;
     }
 
     function fairPriceLine(player) {
@@ -8934,7 +8939,7 @@ table.ftp-table {
         const isBatsman = primaryInfo.name === 'batting';
         const isBowler = primaryInfo.name === 'bowling';
         const isKeeper = primaryInfo.name === 'keeping';
-        const isAllrounder = !isKeeper && Math.abs(player.batting - player.bowling) <= 2 && player.batting >= 4 && player.bowling >= 4;
+        const isAllrounder = isAllrounderProfile(player);
         const isWristSpinner = player.bowlerType === 'rws' || player.bowlerType === 'lws';
         const isProdigy = player.talents.some(t => t.toLowerCase().includes('prodigy'));
         const hasGiftedBatting = player.talents.some(t => t.toLowerCase().includes('gifted') && t.toLowerCase().includes('batting'));
@@ -11282,9 +11287,9 @@ const progMap = { batting: 'batting', bowling: 'bowling', keeping: 'keeperbattin
                 // as tiebreakers — the list answers "who's the best player
                 // here" with the fair-price line on each card separating a
                 // great deal from a great-but-overpriced player.
-                const verdictOrder = { elite: 0, strong: 1, adequate: 2 };
+                const projOf = p => (p._dynastyCeiling && p._dynastyCeiling.ceiling) || 0;
                 const bestBuyOrder = (a, b) => bestBuyScore(b) - bestBuyScore(a) ||
-                    (verdictOrder[a.eval.verdict] ?? 9) - (verdictOrder[b.eval.verdict] ?? 9) ||
+                    projOf(b) - projOf(a) ||
                     (a.price || 0) - (b.price || 0);
                 priorityBuys.sort(bestBuyOrder);
                 function renderTransferResults(players, totalScanned, ageFilteredCount, verdictFilteredCount, detailsFetched) {
@@ -11312,7 +11317,7 @@ const progMap = { batting: 'batting', bowling: 'bowling', keeping: 'keeperbattin
                         ? `Projections use your <span class="vj-fw-700">${academyInfoForProjection.level}</span> academy (${academyInfoForProjection.seniorEfficiency}% senior / ${academyInfoForProjection.youthEfficiency}% youth efficiency)`
                         : `Academy level not cached yet — visit the <span class="vj-fw-700">Academy</span> page so market projections use your real training speed`;
                     html += `<div class="vj-text-xs vj-text-muted vj-mb-8">${academyContext}</div>`;
-                    html += `<div class="vj-text-xs vj-text-muted vj-mb-8">Shown: ages ${BUY_AGES_LABEL}, \u2264 $${TRANSFER_MAX_PRICE.toLocaleString()}, \u2265 ${MIN_PROJECTION_AT_25} at 25, top ${TRANSFER_MAX_AT25_RANK.keeping} keeper / top ${TRANSFER_MAX_AT25_RANK.batting} batter or bowler in your squad when he's 25 (your youths included). Best \u2192 worst: \u2605 rating, rank in your side at 25, starts today, price vs fair.</div>`;
+                    html += `<div class="vj-text-xs vj-text-muted vj-mb-8">Shown: ages ${BUY_AGES_LABEL}, \u2264 $${TRANSFER_MAX_PRICE.toLocaleString()}, \u2265 ${MIN_PROJECTION_AT_25} at 25, your #1 keeper / top ${TRANSFER_MAX_AT25_RANK.batting} batter or bowler in your squad when he's 25 (your youths included). Each role ranked separately, best \u2192 worst by \u2605 rating (projection at 25 from all skills, experience, talents and your academy; age; skill shape; bowler type; wage value \u2014 hover the badge for the breakdown), then projection, then cheaper bid.</div>`;
                     if (!detailsFetched) {
                         // Talents aren't shown on the transfer search table
                         // at all (game limitation \u2014 only on the player's
@@ -11328,7 +11333,18 @@ const progMap = { batting: 'batting', bowling: 'bowling', keeping: 'keeperbattin
                     if (players.length === 0) {
                         html += '<div class="vj-text-sm vj-text-muted">No targets found. Try adjusting search filters (age, bowling type, skill ranges).</div>';
                     } else {
+                        const order = TRANSFER_SECTIONS.map(([k]) => k);
+                        players = [...players].sort((a, b) => order.indexOf(transferSection(a)) - order.indexOf(transferSection(b)));
+                        const sectionCount = {};
+                        players.forEach(p => { const k = transferSection(p); sectionCount[k] = (sectionCount[k] || 0) + 1; });
+                        let lastSection = null, sectionIdx = 0;
                         players.forEach((p, i) => {
+                            const section = transferSection(p);
+                            if (section !== lastSection) {
+                                lastSection = section; sectionIdx = 0;
+                                html += `<div class="vj-fw-700" style="font-size:13px;margin:10px 0 2px;border-bottom:1px solid var(--vj-border,#ddd);padding-bottom:2px;">${TRANSFER_SECTIONS.find(([k]) => k === section)[1]} <span class="vj-text-xs vj-text-muted">(${sectionCount[section]}, best first)</span></div>`;
+                            }
+                            sectionIdx++;
                             const ev = p.eval;
                             // Verdict word shown on the card comes from the
                             // Overall Rating (v8.66) — the legacy
@@ -11414,7 +11430,7 @@ const progMap = { batting: 'batting', bowling: 'bowling', keeping: 'keeperbattin
 
                             html += `<div class="ftp-rec low" style="padding:6px 8px;margin:3px 0;">
                                 <div class="vj-flex-between">
-                                    <span class="vj-fw-700" style="font-size:12px;">#${i+1} <a href="${FTP_ORIGIN}/player.htm?playerId=${encodeURIComponent(p.id || '')}" target="_blank" rel="noopener" style="color:inherit;text-decoration:underline;text-underline-offset:2px;">${p.name}</a> <span class="vj-text-xs vj-text-muted">(${formatAgeDisplay(p.age)})</span></span>
+                                    <span class="vj-fw-700" style="font-size:12px;">#${sectionIdx} <a href="${FTP_ORIGIN}/player.htm?playerId=${encodeURIComponent(p.id || '')}" target="_blank" rel="noopener" style="color:inherit;text-decoration:underline;text-underline-offset:2px;">${p.name}</a> <span class="vj-text-xs vj-text-muted">(${formatAgeDisplay(p.age)})</span></span>
                                     <div style="display:flex;gap:4px;align-items:center;">
                                         <button class="ftp-sl-toggle" data-sl="${escapeHtml(String(p.id || ''))}" title="${shortlisted[String(p.id)] ? 'Remove from your shortlist' : 'Add to your shortlist'}" style="border:none;background:none;cursor:pointer;font-size:16px;color:var(--vj-gold);">${shortlisted[String(p.id)] ? '\u2605' : '\u2606'}</button>
                                         ${overallRatingBadge(overallRating)}
@@ -12496,7 +12512,7 @@ const progMap = { batting: 'batting', bowling: 'bowling', keeping: 'keeperbattin
     // top 3 of your batters or bowlers at 25 (vs your SENIORS' to-25
     // projections — the one horizon a 16yo and a 21yo share), and cost no
     // more than $100,000 (current bid).
-    const TRANSFER_MAX_AT25_RANK = { keeping: 2, batting: 3, bowling: 3 };
+    const TRANSFER_MAX_AT25_RANK = { keeping: 1, batting: 2, bowling: 2 }; // user 2026-11-13 (was 2/3/3)
     const TRANSFER_MAX_PRICE = 60000;
     // Ranked against the side he'd actually compete with when HE is 25
     // (v8.139): your own youths count (projected to 25 — they'll be seniors
