@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         FTP Advisor
 // @namespace    http://tampermonkey.net/
-// @version      8.140
+// @version      8.141
 // @description  Tactical/scouting advisor for fromthepavilion.org (cricket sim): team, tactics, pitch, training, transfer market, youth and squad plan advice with projections. Full changelog: github.com/Jadax/ftp-advisor
 // @author       Tushant Sharma
 // @license      MIT
@@ -3613,6 +3613,13 @@
         if (!m || MONTHS[m[2].toLowerCase()] == null) return 0;
         return new Date(+m[3], MONTHS[m[2].toLowerCase()], +m[1], +m[4], +m[5]).getTime();
     }
+    // Short "time left" for badges ("2d 4h", "5h 12m", "ended").
+    function timeLeftShort(ts) {
+        const left = ts - Date.now();
+        if (left <= 0) return 'ended';
+        const h = Math.floor(left / 3600e3), dd = Math.floor(h / 24);
+        return dd ? `${dd}d ${h % 24}h` : h ? `${h}h ${Math.floor(left / 60e3) % 60}m` : `${Math.max(1, Math.floor(left / 60e3))}m`;
+    }
     function deadlineText(ts) {
         if (!ts) return '';
         const d = new Date(ts);
@@ -3656,18 +3663,29 @@
         if (changed) saveShortlist(list);
     }
     function renderShortlistHtml() {
+        // Best to worst by the star (user, 2026-11-13), ended auctions last;
+        // the deadline is a coloured badge on every row and the soonest live
+        // one is tagged, so a lower-ranked player closing first still stands out.
+        const now = Date.now();
         const items = Object.values(loadShortlist()).sort((a, b) => {
-            const now = Date.now(), ae = a.deadlineTs && a.deadlineTs <= now, be = b.deadlineTs && b.deadlineTs <= now;
-            return (ae - be) || (a.deadlineTs || Infinity) - (b.deadlineTs || Infinity);
+            const ae = !!(a.deadlineTs && a.deadlineTs <= now), be = !!(b.deadlineTs && b.deadlineTs <= now);
+            return (ae - be) || (b.star || 0) - (a.star || 0) || (b.proj || 0) - (a.proj || 0);
         });
+        const live = items.filter(e => e.deadlineTs && e.deadlineTs > now);
+        const firstEnding = live.length > 1 ? live.reduce((m, e) => e.deadlineTs < m.deadlineTs ? e : m) : null;
         if (!items.length) return '<div class="vj-text-xs vj-text-muted">No one yet \u2014 press \u2606 on a transfer card to shortlist him.</div>';
         const ROLE = { batting: 'batter', bowling: 'bowler', keeping: 'keeper' };
-        return `<details open><summary class="vj-text-sm vj-fw-700" style="cursor:pointer;">\u2B50 Shortlist (${items.length}) \u2014 ending soonest first</summary>` + items.map(e => {
-            const ended = e.deadlineTs && e.deadlineTs <= Date.now();
-            const soon = e.deadlineTs && !ended && e.deadlineTs - Date.now() < 6 * 3600e3;
+        return `<details open><summary class="vj-text-sm vj-fw-700" style="cursor:pointer;">\u2B50 Shortlist (${items.length}) \u2014 best first</summary>` + items.map((e, i) => {
+            const ended = e.deadlineTs && e.deadlineTs <= now;
+            const left = e.deadlineTs ? e.deadlineTs - now : null;
+            const soon = left != null && !ended && left < 6 * 3600e3;
+            const today = left != null && !ended && left < 24 * 3600e3;
+            const badgeBg = ended ? 'var(--vj-text-muted)' : soon ? 'var(--vj-red)' : today ? 'var(--vj-amber)' : 'var(--vj-blue,#3b6fd8)';
+            const badge = e.deadlineTs ? `<span style="background:${badgeBg};color:#fff;border-radius:10px;padding:1px 8px;font-size:11px;font-weight:700;white-space:nowrap;">\u23F1 ${timeLeftShort(e.deadlineTs)}</span>` : '';
+            const firstTag = firstEnding === e ? ` <span style="color:var(--vj-red);font-size:10px;font-weight:700;">ENDS FIRST</span>` : '';
             return `<div class="ftp-rec low" style="padding:6px 8px;margin:4px 0;${ended ? 'opacity:.55;' : ''}">
-                <div class="vj-flex-between"><span class="vj-fw-700" style="font-size:12px;"><a href="${FTP_ORIGIN}/player.htm?playerId=${encodeURIComponent(e.id)}" target="_blank" rel="noopener" style="color:inherit;text-decoration:underline;">${e.name}</a> <span class="vj-text-xs vj-text-muted">(${formatAgeDisplay(e.age)})</span></span>
-                <button class="ftp-sl-remove" data-sl="${escapeHtml(e.id)}" title="Remove from shortlist" style="border:none;background:none;cursor:pointer;font-size:14px;">\u2715</button></div>
+                <div class="vj-flex-between" style="gap:6px;"><span class="vj-fw-700" style="font-size:12px;">#${i + 1} <a href="${FTP_ORIGIN}/player.htm?playerId=${encodeURIComponent(e.id)}" target="_blank" rel="noopener" style="color:inherit;text-decoration:underline;">${e.name}</a> <span class="vj-text-xs vj-text-muted">(${formatAgeDisplay(e.age)})</span>${firstTag}</span>
+                <span style="display:flex;align-items:center;gap:4px;">${badge}<button class="ftp-sl-remove" data-sl="${escapeHtml(e.id)}" title="Remove from shortlist" style="border:none;background:none;cursor:pointer;font-size:14px;">\u2715</button></span></div>
                 <div class="vj-text-xs vj-text-muted">${e.bowlerType && e.role === 'bowling' ? e.bowlerType.toUpperCase() + ' ' : ''}${ROLE[e.role] || e.role} \u00B7 ${skillLabel(e.primary)}${e.proj != null ? ` \u00B7 proj ${e.proj} at 25${e.at25Rank ? ` (#${e.at25Rank} in your side)` : ''}` : ''}${e.star != null ? ` \u00B7 \u2605 ${e.star}` : ''}</div>
                 <div class="vj-text-xs" style="color:${ended ? 'var(--vj-text-muted)' : soon ? 'var(--vj-red)' : 'var(--vj-text)'};">\u23F1 ${e.deadlineTs ? deadlineText(e.deadlineTs) : 'deadline unknown'} \u00B7 bid $${(e.price || 0).toLocaleString()} <span class="vj-text-muted">(as of ${new Date(e.seenAt || e.addedAt).toLocaleString(undefined, { day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit' })})</span></div>
             </div>`;
