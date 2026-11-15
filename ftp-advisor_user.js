@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         FTP Advisor
 // @namespace    http://tampermonkey.net/
-// @version      8.141
+// @version      8.142
 // @description  Tactical/scouting advisor for fromthepavilion.org (cricket sim): team, tactics, pitch, training, transfer market, youth and squad plan advice with projections. Full changelog: github.com/Jadax/ftp-advisor
 // @author       Tushant Sharma
 // @license      MIT
@@ -4029,11 +4029,17 @@ ${matches.length ? matches.map(([id, m]) => ck(true, `Orders: ${esc(m.teams)} \u
     const tr = L.version === LEARN_VERSION ? (L.training || {}) : {};
     const typeLines = Object.keys(bt).length ? `<div class="ck"><b class="ok">\u2022</b><span>Bowler types in the engine's scorecards: ${Object.keys(PACE_CLASS_LABEL).filter(c => bt[c]).map(c => `${PACE_CLASS_LABEL[c]} ${bt[c].rel >= 0 ? '+' : ''}${Math.round(bt[c].rel * 100)}% (${bt[c].overs} ov)`).join(' \u00B7 ')}</span></div>` : '';
     const trainLines = ['youth', 'senior'].filter(g => tr[g]).map(g => { const f = learnedTrainingFactor(g === 'youth'); return `<div class="ck"><b class="${f !== 1 ? 'ok' : 'no'}">\u2022</b><span>${g === 'youth' ? 'Youth' : 'Senior'} training: ${tr[g].pairs} week-pairs, real ${(tr[g].actual / 1000).toFixed(1)} vs predicted ${(tr[g].expected / 1000).toFixed(1)} levels \u2014 ${f === 1 ? 'need ' + TRAIN_LEARN_MIN_POINTS / 1000 + ' predicted levels to apply' : 'projections run \u00D7' + f.toFixed(2)}</span></div>`; }).join('');
-    if (!rows.length && !comps.length && !typeLines && !trainLines) return '<div class="lg">Learning starts once completed matches with engine ratings are recorded.</div>';
+    const wm = L.version === LEARN_VERSION ? (L.winModel || {}) : {};
+    const ad = L.version === LEARN_VERSION ? L.advice : null;
+    const winLines = ['senior', 'youth'].filter(g => wm[g] && wm[g].n).map(g => { const e = wm[g]; return `<div class="ck"><b class="${e.k != null ? 'ok' : 'no'}">\u2022</b><span>${g === 'senior' ? 'Senior' : 'Youth'} results vs the engine's team ratings: ${e.k != null ? `the higher-rated side won ${e.signRight} of ${e.n} (prediction error ${e.brier})` : `${e.n} rated results — need ${WIN_MODEL_MIN}`}</span></div>`; }).join('');
+    const gapLines = [false, true].map(y => { const w = weakestDepartments(y, 2); return w.length ? `<div class="ck"><b class="ok">\u2022</b><span>${y ? 'Youth' : 'Senior'} losses: you trail most in ${w.map(x => `${x.label} ${Math.round(x.gap * 100)}%`).join(', ')} (${w[0].losses} losses)</span></div>` : ''; }).join('');
+    const adviceLine = ad && (ad.followed.w + ad.followed.l + ad.changed.w + ad.changed.l) ? `<div class="ck"><b class="ok">\u2022</b><span>Advice record: followed ${ad.followed.w}W-${ad.followed.l}L, changed ${ad.changed.w}W-${ad.changed.l}L${ad.predicted.n ? ` \u00B7 win predictions right ${ad.predicted.right}/${ad.predicted.n}` : ''}</span></div>` : '';
+    if (!rows.length && !comps.length && !typeLines && !trainLines && !winLines) return '<div class="lg">Learning starts once completed matches with engine ratings are recorded.</div>';
     return rows.map(([g, e]) => { const f = learnedSpinSeamFactor(g === 'youth'); return `<div class="ck"><b class="${f !== 1 ? 'ok' : 'no'}">${f > 1 ? '\u2191' : f < 1 ? '\u2193' : '\u2022'}</b><span>${g === 'youth' ? 'Youth' : 'Senior'} bowling: ${e.n} match${e.n > 1 ? 'es' : ''} \u2014 ${f === 1 ? (e.n < LEARN_MIN_MATCHES ? 'need ' + LEARN_MIN_MATCHES + ' to apply' : 'model already right') : `the engine rates your spinners ${f > 1 ? 'higher' : 'lower'} vs your seamers than the model did (\u00D7${f.toFixed(2)} applied)`}</span></div>`; }).join('')
-        + typeLines + trainLines
+        + winLines + gapLines + adviceLine + typeLines + trainLines
         + comps.map(([name, t]) => `<div class="ck"><b class="ok">\u2022</b><span>${esc(name)} = ${esc(t.matchType)}${t.youth ? ' \u2014 youth only' : ''}${t.friendly ? ', everyone rested' : ''}</span></div>`).join('');
 })()}</div>
+<div class="sec"><div class="h">Health</div>${healthChecks().map(c => ck(c.ok, c.msg)).join('')}</div>
 <div class="sec"><div class="btns"><button class="btn pri" data-a="run">Run now</button><button class="btn" data-a="preview">Preview</button></div>
 <div class="btns" style="margin-top:6px;"><button class="btn" data-a="export">Export database (${Object.keys(loadMatchDb()).length} matches)</button></div></div>
 <div class="sec"><div class="h">Activity</div>${(st.log || []).slice(-12).reverse().map(l => `<div class="lg"><em>${esc(ago(l.t))}</em> \u00B7 ${esc(l.msg)}</div>`).join('') || '<div class="lg">Nothing yet.</div>'}</div>`;
@@ -6314,7 +6320,18 @@ const MAX_OVERS_PER_BOWLER = { OD: 10, YOD: 8, T20: 4, YT20: 4 };
             console.warn('[FTP Advisor] Could not render confidence badge:', e);
         }
 
-        const { enrichedPlayers, ageWarning, opponentAnalysis, tossRec, lineup, battingOrder, bowling } = computeOrdersPlan();
+        const ordersPlan = computeOrdersPlan();
+        const { enrichedPlayers, ageWarning, opponentAnalysis, tossRec, lineup, battingOrder, bowling } = ordersPlan;
+        try {
+            const pred = recordAdvice(ordersPlan);
+            const ctxEl = document.getElementById('ftp-context');
+            if (ctxEl && pred) {
+                const weak = weakestDepartments(!!context.isYouthOnly, 2);
+                ctxEl.insertAdjacentHTML('beforeend', pred.p != null
+                    ? `<div class="ftp-stat-row"><span class="ftp-stat-label">Win chance</span><span class="ftp-stat-value" style="color:${pred.p >= 0.6 ? 'var(--vj-green)' : pred.p <= 0.4 ? 'var(--vj-red)' : 'var(--vj-amber)'};">~${Math.round(pred.p * 100)}% <span class="vj-text-xs vj-text-muted">(their last XI rated ${pred.theirs.toLocaleString()}, your recent ${pred.ours.toLocaleString()})</span></span></div>${weak.length && pred.p < 0.5 ? `<div class="vj-text-xs vj-text-muted">In your losses you trail most in ${weak.map(w => `${w.label} (${Math.round(w.gap * 100)}%)`).join(' and ')}.</div>` : ''}`
+                    : `<div class="vj-text-xs vj-text-muted vj-mt-4">${pred.basis === 'first-meeting' ? 'First recorded meeting with this side \u2014 no win estimate yet.' : 'Not enough rated matches for a win estimate yet.'}</div>`);
+            }
+        } catch (e) { console.warn('[FTP Advisor] advice record failed:', e); }
         // Only when it fires: a weary-or-worse player still made the XI
         // because nobody fresher was better even after the fatigue penalty.
         const tiredNames = context.isFriendly ? [] : battingOrder.filter(p => (p.fatigue ?? 10) <= FATIGUE_MAP.weary)
@@ -10170,7 +10187,7 @@ const progMap = { batting: 'batting', bowling: 'bowling', keeping: 'keeperbattin
     // Deterministic given the database.
     // ============================================================
     const LEARNED_KEY = 'ftp_learned';
-    const LEARN_VERSION = 3;
+    const LEARN_VERSION = 4;
     const LEARN_SHRINK = 4;
     const LEARN_MIN_MATCHES = 5;
     const LEARN_CLAMP = [0.8, 1.25];
@@ -10349,6 +10366,226 @@ const progMap = { batting: 'batting', bowling: 'bowling', keeping: 'keeperbattin
         return Math.max(TRAIN_LEARN_CLAMP[0], Math.min(TRAIN_LEARN_CLAMP[1], shrunk));
     }
 
+    // ---- Self-evaluation: how well the advisor reads the game ----
+    // The engine's overall team rating decided almost every league result
+    // (2026-11, 66 matches: every league loss came with the lower overall).
+    // From that: a learned win chance, the departments that trail in losses,
+    // and a record of the advisor's own advice and predictions against what
+    // happened — so its accuracy is measured, not assumed.
+    const ENGINE_DEPTS = [['batTop', 'top-order batting'], ['batMiddle', 'middle-order batting'], ['batTail', 'tail batting'],
+        ['seam', 'seam bowling'], ['spin', 'spin bowling'], ['field', 'fielding/keeping']];
+    const WIN_MODEL_MIN = 6;
+    function matchGroupIsYouth(m, compTypes) {
+        return /youth/i.test(m.league || '') || !!(compTypes[m.league] && compTypes[m.league].youth);
+    }
+    // Our and their engine ratings plus the result; won is null for a tie or no result.
+    function matchSides(m, myName) {
+        if (!myName || !m || !m.ratings) return null;
+        const us = m.ratings.find(r => r.team === myName), them = m.ratings.find(r => r.team && r.team !== myName);
+        if (!us || !them) return null;
+        const text = (m.result && m.result.text) || '';
+        return { us, them, won: text.indexOf(myName + ' won') === 0 ? true : / won /.test(text) ? false : null };
+    }
+    function ratingGap(ours, theirs) { return (ours - theirs) / ((ours + theirs) / 2); }
+    // One logistic slope per age group, maximum likelihood on a 0..40 grid
+    // (the cap keeps a perfectly separated record finite). Deterministic.
+    function learnWinModel(db, myName, compTypes) {
+        const out = {};
+        ['senior', 'youth'].forEach(g => {
+            const d = [];
+            Object.values(db).forEach(m => {
+                if (matchGroupIsYouth(m, compTypes) !== (g === 'youth')) return;
+                const sd = matchSides(m, myName);
+                if (!sd || sd.won == null || !(sd.us.overall && sd.them.overall && sd.us.overall.v > 0 && sd.them.overall.v > 0)) return;
+                d.push({ x: ratingGap(sd.us.overall.v, sd.them.overall.v), y: sd.won ? 1 : 0 });
+            });
+            if (d.length < WIN_MODEL_MIN) { out[g] = { n: d.length }; return; }
+            let best = null;
+            for (let k = 0; k <= 40; k += 0.5) {
+                let ll = 0;
+                d.forEach(r => { const pr = 1 / (1 + Math.exp(-k * r.x)); ll += Math.log(Math.max(1e-9, r.y ? pr : 1 - pr)); });
+                if (!best || ll > best.ll + 1e-12) best = { k, ll };
+            }
+            const brier = d.reduce((t, r) => t + Math.pow(1 / (1 + Math.exp(-best.k * r.x)) - r.y, 2), 0) / d.length;
+            out[g] = { n: d.length, k: best.k, brier: Math.round(brier * 1000) / 1000, wins: d.filter(r => r.y).length, signRight: d.filter(r => (r.x > 0) === !!r.y).length };
+        });
+        return out;
+    }
+    function winChance(gap, isYouth) {
+        const L = loadLearned();
+        const e = L.version === LEARN_VERSION && L.winModel ? L.winModel[isYouth ? 'youth' : 'senior'] : null;
+        if (!e || !(e.n >= WIN_MODEL_MIN) || e.k == null) return null;
+        return 1 / (1 + Math.exp(-e.k * gap));
+    }
+    // Where we trail in the matches we LOST: mean relative gap per engine
+    // department (negative = they were stronger there).
+    function learnDeptGaps(db, myName, compTypes) {
+        const out = {};
+        ['senior', 'youth'].forEach(g => {
+            const acc = {}; let n = 0;
+            Object.values(db).forEach(m => {
+                if (matchGroupIsYouth(m, compTypes) !== (g === 'youth')) return;
+                const sd = matchSides(m, myName);
+                if (!sd || sd.won !== false) return;
+                n++;
+                ENGINE_DEPTS.forEach(([k]) => {
+                    const a = sd.us[k], b = sd.them[k];
+                    if (!a || !b || !(b.v > 0)) return;
+                    const e = acc[k] || (acc[k] = { sum: 0, n: 0 });
+                    e.sum += (a.v - b.v) / b.v; e.n++;
+                });
+            });
+            out[g] = { losses: n, gaps: Object.fromEntries(Object.entries(acc).map(([k, e]) => [k, Math.round(e.sum / e.n * 1000) / 1000])) };
+        });
+        return out;
+    }
+    function weakestDepartments(isYouth, howMany) {
+        const L = loadLearned();
+        const e = L.version === LEARN_VERSION && L.deptGaps ? L.deptGaps[isYouth ? 'youth' : 'senior'] : null;
+        if (!e || e.losses < 3) return [];
+        return Object.entries(e.gaps).filter(([, v]) => v < 0).sort((a, b) => a[1] - b[1]).slice(0, howMany || 2)
+            .map(([k, v]) => ({ key: k, label: (ENGINE_DEPTS.find(d => d[0] === k) || [k, k])[1], gap: v, losses: e.losses }));
+    }
+    // Before a match: their last recorded overall vs the mean of our last
+    // three in the same age group.
+    function predictMatch(oppName, isYouth) {
+        const myName = (loadTeamInfoCache() || {}).teamName;
+        if (!oppName || !myName) return null;
+        const compTypes = loadCompTypes();
+        const ms = Object.values(loadMatchDb()).filter(m => m.ratings && matchGroupIsYouth(m, compTypes) === !!isYouth)
+            .map(m => ({ m, sd: matchSides(m, myName) })).filter(x => x.sd && x.sd.us.overall && x.sd.them.overall)
+            .sort((a, b) => (b.m.date || 0) - (a.m.date || 0));
+        const met = ms.find(x => x.sd.them.team === oppName);
+        const ours = ms.slice(0, 3).map(x => x.sd.us.overall.v);
+        if (!met || !ours.length) return { basis: met ? 'no-ours' : 'first-meeting' };
+        const ourAvg = ours.reduce((a, b) => a + b, 0) / ours.length;
+        const gap = ratingGap(ourAvg, met.sd.them.overall.v);
+        return { p: winChance(gap, isYouth), gap, ours: Math.round(ourAvg), theirs: met.sd.them.overall.v, lastMet: met.m.date || 0 };
+    }
+    // Saved whenever the orders page shows a plan (read-only — orders are
+    // never submitted from here): what the advisor recommended and the win
+    // chance it gave, judged after the match against the XI actually played.
+    function recordAdvice(plan) {
+        const gameId = (String(location.search).match(/gameId=(\d+)/) || [])[1];
+        if (!gameId || !plan || !plan.battingOrder || !plan.battingOrder.length) return null;
+        const db = loadMatchDb();
+        const m = db[gameId] || { gameId };
+        if (m.result) return null;
+        const opp = getOpponentTeamName();
+        const pred = predictMatch(opp, !!plan.context.isYouthOnly);
+        const teams = parseFixtureTeams(pageDoc());
+        m.teams = m.teams || (teams.home && teams.away ? `${teams.home.name} v ${teams.away.name}` : '');
+        // Real date arrives with the result; until then 'now' keeps the
+        // entry from sorting oldest (saveMatchDb trims oldest first).
+        if (!m.date) { m.date = Date.now(); m.dateProvisional = true; }
+        m.advice = {
+            at: Date.now(), opponent: opp || '', matchType: plan.context.matchType, pitch: plan.context.pitch, weather: plan.context.weather,
+            xi: plan.battingOrder.map(p => p.name), captain: (plan.battingOrder.find(p => p.isCaptain) || {}).name || '',
+            keeper: (plan.battingOrder.find(p => p.role === 'WK') || {}).name || '', toss: plan.tossRec.decision,
+            prediction: pred && pred.p != null ? { p: Math.round(pred.p * 1000) / 1000, ours: pred.ours, theirs: pred.theirs } : null
+        };
+        db[gameId] = m;
+        saveMatchDb(db);
+        return pred;
+    }
+    // Did following the advice win? And were the predictions right?
+    function learnAdviceRecord(db, myName) {
+        const rec = { followed: { w: 0, l: 0 }, changed: { w: 0, l: 0 }, predicted: { n: 0, brierSum: 0, right: 0 } };
+        Object.values(db).forEach(m => {
+            if (!m.advice || !m.result) return;
+            const sd = matchSides(m, myName);
+            const text = (m.result && m.result.text) || '';
+            const won = sd ? sd.won : (myName && text.indexOf(myName + ' won') === 0 ? true : / won /.test(text) ? false : null);
+            if (won == null) return;
+            const played = new Set();
+            (m.result.innings || []).forEach(inn => {
+                if (inn.batting === myName) (inn.batting_card || []).forEach(b => played.add(playerNameKey(b.name)));
+                if (inn.bowling === myName) (inn.bowling_card || []).forEach(b => played.add(playerNameKey(b.name)));
+            });
+            const advised = new Set((m.advice.xi || []).map(playerNameKey));
+            if (played.size) {
+                const overlap = [...played].filter(k => advised.has(k)).length;
+                const bucket = overlap / played.size >= 0.9 ? rec.followed : rec.changed;
+                if (won) bucket.w++; else bucket.l++;
+            }
+            const pr = m.advice.prediction;
+            if (pr && pr.p != null) {
+                rec.predicted.n++;
+                rec.predicted.brierSum += Math.pow(pr.p - (won ? 1 : 0), 2);
+                if ((pr.p >= 0.5) === won) rec.predicted.right++;
+            }
+        });
+        return rec;
+    }
+
+    // ---- Self-checks: catch the kinds of mistakes that have happened ----
+    // Each past bug was either a silent fallback (unknown academy projected
+    // as the slowest), two views of one player disagreeing (Player Advisor
+    // vs transfer card), or a list breaking its own rules (top card not the
+    // best). These checks run while the advisor is used and log to Health.
+    const HEALTH_KEY = 'ftp_health';
+    function logHealth(area, msg) {
+        try {
+            const h = JSON.parse(GM_getValue(HEALTH_KEY, '[]')) || [];
+            if (h.some(e => e.msg === msg && Date.now() - e.t < 6 * 3600e3)) return;
+            h.push({ t: Date.now(), area, msg });
+            while (h.length > 30) h.shift();
+            GM_setValue(HEALTH_KEY, JSON.stringify(h));
+            console.error('[FTP Advisor self-check]', area + ':', msg);
+        } catch (e) { /* storage unavailable */ }
+    }
+    function healthChecks() {
+        const out = [];
+        const add = (ok, msg) => out.push({ ok, msg });
+        add(!!TEAM_ID, TEAM_ID ? `Team detected (${TEAM_ID})` : 'Team not detected — open your Club page once');
+        const acad = loadAcademyCache();
+        add(academyKnown(acad), academyKnown(acad) ? `Academy level known (${acad.level})` : 'Academy level unknown — projections would run at the slowest speed; open the Academy page while logged in');
+        const cache = loadPlayerCache();
+        const players = cache ? cache.players : [];
+        const youths = players.filter(p => (p.age || 0) < 21).length, seniors = players.length - youths;
+        const skilled = players.filter(p => (p.batting || 0) + (p.bowling || 0) + (p.keeping || 0) > 0).length;
+        add(seniors > 0 && youths > 0 && skilled === players.length, players.length ? `Squad data: ${seniors} seniors, ${youths} youths${skilled < players.length ? `, ${players.length - skilled} without skills` : ''}` : 'No squad data yet');
+        const team = (loadTeamInfoCache() || {}).teamName;
+        add(!!team, team ? 'Own team name known (needed to learn from results)' : 'Own team name unknown — open your Club page; nothing can be learned without it');
+        const ing = pilotState().ingestAt;
+        add(!!ing && Date.now() - ing < 24 * 3600e3, ing ? `Match results last recorded ${Math.round((Date.now() - ing) / 3600e3)} h ago` : 'Match results not recorded yet');
+        const L = loadLearned();
+        add(L.version === LEARN_VERSION && Date.now() - (L.updatedAt || 0) < 48 * 3600e3, L.version === LEARN_VERSION ? `Learning up to date (${Math.round((Date.now() - (L.updatedAt || 0)) / 3600e3)} h ago)` : 'Learning not run on this version yet');
+        const prog = Object.values(loadProgress());
+        const lastSnap = prog.reduce((t, list) => Math.max(t, list.length ? list[list.length - 1].t : 0), 0);
+        add(lastSnap > 0 && Date.now() - lastSnap < 8 * 864e5, lastSnap ? `Training progress tracked (last snapshot ${Math.round((Date.now() - lastSnap) / 864e5)} d ago)` : 'Training progress not tracked yet');
+        let issues = [];
+        try { issues = (JSON.parse(GM_getValue(HEALTH_KEY, '[]')) || []).filter(e => Date.now() - e.t < 7 * 864e5); } catch (e) { issues = []; }
+        add(!issues.length, issues.length ? `${issues.length} self-check problem(s) this week — latest: ${issues[issues.length - 1].msg}` : 'No self-check problems this week');
+        return out;
+    }
+    // The transfer list must obey its own rules: rendered order = star order
+    // within each section, every fetched card inside the hard filters, and
+    // the stored projection equal to a fresh one.
+    function auditTransferList(list, allPlayers, projOpts) {
+        const problems = [];
+        const order = TRANSFER_SECTIONS.map(([k]) => k);
+        const shown = [...list].sort((a, b) => order.indexOf(transferSection(a)) - order.indexOf(transferSection(b)));
+        shown.forEach((p, i) => {
+            const prev = shown[i - 1];
+            if (prev && transferSection(prev) === transferSection(p) && bestBuyScore(prev) < bestBuyScore(p) - 1e-9)
+                problems.push(`${p.name} (star ${bestBuyScore(p)}) listed below ${prev.name} (star ${bestBuyScore(prev)})`);
+            if (!buyAgeAllowed(p.age)) problems.push(`${p.name} shown at age ${ageYears(p.age)} (outside ${BUY_AGES_LABEL})`);
+            if ((p.price || 0) > TRANSFER_MAX_PRICE) problems.push(`${p.name} shown at $${p.price} (over $${TRANSFER_MAX_PRICE})`);
+            if (!((p.experience || 0) > 0 || (p.wage || 0) > 0) || !p._dynastyCeiling) return;
+            const proj = p._dynastyCeiling.ceiling;
+            if (proj < MIN_PROJECTION_AT_25) problems.push(`${p.name} shown projecting ${Math.round(proj)} (under ${MIN_PROJECTION_AT_25})`);
+            const rr = at25RoleRank(p, allPlayers, projOpts);
+            if (rr.rank > (TRANSFER_MAX_AT25_RANK[rr.role] || 3)) problems.push(`${p.name} shown as #${rr.rank} ${rr.role} (cap ${TRANSFER_MAX_AT25_RANK[rr.role]})`);
+            if (i < 25) {
+                const fresh = computePlayerCeiling(p, getAcademySpeedForPlayer(p, projOpts.academyInfo), projOpts.squadContext || {}, 25).ceiling;
+                if (Math.abs(fresh - proj) > 0.01) problems.push(`${p.name}: stored projection ${proj} vs fresh ${fresh}`);
+            }
+        });
+        problems.forEach(m => logHealth('transfer list', m));
+        return problems;
+    }
+
     function snapshotToPlayer(x) {
         return {
             id: x.id, name: x.name, age: x.age, batting: x.bat, bowling: x.bowl, technique: x.tech, power: x.pow, keeping: x.keep,
@@ -10364,6 +10601,16 @@ const progMap = { batting: 'batting', bowling: 'bowling', keeping: 'keeperbattin
         const myName = (loadTeamInfoCache() || {}).teamName;
         const compTypes = loadCompTypes();
         const samples = {};
+        // Skills as they were on match day (weekly progress snapshots) beat
+        // today's skills for a past match.
+        const progress = loadProgress();
+        const skillsOn = (id, ts) => {
+            const list = progress[id];
+            if (!list || !ts) return null;
+            let snap = null;
+            list.forEach(sn => { if (sn.t <= ts + 864e5 && (!snap || sn.t > snap.t)) snap = sn; });
+            return snap;
+        };
         Object.values(db).forEach(m => {
             if (!m.ratings || !m.result) return;
             const ours = myName ? (m.ratings.find(r => r.team === myName) || null) : null;
@@ -10373,12 +10620,20 @@ const progMap = { batting: 'batting', bowling: 'bowling', keeping: 'keeperbattin
             const isT20 = /twenty20|t20/i.test(m.league || '');
             const isYouth = /youth/i.test(m.league || '') || !!(compTypes[m.league] && compTypes[m.league].youth);
             const acc = { seam: [0, 0], spin: [0, 0] };
-            let fromSnapshot = true;
+            let fromSnapshot = true, datedSkills = false;
             (usInnings.bowling_card || []).forEach(b => {
                 const key = String(b.name || '').toLowerCase();
                 let pl = preByKey.get(key);
                 // Today's fatigue says nothing about a past match.
-                if (!pl) { pl = squadByKey.get(key) || null; if (pl) pl = Object.assign({}, pl, { fatigue: 10 }); fromSnapshot = false; }
+                if (!pl) {
+                    pl = squadByKey.get(key) || null;
+                    if (pl) {
+                        const sn = skillsOn(pl.id, m.date);
+                        pl = Object.assign({}, pl, sn ? PROGRESS_SKILLS.reduce((o, k) => { o[k] = sn[k]; return o; }, {}) : {}, { fatigue: 10 });
+                        if (sn) datedSkills = true;
+                    }
+                    fromSnapshot = false;
+                }
                 const cat = BOWLER_CATEGORY[b.type] || (pl && pl.bowlerCategory);
                 if (!pl || (cat !== 'seam' && cat !== 'spin') || !(b.overs > 0)) return;
                 const score = calculateBowlingScore(Object.assign({}, pl, { bowlerCategory: cat }), PITCH_EFFECTS.Sporting, WEATHER_EFFECTS.Sunny, isT20, isYouth, false);
@@ -10390,13 +10645,14 @@ const progMap = { batting: 'batting', bowling: 'bowling', keeping: 'keeperbattin
             const observed = ours.spin.v / ours.seam.v;
             if (!(predicted > 0) || !(observed > 0)) return;
             const resid = Math.max(-0.7, Math.min(0.7, Math.log(observed / predicted)));
-            const w = fromSnapshot ? 1 : 0.5;
+            const w = fromSnapshot ? 1 : datedSkills ? 0.75 : 0.5;
             const group = isYouth ? 'youth' : 'senior';
             const e = samples[group] || (samples[group] = { n: 0, w: 0, sum: 0 });
             e.n++; e.w += w; e.sum += resid * w;
         });
         const learned = { version: LEARN_VERSION, spinSeam: {}, updatedAt: Date.now(),
-            bowlerType: learnBowlerTypeFromScorecards(db), training: learnTrainingFromProgress() };
+            bowlerType: learnBowlerTypeFromScorecards(db), training: learnTrainingFromProgress(),
+            winModel: learnWinModel(db, myName, compTypes), deptGaps: learnDeptGaps(db, myName, compTypes), advice: learnAdviceRecord(db, myName) };
         Object.entries(samples).forEach(([g, e]) => { learned.spinSeam[g] = { n: e.n, w: Math.round(e.w * 100) / 100, mean: Math.round(e.sum / e.w * 1000) / 1000 }; });
         GM_setValue(LEARNED_KEY, JSON.stringify(learned));
         return learned;
@@ -10505,7 +10761,7 @@ const progMap = { batting: 'batting', bowling: 'bowling', keeping: 'keeperbattin
             }
             const date = new Date(m.dateText.replace(/(\d+) (\w+) (\d+) (\d+):(\d+)/, '$2 $1, $3 $4:$5')).getTime() || 0;
             db[m.gameId] = Object.assign(db[m.gameId] || {}, {
-                gameId: m.gameId, teams: m.teams, date: (db[m.gameId] && db[m.gameId].date) || date, league: d.league || m.league,
+                gameId: m.gameId, teams: m.teams, date: (db[m.gameId] && db[m.gameId].date && !db[m.gameId].dateProvisional) ? db[m.gameId].date : date, dateProvisional: false, league: d.league || m.league,
                 conditions: { pitch: d.pitch, weather: d.weather, ground: d.ground, crowd: d.crowd, home: d.home, away: d.away },
                 result: {
                     text: d.result || (sc && sc.result) || '', toss: sc ? sc.toss : '', motm: sc ? sc.motm : '',
@@ -11335,6 +11591,8 @@ const progMap = { batting: 'batting', bowling: 'bowling', keeping: 'keeperbattin
                         ? `Projections use your <span class="vj-fw-700">${academyInfoForProjection.level}</span> academy (${academyInfoForProjection.seniorEfficiency}% senior / ${academyInfoForProjection.youthEfficiency}% youth efficiency)`
                         : `Academy level not cached yet — visit the <span class="vj-fw-700">Academy</span> page so market projections use your real training speed`;
                     html += `<div class="vj-text-xs vj-text-muted vj-mb-8">${academyContext}</div>`;
+                    const weakSenior = weakestDepartments(false, 2);
+                    if (weakSenior.length) html += `<div class="vj-text-xs vj-mb-8" style="color:var(--vj-amber);">Where your seniors lose: you trail the teams that beat you most in ${weakSenior.map(w => `<b>${w.label}</b> (${Math.round(w.gap * 100)}%)`).join(' and ')} \u2014 over ${weakSenior[0].losses} losses.</div>`;
                     html += `<div class="vj-text-xs vj-text-muted vj-mb-8">Shown: ages ${BUY_AGES_LABEL}, \u2264 $${TRANSFER_MAX_PRICE.toLocaleString()}, \u2265 ${MIN_PROJECTION_AT_25} at 25, your #1 keeper / top ${TRANSFER_MAX_AT25_RANK.batting} batter or bowler in your squad when he's 25 (your youths included). Each role ranked separately, best \u2192 worst by \u2605 rating (projection at 25 from all skills, experience, talents and your academy; age; skill shape; bowler type; wage value \u2014 hover the badge for the breakdown), then projection, then cheaper bid.</div>`;
                     if (!detailsFetched) {
                         // Talents aren't shown on the transfer search table
@@ -11546,6 +11804,10 @@ const progMap = { batting: 'batting', bowling: 'bowling', keeping: 'keeperbattin
                         const reVerdictFiltered = priorityBuys.length - reAgeFiltered - reFiltered.length;
                         refreshShortlistFrom(priorityBuys);
                         resultsEl.innerHTML = renderTransferResults(reFiltered, evaluated.length, reAgeFiltered, reVerdictFiltered, true);
+                        try {
+                            const problems = auditTransferList(reFiltered, allPlayers, projOpts);
+                            if (problems.length) resultsEl.insertAdjacentHTML('afterbegin', `<div class="ftp-alert danger" style="margin:0 0 6px 0;"><span>\u26A0</span><div>Self-check found ${problems.length} problem(s) in this list: ${problems.slice(0, 3).join('; ')}${problems.length > 3 ? '\u2026' : ''} (logged under Health in the autopilot panel)</div></div>`);
+                        } catch (e) { console.warn('[FTP Advisor] transfer self-check failed:', e); }
                     };
                     fetchBtn.addEventListener('click', runFetch);
                     // Automatic: the MIN_PROJECTION_AT_25 bar only applies to fetched rows,
@@ -12595,6 +12857,18 @@ const progMap = { batting: 'batting', bowling: 'bowling', keeping: 'keeperbattin
         const verdictEl = document.getElementById('ftp-player-verdict');
         const compareEl = document.getElementById('ftp-player-compare');
         const player = scrapePlayerDetailPage();
+        // Same player, two parsers: fields that don't change week to week must
+        // agree (the v8.127 bowler-type miss showed up exactly here).
+        try {
+            const cached = player.hasFullSkills && player.id ? ((loadPlayerCache() || {}).players || []).find(p => String(p.id) === String(player.id)) : null;
+            if (cached) {
+                const diffs = [];
+                if ((cached.bowlerType || '') !== (player.bowlerType || '')) diffs.push(`bowler type page '${player.bowlerType}' vs squad '${cached.bowlerType}'`);
+                if (cached.isLeftHanded != null && player.isLeftHanded != null && cached.isLeftHanded !== player.isLeftHanded) diffs.push('batting hand');
+                if ((cached.talents || []).length && player.talents.length && [...cached.talents].sort().join('|') !== [...player.talents].sort().join('|')) diffs.push('talents');
+                if (diffs.length) logHealth('player page', `${player.name}: ${diffs.join(', ')}`);
+            }
+        } catch (e) { /* self-check only */ }
 
         if (!player.hasFullSkills) {
             verdictEl.innerHTML = `<div class="ftp-alert warning"><span>⚠</span><div>Couldn't read this player's skill grid from the page — got ${player.name || 'a player'} but too few skill fields matched. The evaluation below would be unreliable, so it's been skipped. If this keeps happening, the page markup may differ from what this was built against.</div></div>`;
