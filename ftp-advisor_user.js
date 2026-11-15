@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         FTP Advisor
 // @namespace    http://tampermonkey.net/
-// @version      8.142
+// @version      8.143
 // @description  Tactical/scouting advisor for fromthepavilion.org (cricket sim): team, tactics, pitch, training, transfer market, youth and squad plan advice with projections. Full changelog: github.com/Jadax/ftp-advisor
 // @author       Tushant Sharma
 // @license      MIT
@@ -10372,8 +10372,19 @@ const progMap = { batting: 'batting', bowling: 'bowling', keeping: 'keeperbattin
     // From that: a learned win chance, the departments that trail in losses,
     // and a record of the advisor's own advice and predictions against what
     // happened — so its accuracy is measured, not assumed.
+    // Seam and spin are ONE attack here, overs-weighted: the engine rates an
+    // unused type 0, so a seam-only attack read as "spin -75%" in live
+    // losses (2026-11-15) — a mix choice, not a weakness. Type value has its
+    // own learner (learnBowlerTypeFromScorecards).
     const ENGINE_DEPTS = [['batTop', 'top-order batting'], ['batMiddle', 'middle-order batting'], ['batTail', 'tail batting'],
-        ['seam', 'seam bowling'], ['spin', 'spin bowling'], ['field', 'fielding/keeping']];
+        ['bowl', 'bowling attack'], ['field', 'fielding/keeping']];
+    function deptValue(side, key) {
+        if (key !== 'bowl') return side[key] && side[key].v > 0 ? side[key].v : null;
+        const parts = ['seam', 'spin'].map(k => side[k]).filter(x => x && x.v > 0);
+        if (!parts.length) return null;
+        const overs = parts.reduce((t, x) => t + (x.overs || 0), 0);
+        return overs > 0 ? parts.reduce((t, x) => t + x.v * (x.overs || 0), 0) / overs : Math.max(...parts.map(x => x.v));
+    }
     const WIN_MODEL_MIN = 6;
     function matchGroupIsYouth(m, compTypes) {
         return /youth/i.test(m.league || '') || !!(compTypes[m.league] && compTypes[m.league].youth);
@@ -10415,7 +10426,11 @@ const progMap = { batting: 'batting', bowling: 'bowling', keeping: 'keeperbattin
         const L = loadLearned();
         const e = L.version === LEARN_VERSION && L.winModel ? L.winModel[isYouth ? 'youth' : 'senior'] : null;
         if (!e || !(e.n >= WIN_MODEL_MIN) || e.k == null) return null;
-        return 1 / (1 + Math.exp(-e.k * gap));
+        // Near-separable records drive k to the cap and the curve to 0/100%
+        // (live: Chennai 1%, Ealing 100%) though upsets happen (1 in 24
+        // senior). Bound by the observed upset rate, Laplace-smoothed.
+        const floor = ((e.n - (e.signRight || 0)) + 1) / (e.n + 2);
+        return Math.max(floor, Math.min(1 - floor, 1 / (1 + Math.exp(-e.k * gap))));
     }
     // Where we trail in the matches we LOST: mean relative gap per engine
     // department (negative = they were stronger there).
@@ -10429,10 +10444,10 @@ const progMap = { batting: 'batting', bowling: 'bowling', keeping: 'keeperbattin
                 if (!sd || sd.won !== false) return;
                 n++;
                 ENGINE_DEPTS.forEach(([k]) => {
-                    const a = sd.us[k], b = sd.them[k];
-                    if (!a || !b || !(b.v > 0)) return;
+                    const a = deptValue(sd.us, k), b = deptValue(sd.them, k);
+                    if (a == null || b == null) return;
                     const e = acc[k] || (acc[k] = { sum: 0, n: 0 });
-                    e.sum += (a.v - b.v) / b.v; e.n++;
+                    e.sum += (a - b) / b; e.n++;
                 });
             });
             out[g] = { losses: n, gaps: Object.fromEntries(Object.entries(acc).map(([k, e]) => [k, Math.round(e.sum / e.n * 1000) / 1000])) };
