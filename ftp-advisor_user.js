@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         FTP Advisor
 // @namespace    http://tampermonkey.net/
-// @version      8.147
+// @version      8.148
 // @description  Tactical/scouting advisor for fromthepavilion.org (cricket sim): team, tactics, pitch, training, transfer market, youth and squad plan advice with projections. Full changelog: github.com/Jadax/ftp-advisor
 // @author       Tushant Sharma
 // @license      MIT
@@ -3745,14 +3745,9 @@
             const projOpts = { academyInfo, squadContext: { ...squadCounts(squad), academyInfo } };
             items.forEach(e => {
                 if (e.boughtAt || e.proj == null || !e.role) return;
-                const yearsAhead = Math.max(0, 25 - (e.age || 25));
-                const ahead = squad.filter(p => String(p.id) !== String(e.id) && getPrimarySkillInfo(p).name === e.role
-                    && (p.age || 0) + yearsAhead <= FUTURE_SQUAD_MAX_AGE)
-                    .map(p => ({ name: p.name, proj: Math.round(projectedSkillAt25(p, projOpts)) }))
-                    .filter(p => p.proj >= e.proj)
-                    .sort((a, b) => b.proj - a.proj);
-                e.at25Rank = ahead.length + 1;
-                e.aheadOf = ahead.slice(0, 2).map(p => `${p.name} ${p.proj}`);
+                const rr = rankAgainstFutureSquad(e.role, e.age, e.proj, e.id, null, squad, projOpts);
+                e.at25Rank = rr.rank; e.at25Cap = rr.cap;
+                e.aheadOf = rr.ahead.slice(0, 2).map(p => `${p.name} ${p.proj}`);
             });
         }
         const live = items.filter(e => e.deadlineTs && e.deadlineTs > now);
@@ -3771,7 +3766,7 @@
             return `<div class="ftp-rec low" style="padding:6px 8px;margin:4px 0;${ended ? 'opacity:.55;' : ''}">
                 <div class="vj-flex-between" style="gap:6px;"><span class="vj-fw-700" style="font-size:12px;">#${i + 1} <a href="${FTP_ORIGIN}/player.htm?playerId=${encodeURIComponent(e.id)}" target="_blank" rel="noopener" style="color:inherit;text-decoration:underline;">${e.name}</a> <span class="vj-text-xs vj-text-muted">(${formatAgeDisplay(e.age)})</span>${firstTag}</span>
                 <span style="display:flex;align-items:center;gap:4px;">${badge}<button class="ftp-sl-remove" data-sl="${escapeHtml(e.id)}" title="Remove from shortlist" style="border:none;background:none;cursor:pointer;font-size:14px;">\u2715</button></span></div>
-                <div class="vj-text-xs vj-text-muted">${e.bowlerType && e.role === 'bowling' ? e.bowlerType.toUpperCase() + ' ' : ''}${ROLE[e.role] || e.role} \u00B7 ${skillLabel(e.primary)}${e.proj != null ? ` \u00B7 proj ${e.proj} at 25${e.boughtAt ? '' : e.at25Rank ? ` (<span style="${e.at25Rank > (TRANSFER_MAX_AT25_RANK[e.role] || 3) ? 'color:var(--vj-red);font-weight:700;' : ''}">#${e.at25Rank} in your side${e.aheadOf && e.aheadOf.length ? ' — behind ' + e.aheadOf.join(', ') : ''}</span>)` : ''}` : ''}${e.star != null ? ` \u00B7 \u2605 ${e.star}` : ''}</div>
+                <div class="vj-text-xs vj-text-muted">${e.bowlerType && e.role === 'bowling' ? e.bowlerType.toUpperCase() + ' ' : ''}${ROLE[e.role] || e.role} \u00B7 ${skillLabel(e.primary)}${e.proj != null ? ` \u00B7 proj ${e.proj} at 25${e.boughtAt ? '' : e.at25Rank ? ` (<span style="${e.at25Rank > (e.at25Cap || TRANSFER_MAX_AT25_RANK[e.role] || 3) ? 'color:var(--vj-red);font-weight:700;' : ''}">#${e.at25Rank} in your side${e.aheadOf && e.aheadOf.length ? ' — behind ' + e.aheadOf.join(', ') : ''}</span>)` : ''}` : ''}${e.star != null ? ` \u00B7 \u2605 ${e.star}` : ''}</div>
                 <div class="vj-text-xs" style="color:${ended ? 'var(--vj-text-muted)' : soon ? 'var(--vj-red)' : 'var(--vj-text)'};">\u23F1 ${e.deadlineTs ? deadlineText(e.deadlineTs) : 'deadline unknown'} \u00B7 bid $${(e.price || 0).toLocaleString()} <span class="vj-text-muted">(as of ${new Date(e.seenAt || e.addedAt).toLocaleString(undefined, { day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit' })})</span></div>
             </div>`;
         }).join('') + '<div class="vj-text-xs vj-text-muted vj-mt-4">Bids and deadlines update whenever the player turns up in a market scan.</div></details>';
@@ -10676,7 +10671,7 @@ const progMap = { batting: 'batting', bowling: 'bowling', keeping: 'keeperbattin
             const proj = p._dynastyCeiling.ceiling;
             if (proj < MIN_PROJECTION_AT_25) problems.push(`${p.name} shown projecting ${Math.round(proj)} (under ${MIN_PROJECTION_AT_25})`);
             const rr = at25RoleRank(p, allPlayers, projOpts);
-            if (rr.rank > (TRANSFER_MAX_AT25_RANK[rr.role] || 3)) problems.push(`${p.name} shown as #${rr.rank} ${rr.role} (cap ${TRANSFER_MAX_AT25_RANK[rr.role]})`);
+            if (rr.rank > rr.cap) problems.push(`${p.name} shown as #${rr.rank} ${rr.role} (cap ${rr.cap})`);
             if (i < 25) {
                 const fresh = computePlayerCeiling(p, getAcademySpeedForPlayer(p, projOpts.academyInfo), projOpts.squadContext || {}, 25).ceiling;
                 if (Math.abs(fresh - proj) > 0.01) problems.push(`${p.name}: stored projection ${proj} vs fresh ${fresh}`);
@@ -11555,9 +11550,9 @@ const progMap = { batting: 'batting', bowling: 'bowling', keeping: 'keeperbattin
                     // projection ranks low and a hidden card is never fetched.
                     if ((e.experience || 0) > 0 || (e.wage || 0) > 0) {
                         const rr = at25RoleRank(e, allPlayers, projOpts);
-                        const cap = TRANSFER_MAX_AT25_RANK[rr.role] || 3;
+                        const cap = rr.cap;
                         if (rr.rank > cap) {
-                            e.eval.warnings.push(`At 25 would be your #${rr.rank} ${rr.role === 'keeping' ? 'keeper' : rr.role === 'bowling' ? 'bowler' : 'batter'} — must be top ${cap}`);
+                            e.eval.warnings.push(`At 25 would be your #${rr.rank} ${rr.role === 'keeping' ? 'keeper' : rr.role === 'bowling' ? 'bowler' : 'batter'} — must be top ${cap} by ${TRANSFER_UPGRADE_MARGIN}+ points`);
                             return false;
                         }
                     }
@@ -11697,7 +11692,7 @@ const progMap = { batting: 'batting', bowling: 'bowling', keeping: 'keeperbattin
                     html += `<div class="vj-text-xs vj-text-muted vj-mb-8">${academyContext}</div>`;
                     const weakSenior = weakestDepartments(false, 2);
                     if (weakSenior.length) html += `<div class="vj-text-xs vj-mb-8" style="color:var(--vj-amber);">Where your seniors lose: you trail the teams that beat you most in ${weakSenior.map(w => `<b>${w.label}</b> (${Math.round(w.gap * 100)}%)`).join(' and ')} \u2014 over ${weakSenior[0].losses} losses.</div>`;
-                    html += `<div class="vj-text-xs vj-text-muted vj-mb-8">Shown: ages ${BUY_AGES_LABEL}, \u2264 $${TRANSFER_MAX_PRICE.toLocaleString()}, \u2265 ${MIN_PROJECTION_AT_25} at 25, your #1 keeper / top ${TRANSFER_MAX_AT25_RANK.batting} batter or bowler in your squad when he's 25 (your youths included). Each role ranked separately, best \u2192 worst by \u2605 rating (projection at 25 from all skills, experience, talents and your academy; age; skill shape; bowler type; wage value \u2014 hover the badge for the breakdown), then projection, then cheaper bid.</div>`;
+                    html += `<div class="vj-text-xs vj-text-muted vj-mb-8">Shown: ages ${BUY_AGES_LABEL}, \u2264 $${TRANSFER_MAX_PRICE.toLocaleString()}, \u2265 ${MIN_PROJECTION_AT_25} at 25, your #1 keeper / top ${TRANSFER_MAX_AT25_RANK.batting} batter or bowler in your squad when he's 25 (your youths included), beating the player he'd replace by ${TRANSFER_UPGRADE_MARGIN}+ points — while a role has fewer than an XI's worth projecting ${MIN_PROJECTION_AT_25}+ (${TRANSFER_XI_SLOTS.batting} batters / ${TRANSFER_XI_SLOTS.bowling} bowlers), anyone who'd make that XI is shown. Each role ranked separately, best \u2192 worst by \u2605 rating (projection at 25 from all skills, experience, talents and your academy; age; skill shape; bowler type; wage value \u2014 hover the badge for the breakdown), then projection, then cheaper bid.</div>`;
                     if (!detailsFetched) {
                         // Talents aren't shown on the transfer search table
                         // at all (game limitation \u2014 only on the player's
@@ -12905,16 +12900,32 @@ const progMap = { batting: 'batting', bowling: 'bowling', keeping: 'keeperbattin
     // counted veterans who'll be long past it — live, two #3 bowlers were
     // in fact #4 behind the club's youth bowlers.
     const FUTURE_SQUAD_MAX_AGE = 31; // 30+ decline isn't modelled (known tech debt); past ~31 a projection no longer holds
+    // A buy must beat the player he'd displace by this many points at 25 —
+    // 1-point gaps are inside the projection's error (user, 2026-11-16:
+    // Sanson/Laggan 66 vs Tete 65 are not upgrades).
+    const TRANSFER_UPGRADE_MARGIN = 2;
+    // Rank of a to-25 projection among the future squad of his role. A peer
+    // counts as ahead unless the candidate beats him by the margin.
+    // cap: normally TRANSFER_MAX_AT25_RANK, but while the role has fewer
+    // players projecting >= the bar than an XI needs (TRANSFER_XI_SLOTS),
+    // anyone who'd make that future XI is shown — buying your #1 batter must
+    // not stop the list offering batters you still need (user, 2026-11-16).
+    function rankAgainstFutureSquad(role, age, proj, excludeId, excludeName, squadPlayers, projOpts) {
+        const yearsAhead = Math.max(0, 25 - (age || 25));
+        const peers = squadPlayers.filter(p => p.name !== excludeName && !(excludeId != null && String(p.id) === String(excludeId))
+            && getPrimarySkillInfo(p).name === role && (p.age || 0) + yearsAhead <= FUTURE_SQUAD_MAX_AGE)
+            .map(p => ({ name: p.name, proj: Math.round(projectedSkillAt25(p, projOpts)) }))
+            .sort((a, b) => b.proj - a.proj);
+        const mine = Math.round(proj);
+        const ahead = peers.filter(p => p.proj > mine - TRANSFER_UPGRADE_MARGIN);
+        const depth = peers.filter(p => p.proj >= MIN_PROJECTION_AT_25).length;
+        const slots = TRANSFER_XI_SLOTS[role] || 5;
+        const cap = depth < slots ? Math.max(slots, TRANSFER_MAX_AT25_RANK[role] || 3) : (TRANSFER_MAX_AT25_RANK[role] || 3);
+        return { role, rank: ahead.length + 1, of: peers.length + 1, cap, depth, slots, short: depth < slots, ahead };
+    }
     function at25RoleRank(candidate, squadPlayers, projOpts) {
         const role = getPrimarySkillInfo(candidate).name;
-        const yearsAhead = Math.max(0, 25 - (candidate.age || 25));
-        const peers = squadPlayers.filter(p => p.name !== candidate.name && !(candidate.id != null && p.id === candidate.id)
-            && getPrimarySkillInfo(p).name === role && (p.age || 0) + yearsAhead <= FUTURE_SQUAD_MAX_AGE);
-        // Compared on the shown (rounded) projections, and a peer level with him
-        // counts as ahead: the caps keep only players who'd be BETTER than who
-        // you already have, not another of the same.
-        const ceiling = Math.round(projectionAt25(candidate, projOpts).ceiling);
-        return { role, rank: 1 + peers.filter(p => Math.round(projectedSkillAt25(p, projOpts)) >= ceiling).length, of: peers.length + 1 };
+        return rankAgainstFutureSquad(role, candidate.age, projectionAt25(candidate, projOpts).ceiling, candidate.id, candidate.name, squadPlayers, projOpts);
     }
     function squadRankLines(candidate, squadPlayers, projOpts) {
         const role = getPrimarySkillInfo(candidate).name;
