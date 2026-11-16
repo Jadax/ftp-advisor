@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         FTP Advisor
 // @namespace    http://tampermonkey.net/
-// @version      8.144
+// @version      8.145
 // @description  Tactical/scouting advisor for fromthepavilion.org (cricket sim): team, tactics, pitch, training, transfer market, youth and squad plan advice with projections. Full changelog: github.com/Jadax/ftp-advisor
 // @author       Tushant Sharma
 // @license      MIT
@@ -1766,7 +1766,7 @@
     }
 
     // ── Squad cache (senior + youth) ──────────────────────────
-    function savePlayerCache(players) { _saveCache(CACHE_KEY, CACHE_TIMESTAMP_KEY, players); }
+    function savePlayerCache(players) { _saveCache(CACHE_KEY, CACHE_TIMESTAMP_KEY, players); markShortlistBought(players); }
     // A squad PAGE shows one age group in the grid view, which has no
     // talents / batting hand / current training (those come from the
     // summary view). Saving the page as the whole cache dropped the other
@@ -3342,7 +3342,8 @@
                 (p.batting || 0) === 0 && (p.bowling || 0) === 0 && (p.fielding || 0) === 0)
              || (existingSquadCache.players.some(p => p.isYouth) && !existingSquadCache.players.some(p => p.isSenior))
              || (existingSquadCache.players.some(p => p.isSenior) && !existingSquadCache.players.some(p => p.isYouth))));
-        if (force || isStale(CACHE_TIMESTAMP_KEY, STALE_SQUAD_HOURS) || squadCacheCorrupted || !existingSquadCache) {
+        if (force || isStale(CACHE_TIMESTAMP_KEY, STALE_SQUAD_HOURS) || squadCacheCorrupted || !existingSquadCache
+            || shortlistEndedSince(existingSquadCache.timestamp)) {
             labels.push('squad');
             promises.push(
                 fetchSquadFromPage(`${FTP_ORIGIN}/seniors.htm?squadViewId=2&teamId=${TEAM_ID}`)
@@ -3686,6 +3687,22 @@
         return list;
     }
     function saveShortlist(list) { GM_setValue(SHORTLIST_KEY, JSON.stringify(list)); }
+    // A shortlisted player who turns up in your own squad was bought.
+    function markShortlistBought(squad) {
+        const ids = new Set((squad || []).map(p => String(p.id)));
+        const list = loadShortlist();
+        let changed = false;
+        Object.values(list).forEach(e => { if (!e.boughtAt && ids.has(String(e.id))) { e.boughtAt = Date.now(); changed = true; } });
+        if (changed) saveShortlist(list);
+    }
+    // An auction on the shortlist closed after the squad was last read: he may
+    // be ours now, and until the squad is re-read the at-25 rank caps would
+    // still compare keepers/batters/bowlers against the squad WITHOUT him
+    // (user, 2026-11-16: bought Tete, list must then show only better keepers).
+    function shortlistEndedSince(ts) {
+        const now = Date.now();
+        return Object.values(loadShortlist()).some(e => !e.boughtAt && e.deadlineTs && e.deadlineTs > (ts || 0) && e.deadlineTs <= now);
+    }
     function shortlistSnapshot(p, prev) {
         const role = getPrimarySkillInfo(p);
         const r = p._rankLines;
@@ -3717,7 +3734,7 @@
         const now = Date.now();
         const items = Object.values(loadShortlist()).sort((a, b) => {
             const ae = !!(a.deadlineTs && a.deadlineTs <= now), be = !!(b.deadlineTs && b.deadlineTs <= now);
-            return (ae - be) || (b.star || 0) - (a.star || 0) || (b.proj || 0) - (a.proj || 0);
+            return (!!a.boughtAt - !!b.boughtAt) || (ae - be) || (b.star || 0) - (a.star || 0) || (b.proj || 0) - (a.proj || 0);
         });
         const live = items.filter(e => e.deadlineTs && e.deadlineTs > now);
         const firstEnding = live.length > 1 ? live.reduce((m, e) => e.deadlineTs < m.deadlineTs ? e : m) : null;
@@ -3729,7 +3746,8 @@
             const soon = left != null && !ended && left < 6 * 3600e3;
             const today = left != null && !ended && left < 24 * 3600e3;
             const badgeBg = ended ? 'var(--vj-text-muted)' : soon ? 'var(--vj-red)' : today ? 'var(--vj-amber)' : 'var(--vj-blue,#3b6fd8)';
-            const badge = e.deadlineTs ? `<span style="background:${badgeBg};color:#fff;border-radius:10px;padding:1px 8px;font-size:11px;font-weight:700;white-space:nowrap;">\u23F1 ${timeLeftShort(e.deadlineTs)}</span>` : '';
+            const badge = e.boughtAt ? `<span style="background:var(--vj-green,#2e8b57);color:#fff;border-radius:10px;padding:1px 8px;font-size:11px;font-weight:700;white-space:nowrap;">✓ in your squad</span>`
+                : e.deadlineTs ? `<span style="background:${badgeBg};color:#fff;border-radius:10px;padding:1px 8px;font-size:11px;font-weight:700;white-space:nowrap;">\u23F1 ${timeLeftShort(e.deadlineTs)}</span>` : '';
             const firstTag = firstEnding === e ? ` <span style="color:var(--vj-red);font-size:10px;font-weight:700;">ENDS FIRST</span>` : '';
             return `<div class="ftp-rec low" style="padding:6px 8px;margin:4px 0;${ended ? 'opacity:.55;' : ''}">
                 <div class="vj-flex-between" style="gap:6px;"><span class="vj-fw-700" style="font-size:12px;">#${i + 1} <a href="${FTP_ORIGIN}/player.htm?playerId=${encodeURIComponent(e.id)}" target="_blank" rel="noopener" style="color:inherit;text-decoration:underline;">${e.name}</a> <span class="vj-text-xs vj-text-muted">(${formatAgeDisplay(e.age)})</span>${firstTag}</span>
@@ -12869,8 +12887,11 @@ const progMap = { batting: 'batting', bowling: 'bowling', keeping: 'keeperbattin
         const yearsAhead = Math.max(0, 25 - (candidate.age || 25));
         const peers = squadPlayers.filter(p => p.name !== candidate.name && !(candidate.id != null && p.id === candidate.id)
             && getPrimarySkillInfo(p).name === role && (p.age || 0) + yearsAhead <= FUTURE_SQUAD_MAX_AGE);
-        const ceiling = projectionAt25(candidate, projOpts).ceiling;
-        return { role, rank: 1 + peers.filter(p => projectedSkillAt25(p, projOpts) > ceiling).length, of: peers.length + 1 };
+        // Compared on the shown (rounded) projections, and a peer level with him
+        // counts as ahead: the caps keep only players who'd be BETTER than who
+        // you already have, not another of the same.
+        const ceiling = Math.round(projectionAt25(candidate, projOpts).ceiling);
+        return { role, rank: 1 + peers.filter(p => Math.round(projectedSkillAt25(p, projOpts)) >= ceiling).length, of: peers.length + 1 };
     }
     function squadRankLines(candidate, squadPlayers, projOpts) {
         const role = getPrimarySkillInfo(candidate).name;
