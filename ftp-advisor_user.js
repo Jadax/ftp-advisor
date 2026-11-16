@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         FTP Advisor
 // @namespace    http://tampermonkey.net/
-// @version      8.146
+// @version      8.147
 // @description  Tactical/scouting advisor for fromthepavilion.org (cricket sim): team, tactics, pitch, training, transfer market, youth and squad plan advice with projections. Full changelog: github.com/Jadax/ftp-advisor
 // @author       Tushant Sharma
 // @license      MIT
@@ -3342,7 +3342,7 @@
                 (p.batting || 0) === 0 && (p.bowling || 0) === 0 && (p.fielding || 0) === 0)
              || (existingSquadCache.players.some(p => p.isYouth) && !existingSquadCache.players.some(p => p.isSenior))
              || (existingSquadCache.players.some(p => p.isSenior) && !existingSquadCache.players.some(p => p.isYouth))));
-        if (force || isStale(CACHE_TIMESTAMP_KEY, STALE_SQUAD_HOURS) || squadCacheCorrupted || !existingSquadCache
+        if (force || options.forceSquad || isStale(CACHE_TIMESTAMP_KEY, STALE_SQUAD_HOURS) || squadCacheCorrupted || !existingSquadCache
             || shortlistEndedSince(existingSquadCache.timestamp)) {
             labels.push('squad');
             promises.push(
@@ -11400,6 +11400,10 @@ const progMap = { batting: 'batting', bowling: 'bowling', keeping: 'keeperbattin
         if (scanBtn) scanBtn.addEventListener('click', async () => {
             const status = document.getElementById('ftp-market-scan-status');
             scanBtn.disabled = true;
+            // Rank against the squad as it is NOW: a buy or sale since the last
+            // read changes who'd be #1 at 25 (user, 2026-11-16).
+            if (status) status.textContent = 'Updating your squad…';
+            try { await fetchAllData({ forceSquad: true }); } catch (e) { console.warn('[FTP Transfer] squad refresh failed', e); }
             const found = await runMarketScan(label => { if (status) status.textContent = `Searching ${label}\u2026`; });
             if (status) status.textContent = `${found.length} listed players matched the base filters \u2014 evaluated below.`;
             scanBtn.disabled = false;
