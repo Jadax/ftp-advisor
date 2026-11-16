@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         FTP Advisor
 // @namespace    http://tampermonkey.net/
-// @version      8.145
+// @version      8.146
 // @description  Tactical/scouting advisor for fromthepavilion.org (cricket sim): team, tactics, pitch, training, transfer market, youth and squad plan advice with projections. Full changelog: github.com/Jadax/ftp-advisor
 // @author       Tushant Sharma
 // @license      MIT
@@ -3736,6 +3736,25 @@
             const ae = !!(a.deadlineTs && a.deadlineTs <= now), be = !!(b.deadlineTs && b.deadlineTs <= now);
             return (!!a.boughtAt - !!b.boughtAt) || (ae - be) || (b.star || 0) - (a.star || 0) || (b.proj || 0) - (a.proj || 0);
         });
+        // The stored at-25 rank is from the day he was shortlisted; re-rank
+        // against TODAY's squad (user, 2026-11-16: after buying Tete every
+        // shortlisted keeper still read '#1 in your side').
+        const squad = (loadPlayerCache() || {}).players || [];
+        if (squad.length) {
+            const academyInfo = loadAcademyCache();
+            const projOpts = { academyInfo, squadContext: { ...squadCounts(squad), academyInfo } };
+            items.forEach(e => {
+                if (e.boughtAt || e.proj == null || !e.role) return;
+                const yearsAhead = Math.max(0, 25 - (e.age || 25));
+                const ahead = squad.filter(p => String(p.id) !== String(e.id) && getPrimarySkillInfo(p).name === e.role
+                    && (p.age || 0) + yearsAhead <= FUTURE_SQUAD_MAX_AGE)
+                    .map(p => ({ name: p.name, proj: Math.round(projectedSkillAt25(p, projOpts)) }))
+                    .filter(p => p.proj >= e.proj)
+                    .sort((a, b) => b.proj - a.proj);
+                e.at25Rank = ahead.length + 1;
+                e.aheadOf = ahead.slice(0, 2).map(p => `${p.name} ${p.proj}`);
+            });
+        }
         const live = items.filter(e => e.deadlineTs && e.deadlineTs > now);
         const firstEnding = live.length > 1 ? live.reduce((m, e) => e.deadlineTs < m.deadlineTs ? e : m) : null;
         if (!items.length) return '<div class="vj-text-xs vj-text-muted">No one yet \u2014 press \u2606 on a transfer card to shortlist him.</div>';
@@ -3752,7 +3771,7 @@
             return `<div class="ftp-rec low" style="padding:6px 8px;margin:4px 0;${ended ? 'opacity:.55;' : ''}">
                 <div class="vj-flex-between" style="gap:6px;"><span class="vj-fw-700" style="font-size:12px;">#${i + 1} <a href="${FTP_ORIGIN}/player.htm?playerId=${encodeURIComponent(e.id)}" target="_blank" rel="noopener" style="color:inherit;text-decoration:underline;">${e.name}</a> <span class="vj-text-xs vj-text-muted">(${formatAgeDisplay(e.age)})</span>${firstTag}</span>
                 <span style="display:flex;align-items:center;gap:4px;">${badge}<button class="ftp-sl-remove" data-sl="${escapeHtml(e.id)}" title="Remove from shortlist" style="border:none;background:none;cursor:pointer;font-size:14px;">\u2715</button></span></div>
-                <div class="vj-text-xs vj-text-muted">${e.bowlerType && e.role === 'bowling' ? e.bowlerType.toUpperCase() + ' ' : ''}${ROLE[e.role] || e.role} \u00B7 ${skillLabel(e.primary)}${e.proj != null ? ` \u00B7 proj ${e.proj} at 25${e.at25Rank ? ` (#${e.at25Rank} in your side)` : ''}` : ''}${e.star != null ? ` \u00B7 \u2605 ${e.star}` : ''}</div>
+                <div class="vj-text-xs vj-text-muted">${e.bowlerType && e.role === 'bowling' ? e.bowlerType.toUpperCase() + ' ' : ''}${ROLE[e.role] || e.role} \u00B7 ${skillLabel(e.primary)}${e.proj != null ? ` \u00B7 proj ${e.proj} at 25${e.boughtAt ? '' : e.at25Rank ? ` (<span style="${e.at25Rank > (TRANSFER_MAX_AT25_RANK[e.role] || 3) ? 'color:var(--vj-red);font-weight:700;' : ''}">#${e.at25Rank} in your side${e.aheadOf && e.aheadOf.length ? ' — behind ' + e.aheadOf.join(', ') : ''}</span>)` : ''}` : ''}${e.star != null ? ` \u00B7 \u2605 ${e.star}` : ''}</div>
                 <div class="vj-text-xs" style="color:${ended ? 'var(--vj-text-muted)' : soon ? 'var(--vj-red)' : 'var(--vj-text)'};">\u23F1 ${e.deadlineTs ? deadlineText(e.deadlineTs) : 'deadline unknown'} \u00B7 bid $${(e.price || 0).toLocaleString()} <span class="vj-text-muted">(as of ${new Date(e.seenAt || e.addedAt).toLocaleString(undefined, { day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit' })})</span></div>
             </div>`;
         }).join('') + '<div class="vj-text-xs vj-text-muted vj-mt-4">Bids and deadlines update whenever the player turns up in a market scan.</div></details>';
