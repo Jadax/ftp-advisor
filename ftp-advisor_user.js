@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         FTP Advisor
 // @namespace    http://tampermonkey.net/
-// @version      8.149
+// @version      8.150
 // @description  Tactical/scouting advisor for fromthepavilion.org (cricket sim): team, tactics, pitch, training, transfer market, youth and squad plan advice with projections. Full changelog: github.com/Jadax/ftp-advisor
 // @author       Tushant Sharma
 // @license      MIT
@@ -11691,7 +11691,7 @@ const progMap = { batting: 'batting', bowling: 'bowling', keeping: 'keeperbattin
                     html += `<div class="vj-text-xs vj-text-muted vj-mb-8">${academyContext}</div>`;
                     const weakSenior = weakestDepartments(false, 2);
                     if (weakSenior.length) html += `<div class="vj-text-xs vj-mb-8" style="color:var(--vj-amber);">Where your seniors lose: you trail the teams that beat you most in ${weakSenior.map(w => `<b>${w.label}</b> (${Math.round(w.gap * 100)}%)`).join(' and ')} \u2014 over ${weakSenior[0].losses} losses.</div>`;
-                    html += `<div class="vj-text-xs vj-text-muted vj-mb-8">Shown: ages ${BUY_AGES_LABEL}, \u2264 $${TRANSFER_MAX_PRICE.toLocaleString()}, \u2265 ${MIN_PROJECTION_AT_25} at 25, your #1 keeper / top ${TRANSFER_MAX_AT25_RANK.batting} batter or bowler in your squad when he's 25 (your youths included), beating the player he'd replace by ${TRANSFER_UPGRADE_MARGIN}+ points — while a role has fewer than an XI's worth projecting ${MIN_PROJECTION_AT_25}+ (${TRANSFER_XI_SLOTS.batting} batters / ${TRANSFER_XI_SLOTS.bowling} bowlers), anyone who'd make that XI is shown. Each role ranked separately, best \u2192 worst by \u2605 rating (projection at 25 from all skills, experience, talents and your academy; age; skill shape; bowler type; wage value \u2014 hover the badge for the breakdown), then projection, then cheaper bid.</div>`;
+                    html += `<div class="vj-text-xs vj-text-muted vj-mb-8">Shown: ages ${BUY_AGES_LABEL}, \u2264 $${TRANSFER_MAX_PRICE.toLocaleString()}, \u2265 ${MIN_PROJECTION_AT_25} at 25, your #1 keeper / top ${TRANSFER_MAX_AT25_RANK.batting} batter or bowler in your squad when he's 25 (your youths included), beating the player he'd replace by ${TRANSFER_UPGRADE_MARGIN}+ points — while a role has fewer than an XI's worth projecting ${MIN_PROJECTION_AT_25}+ (${TRANSFER_XI_SLOTS.batting + TRANSFER_SQUAD_COVER} batters / ${TRANSFER_XI_SLOTS.bowling + TRANSFER_SQUAD_COVER} bowlers / ${TRANSFER_XI_SLOTS.keeping + TRANSFER_SQUAD_COVER} keepers), anyone who'd make that XI plus ${TRANSFER_SQUAD_COVER} spare is shown. Each role ranked separately, best \u2192 worst by \u2605 rating (projection at 25 from all skills, experience, talents and your academy; age; skill shape; bowler type; wage value \u2014 hover the badge for the breakdown), then projection, then cheaper bid.</div>`;
                     if (!detailsFetched) {
                         // Talents aren't shown on the transfer search table
                         // at all (game limitation \u2014 only on the player's
@@ -12860,6 +12860,8 @@ const progMap = { batting: 'batting', bowling: 'bowling', keeping: 'keeperbattin
         return { bowling, keeping: 1, batting: 11 - 1 - bowling };
     }
     const TRANSFER_XI_SLOTS = xiRoleSlots(['OD', 'T20']);
+    // One spare per role on top of the XI, for fatigue/rotation (user, 2026-11-16).
+    const TRANSFER_SQUAD_COVER = 1;
     // The buying/keeping bar (user, 2026-11-12: 60; was 58): flat at 25 for every age
     // and role, on the workbook-aligned projection (v8.120). Set after
     // seeing Silvastrie Gannile (17, on curve) project exactly 58.
@@ -12928,7 +12930,7 @@ const progMap = { batting: 'batting', bowling: 'bowling', keeping: 'keeperbattin
         const mine = Math.round(proj);
         const ahead = peers.filter(p => p.proj > mine - TRANSFER_UPGRADE_MARGIN);
         const depth = peers.filter(p => p.proj >= MIN_PROJECTION_AT_25).length;
-        const slots = TRANSFER_XI_SLOTS[role] || 5;
+        const slots = (TRANSFER_XI_SLOTS[role] || 5) + TRANSFER_SQUAD_COVER;
         const cap = depth < slots ? Math.max(slots, TRANSFER_MAX_AT25_RANK[role] || 3) : (TRANSFER_MAX_AT25_RANK[role] || 3);
         return { role, rank: ahead.length + 1, of: peers.length + 1, cap, depth, slots, short: depth < slots, ahead };
     }
