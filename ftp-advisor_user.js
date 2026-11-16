@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         FTP Advisor
 // @namespace    http://tampermonkey.net/
-// @version      8.143
+// @version      8.144
 // @description  Tactical/scouting advisor for fromthepavilion.org (cricket sim): team, tactics, pitch, training, transfer market, youth and squad plan advice with projections. Full changelog: github.com/Jadax/ftp-advisor
 // @author       Tushant Sharma
 // @license      MIT
@@ -3608,10 +3608,42 @@
     // "13 Nov 2026 01:51" as shown on the transfer list (the game's own
     // clock, read as local time — good enough for a deadline reminder).
     const MONTHS = { jan: 0, feb: 1, mar: 2, apr: 3, may: 4, jun: 5, jul: 6, aug: 7, sep: 8, oct: 9, nov: 10, dec: 11 };
-    function parseTransferDeadline(text) {
-        const m = String(text || '').match(/(\d{1,2})\s+([A-Za-z]{3})\w*\s+(\d{4})\s*(\d{1,2}):(\d{2})/);
+    // GAME CLOCK. Every time the game prints (deadlines, fixtures, match
+    // dates) is the SERVER's clock, not the viewer's: live 2026-11-16 the
+    // logged-out footer read "Mon 16-Nov 09:14:08" = the HTTP Date header in
+    // GMT while the user's PC was GMT+2, and parsing game times as local put
+    // every countdown 2 h short (Tete "51m left" with 2h51m to go). The
+    // offset is measured from that footer whenever a logged-out page shows
+    // it (calibrateGameClock), so a summer-time switch on the server is
+    // picked up; until then 0 (GMT), which is what the server shows today.
+    const GAME_CLOCK_KEY = 'ftp_game_utc_offset_min';
+    function gameUtcOffsetMin() {
+        const v = parseInt(GM_getValue(GAME_CLOCK_KEY, '0'), 10);
+        return isFinite(v) && Math.abs(v) <= 14 * 60 ? v : 0;
+    }
+    function gameTimeToTs(year, month, day, hour, minute) {
+        return Date.UTC(year, month, day, hour, minute) - gameUtcOffsetMin() * 60000;
+    }
+    // "13 Nov 2026 01:51", "16 Nov 26 12:04", "09 Nov 2026 11:30" -> timestamp (0 if unparseable)
+    function parseGameDateTime(text) {
+        const m = String(text || '').match(/(\d{1,2})\s+([A-Za-z]{3})\w*\s+(\d{2,4})\s*(\d{1,2}):(\d{2})/);
         if (!m || MONTHS[m[2].toLowerCase()] == null) return 0;
-        return new Date(+m[3], MONTHS[m[2].toLowerCase()], +m[1], +m[4], +m[5]).getTime();
+        const y = +m[3] < 100 ? 2000 + +m[3] : +m[3];
+        return gameTimeToTs(y, MONTHS[m[2].toLowerCase()], +m[1], +m[4], +m[5]);
+    }
+    function parseTransferDeadline(text) { return parseGameDateTime(text); }
+    function calibrateGameClock(doc) {
+        const t = (doc && doc.body ? doc.body.textContent : '').replace(/\s+/g, ' ');
+        const m = t.match(/Game Version:[^|]*\|\s*[A-Za-z]{3}\s+(\d{1,2})-([A-Za-z]{3})\s+(\d{1,2}):(\d{2}):(\d{2})/);
+        if (!m || MONTHS[m[2].toLowerCase()] == null) return null;
+        const now = Date.now(), y = new Date(now).getUTCFullYear();
+        // No year in the footer: take whichever year puts it closest to now.
+        const off = [y - 1, y, y + 1].map(yy => (Date.UTC(yy, MONTHS[m[2].toLowerCase()], +m[1], +m[3], +m[4], +m[5]) - now) / 60000)
+            .reduce((a, b) => Math.abs(b) < Math.abs(a) ? b : a);
+        const mins = Math.round(off / 15) * 15;
+        if (Math.abs(mins) > 14 * 60) return null;
+        GM_setValue(GAME_CLOCK_KEY, String(mins));
+        return mins;
     }
     // Short "time left" for badges ("2d 4h", "5h 12m", "ended").
     function timeLeftShort(ts) {
@@ -3623,7 +3655,11 @@
     function deadlineText(ts) {
         if (!ts) return '';
         const d = new Date(ts);
-        const when = d.toLocaleDateString(undefined, { weekday: 'short', day: 'numeric', month: 'short' }) + ' ' + d.toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit' });
+        // Your time first, then the game's own clock (what the game page prints).
+        const g = new Date(ts + gameUtcOffsetMin() * 60000);
+        const gameClock = `${String(g.getUTCHours()).padStart(2, '0')}:${String(g.getUTCMinutes()).padStart(2, '0')}`;
+        const when = d.toLocaleDateString(undefined, { weekday: 'short', day: 'numeric', month: 'short' }) + ' ' + d.toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit' })
+            + (d.getTimezoneOffset() !== -gameUtcOffsetMin() ? ` your time (${gameClock} game)` : '');
         const left = ts - Date.now();
         if (left <= 0) return `Ended ${when}`;
         const h = Math.floor(left / 3600e3), dd = Math.floor(h / 24);
@@ -3635,7 +3671,19 @@
     // again, not polled.
     const SHORTLIST_KEY = 'ftp_shortlist';
     function loadShortlist() {
-        try { return JSON.parse(GM_getValue(SHORTLIST_KEY, '{}')) || {}; } catch (e) { return {}; }
+        let list;
+        try { list = JSON.parse(GM_getValue(SHORTLIST_KEY, '{}')) || {}; } catch (e) { return {}; }
+        // Entries saved before v8.144 read the game's clock as local time;
+        // re-anchor them once (wall clock -> game clock).
+        let fixed = false;
+        Object.values(list).forEach(e => {
+            if (e.deadlineTs && !e.clockV) {
+                e.deadlineTs = e.deadlineTs - new Date(e.deadlineTs).getTimezoneOffset() * 60000 - gameUtcOffsetMin() * 60000;
+                e.clockV = 2; fixed = true;
+            }
+        });
+        if (fixed) GM_setValue(SHORTLIST_KEY, JSON.stringify(list));
+        return list;
     }
     function saveShortlist(list) { GM_setValue(SHORTLIST_KEY, JSON.stringify(list)); }
     function shortlistSnapshot(p, prev) {
@@ -3645,7 +3693,7 @@
             id: String(p.id), name: p.name, age: p.age, role: role.name, primary: role.value, bowlerType: p.bowlerType || '',
             proj: r ? r.proj : (p._dynastyCeiling ? Math.round(p._dynastyCeiling.ceiling) : null),
             at25Rank: r ? r.at25Rank : null, star: p._overallRating ? Math.round(p._overallRating.score * 10) / 10 : null,
-            price: p.price || 0, deadlineTs: p.deadlineTs || (prev && prev.deadlineTs) || 0,
+            price: p.price || 0, deadlineTs: p.deadlineTs || (prev && prev.deadlineTs) || 0, clockV: 2,
             addedAt: (prev && prev.addedAt) || Date.now(), seenAt: Date.now()
         });
     }
@@ -7846,7 +7894,7 @@ const MAX_OVERS_PER_BOWLER = { OD: 10, YOD: 8, T20: 4, YT20: 4 };
                         const cells = row.querySelectorAll('td');
                         if (cells.length < 3) return;
                         const dateText = cells[0].textContent.trim();
-                        const matchDate = new Date(dateText.replace(/(\d+) (\w+) (\d+) (\d+):(\d+)/, '$2 $1, $3 $4:$5'));
+                        const matchDate = new Date(parseGameDateTime(dateText) || NaN);
                         if (isNaN(matchDate.getTime()) || matchDate < now) return;
                         const matchClass = (cells[1]?.querySelector('a')?.textContent.trim() || cells[1]?.textContent.trim() || '').trim();
                         const teams = cells[2]?.textContent.trim() || '';
@@ -7965,7 +8013,7 @@ const MAX_OVERS_PER_BOWLER = { OD: 10, YOD: 8, T20: 4, YT20: 4 };
             if (!dateCell || !teamsCell) return;
 
             const dateText = dateCell.textContent.trim();
-            const matchDate = new Date(dateText.replace(/(\d+) (\w+) (\d+) (\d+):(\d+)/, '$2 $1, $3 $4:$5'));
+            const matchDate = new Date(parseGameDateTime(dateText) || NaN);
             const matchClass = classCell?.querySelector('a')?.textContent.trim() || classCell?.textContent.trim() || '';
             const teams = teamsCell.textContent.trim();
             const status = getOrderStatus(row);
@@ -10774,7 +10822,7 @@ const progMap = { batting: 'batting', bowling: 'bowling', keeping: 'keeperbattin
                 sc.gameId = m.gameId;
                 saveMatchesToHistory([sc]);
             }
-            const date = new Date(m.dateText.replace(/(\d+) (\w+) (\d+) (\d+):(\d+)/, '$2 $1, $3 $4:$5')).getTime() || 0;
+            const date = parseGameDateTime(m.dateText);
             db[m.gameId] = Object.assign(db[m.gameId] || {}, {
                 gameId: m.gameId, teams: m.teams, date: (db[m.gameId] && db[m.gameId].date && !db[m.gameId].dateProvisional) ? db[m.gameId].date : date, dateProvisional: false, league: d.league || m.league,
                 conditions: { pitch: d.pitch, weather: d.weather, ground: d.ground, crowd: d.crowd, home: d.home, away: d.away },
@@ -12390,7 +12438,7 @@ const progMap = { batting: 'batting', bowling: 'bowling', keeping: 'keeperbattin
                         if (!dateCell || !teamsCell) continue;
 
                         const dateText = dateCell.textContent.trim();
-                        const matchDate = new Date(dateText.replace(/(\d+) (\w+) (\d+) (\d+):(\d+)/, '$2 $1, $3 $4:$5'));
+                        const matchDate = new Date(parseGameDateTime(dateText) || NaN);
                         const matchClass = classCell?.querySelector('a')?.textContent.trim() || classCell?.textContent.trim() || '';
                         const teams = teamsCell.textContent.trim();
                         const status = getOrderStatus(row);
@@ -13244,7 +13292,8 @@ const progMap = { batting: 'batting', bowling: 'bowling', keeping: 'keeperbattin
     }
 
     if (SKIP_PAGE) {
-        // logged out
+        // Logged-out pages carry the game clock in their footer.
+        try { calibrateGameClock(document); } catch (e) { /* keep the last offset */ }
     } else if (document.readyState === 'loading') {
         document.addEventListener('DOMContentLoaded', init);
     } else {
