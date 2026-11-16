@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         FTP Advisor
 // @namespace    http://tampermonkey.net/
-// @version      8.148
+// @version      8.149
 // @description  Tactical/scouting advisor for fromthepavilion.org (cricket sim): team, tactics, pitch, training, transfer market, youth and squad plan advice with projections. Full changelog: github.com/Jadax/ftp-advisor
 // @author       Tushant Sharma
 // @license      MIT
@@ -5263,7 +5263,6 @@ ${matches.length ? matches.map(([id, m]) => ck(true, `Orders: ${esc(m.teams)} \u
         // below is a heuristic margin (never hand a bowler their entire
         // match quota in one continuous burst), kept proportionate to each
         // format's real per-bowler max rather than a flat 8.
-const MAX_OVERS_PER_BOWLER = { OD: 10, YOD: 8, T20: 4, YT20: 4 };
         // When the orders page declared its own limits
         // (scrapeMatchOrderSettings), they win over the format table — a
         // 40-over friendly comp still allows only 8 overs per bowler even
@@ -12850,7 +12849,17 @@ const progMap = { batting: 'batting', bowling: 'bowling', keeping: 'keeperbattin
     // projection against your SENIOR players' to-25 projections — every
     // buy, 16yo included, is ultimately a first-team bet (user's aim).
     // TRANSFER_XI_SLOTS = how deep in a role a player still makes a typical XI.
-    const TRANSFER_XI_SLOTS = { batting: 5, bowling: 5, keeping: 1 };
+    // Derived from the formats' own rules, not hard-coded: an XI needs
+    // enough bowlers to cover the innings at the per-bowler cap, one keeper,
+    // and batters fill the rest. Buys are judged at 25, i.e. as seniors, so
+    // the SENIOR formats decide (OD 50/10 -> 5, T20 20/4 -> 5 => 5 batters).
+    const MAX_OVERS_PER_BOWLER = { OD: 10, YOD: 8, T20: 4, YT20: 4 };
+    const FORMAT_OVERS = { OD: 50, YOD: 40, T20: 20, YT20: 20 };
+    function xiRoleSlots(formats) {
+        const bowling = Math.max(...formats.map(f => Math.ceil(FORMAT_OVERS[f] / MAX_OVERS_PER_BOWLER[f])));
+        return { bowling, keeping: 1, batting: 11 - 1 - bowling };
+    }
+    const TRANSFER_XI_SLOTS = xiRoleSlots(['OD', 'T20']);
     // The buying/keeping bar (user, 2026-11-12: 60; was 58): flat at 25 for every age
     // and role, on the workbook-aligned projection (v8.120). Set after
     // seeing Silvastrie Gannile (17, on curve) project exactly 58.
