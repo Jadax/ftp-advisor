@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         FTP Advisor
 // @namespace    http://tampermonkey.net/
-// @version      8.155
+// @version      8.156
 // @description  Tactical/scouting advisor for fromthepavilion.org (cricket sim): team, tactics, pitch, training, transfer market, youth and squad plan advice with projections. Full changelog: github.com/Jadax/ftp-advisor
 // @author       Tushant Sharma
 // @license      MIT
@@ -11264,7 +11264,7 @@ const progMap = { batting: 'batting', bowling: 'bowling', keeping: 'keeperbattin
             sections: [
                 { id: 'ftp-transfer-gaps', label: 'Squad Gaps', icon: '\u26A0', iconColor: 'amber' },
                 { id: 'ftp-transfer-scan', label: 'Market Scan', icon: '\u{1F50E}', iconColor: 'purple',
-                  content: '<div class="vj-flex vj-gap-6" style="align-items:center;flex-wrap:wrap;"><button id="ftp-market-scan" class="vj-btn vj-btn-sm" style="font-size:12px;padding:4px 10px;cursor:pointer;">\u{1F50E} Scan market: 16-19 prospects + 20-22 signings</button><span id="ftp-market-scan-status" class="vj-text-xs vj-text-muted">Runs the searches for you; results appear below.</span></div>' },
+                  content: `<div class="vj-flex vj-gap-6" style="align-items:center;flex-wrap:wrap;"><button id="ftp-market-scan" class="vj-btn vj-btn-sm" style="font-size:12px;padding:4px 10px;cursor:pointer;">\u{1F50E} Scan market: ages ${BUY_AGES_LABEL}</button><span id="ftp-market-scan-status" class="vj-text-xs vj-text-muted">Runs the searches for you; results appear below.</span></div>` },
                 { id: 'ftp-transfer-results', label: 'Search Results', icon: '\u{1F50D}', iconColor: 'green',
                   content: '<div class="vj-text-sm vj-text-muted">Search for players on the transfer form to evaluate them here.</div>' },
                 { id: 'ftp-transfer-targets', label: 'Target Thresholds', icon: '\u{1F3AF}', iconColor: 'blue', collapsible: true, collapsed: true },
