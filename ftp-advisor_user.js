@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         FTP Advisor
 // @namespace    http://tampermonkey.net/
-// @version      8.154
+// @version      8.155
 // @description  Tactical/scouting advisor for fromthepavilion.org (cricket sim): team, tactics, pitch, training, transfer market, youth and squad plan advice with projections. Full changelog: github.com/Jadax/ftp-advisor
 // @author       Tushant Sharma
 // @license      MIT
@@ -12779,7 +12779,7 @@ const progMap = { batting: 'batting', bowling: 'bowling', keeping: 'keeperbattin
         const n = p._xiCheck.filter(x => x.starts).length;
         r._startsBonus = n * STARTS_NOW_BONUS;
         if (!n) return;
-        r.score = Math.min(100, r.score + r._startsBonus);
+        r.score = Math.min(100, Math.round((r.score + r._startsBonus) * 10) / 10);
         if (Array.isArray(r.breakdown)) r.breakdown.push(`Starts in your senior XI today (${p._xiCheck.filter(x => x.starts).map(x => x.format).join(' + ')}) +${r._startsBonus}`);
     }
     function xiGroupIsSenior(age) { return joinsAsSenior(age) || ageYears(age || 0) >= TRANSFER_MUST_START_AGE; }
