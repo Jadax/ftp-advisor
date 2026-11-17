@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         FTP Advisor
 // @namespace    http://tampermonkey.net/
-// @version      8.152
+// @version      8.153
 // @description  Tactical/scouting advisor for fromthepavilion.org (cricket sim): team, tactics, pitch, training, transfer market, youth and squad plan advice with projections. Full changelog: github.com/Jadax/ftp-advisor
 // @author       Tushant Sharma
 // @license      MIT
@@ -10554,7 +10554,7 @@ const progMap = { batting: 'batting', bowling: 'bowling', keeping: 'keeperbattin
             if (proj < MIN_PROJECTION_AT_25) problems.push(`${p.name} shown projecting ${Math.round(proj)} (under ${MIN_PROJECTION_AT_25})`);
             const rr = at25RoleRank(p, allPlayers, projOpts);
             if (rr.rank > rr.cap) problems.push(`${p.name} shown as #${rr.rank} ${rr.role} (cap ${rr.cap})`);
-            if (ageYears(p.age || 0) >= TRANSFER_MUST_START_AGE && p._xiCheck && !p._xiCheck.some(x => x.starts)) problems.push(`${p.name} (${ageYears(p.age)}) shown but wouldn't start in your senior XI`);
+            if (ageYears(p.age || 0) >= TRANSFER_MUST_START_AGE && p._xiCheck && p._overallRating && p._overallRating._startsBonus !== p._xiCheck.filter(x => x.starts).length * STARTS_NOW_BONUS) problems.push(`${p.name}: starts-now bonus out of step with his XI check`);
             if (i < 25) {
                 const fresh = computePlayerCeiling(p, getAcademySpeedForPlayer(p, projOpts.academyInfo), projOpts.squadContext || {}, 25).ceiling;
                 if (Math.abs(fresh - proj) > 0.01) problems.push(`${p.name}: stored projection ${proj} vs fresh ${fresh}`);
@@ -11371,6 +11371,12 @@ const progMap = { batting: 'batting', bowling: 'bowling', keeping: 'keeperbattin
                         squadContext: squadContextForProjection,
                         seniorCeiling: dynastyCeiling
                     });
+                    // Fetched 20+ only (pre-fetch skills/talents are partial).
+                    p._xiCheck = undefined;
+                    if (ageYears(p.age || 0) >= TRANSFER_MUST_START_AGE && ((p.experience || 0) > 0 || (p.wage || 0) > 0)) {
+                        try { p._xiCheck = startingXiCheck(p, allPlayers); } catch (err) { p._xiCheck = null; }
+                        applyStartsNowBonus(p);
+                    }
                     return p;
                 }
                 // Evaluate each player against squad stats
@@ -11437,13 +11443,6 @@ const progMap = { batting: 'batting', bowling: 'bowling', keeping: 'keeperbattin
                         if (rr.rank > cap) {
                             e.eval.warnings.push(`At 25 would be your #${rr.rank} ${rr.role === 'keeping' ? 'keeper' : rr.role === 'bowling' ? 'bowler' : 'batter'} — must be top ${cap} by ${TRANSFER_UPGRADE_MARGIN}+ points`);
                             return false;
-                        }
-                        if (ageYears(e.age || 0) >= TRANSFER_MUST_START_AGE) {
-                            try { e._xiCheck = startingXiCheck(e, allPlayers); } catch (err) { e._xiCheck = null; }
-                            if (e._xiCheck && !e._xiCheck.some(x => x.starts)) {
-                                e.eval.warnings.push(`Age ${ageYears(e.age)} — wouldn't start in your senior XI today (OD or T20)`);
-                                return false;
-                            }
                         }
                     }
                     if (isYouth) return true;
@@ -11578,7 +11577,7 @@ const progMap = { batting: 'batting', bowling: 'bowling', keeping: 'keeperbattin
                     html += `<div class="vj-text-xs vj-text-muted vj-mb-8">${academyContext}</div>`;
                     const weakSenior = weakestDepartments(false, 2);
                     if (weakSenior.length) html += `<div class="vj-text-xs vj-mb-8" style="color:var(--vj-amber);">Where your seniors lose: you trail the teams that beat you most in ${weakSenior.map(w => `<b>${w.label}</b> (${Math.round(w.gap * 100)}%)`).join(' and ')} \u2014 over ${weakSenior[0].losses} losses.</div>`;
-                    html += `<div class="vj-text-xs vj-text-muted vj-mb-8">Shown: ages ${BUY_AGES_LABEL}, \u2264 $${TRANSFER_MAX_PRICE.toLocaleString()}, \u2265 ${MIN_PROJECTION_AT_25} at 25, your #1 keeper / top ${TRANSFER_MAX_AT25_RANK.batting} batter or bowler in your squad when he's 25 (your youths included), beating the player he'd replace by ${TRANSFER_UPGRADE_MARGIN}+ points — while a role has fewer than an XI's worth projecting ${MIN_PROJECTION_AT_25}+ (${TRANSFER_XI_SLOTS.batting + TRANSFER_SQUAD_COVER} batters / ${TRANSFER_XI_SLOTS.bowling + TRANSFER_SQUAD_COVER} bowlers / ${TRANSFER_XI_SLOTS.keeping + TRANSFER_SQUAD_COVER} keepers), anyone who'd make that XI plus ${TRANSFER_SQUAD_COVER} spare is shown. Aged ${TRANSFER_MUST_START_AGE}+: must also start in your senior XI today (OD or T20). Each role ranked separately, best \u2192 worst by \u2605 rating (projection at 25 from all skills, experience, talents and your academy; age; skill shape; bowler type; wage value \u2014 hover the badge for the breakdown), then projection, then cheaper bid.</div>`;
+                    html += `<div class="vj-text-xs vj-text-muted vj-mb-8">Shown: ages ${BUY_AGES_LABEL}, \u2264 $${TRANSFER_MAX_PRICE.toLocaleString()}, \u2265 ${MIN_PROJECTION_AT_25} at 25, your #1 keeper / top ${TRANSFER_MAX_AT25_RANK.batting} batter or bowler in your squad when he's 25 (your youths included), beating the player he'd replace by ${TRANSFER_UPGRADE_MARGIN}+ points — while a role has fewer than an XI's worth projecting ${MIN_PROJECTION_AT_25}+ (${TRANSFER_XI_SLOTS.batting + TRANSFER_SQUAD_COVER} batters / ${TRANSFER_XI_SLOTS.bowling + TRANSFER_SQUAD_COVER} bowlers / ${TRANSFER_XI_SLOTS.keeping + TRANSFER_SQUAD_COVER} keepers), anyone who'd make that XI plus ${TRANSFER_SQUAD_COVER} spare is shown. Aged ${TRANSFER_MUST_START_AGE}+: +${STARTS_NOW_BONUS} ★ for each format (OD, T20) he'd start in your senior XI today. Each role ranked separately, best \u2192 worst by \u2605 rating (projection at 25 from all skills, experience, talents and your academy; age; skill shape; bowler type; wage value \u2014 hover the badge for the breakdown), then projection, then cheaper bid.</div>`;
                     if (!detailsFetched) {
                         // Talents aren't shown on the transfer search table
                         // at all (game limitation \u2014 only on the player's
@@ -12762,9 +12761,22 @@ const progMap = { batting: 'batting', bowling: 'bowling', keeping: 'keeperbattin
     // candidate's aren't known. A skill-sum rank with a top-5 cut (v8.104)
     // couldn't say whether a #6 bowler beats your 5th bowling option.
     const _xiBaselineCache = new Map();
-    // 20+ buys must walk into the SENIOR XI today (user, 2026-11-17: 'for 20+
-    // year olds I'd want them to start'); youths can play senior matches.
+    // 20+ buys are checked against the SENIOR XI today (youths can play
+    // senior matches). A bonus, not a filter (user, 2026-11-17: 'I can't
+    // expect a 20 year old to replace a 25 year old … it's just better if he
+    // does'): +STARTS_NOW_BONUS per format he'd start in, added to the star
+    // itself so the list order still equals the number on the card.
     const TRANSFER_MUST_START_AGE = 20;
+    const STARTS_NOW_BONUS = 1.5;
+    function applyStartsNowBonus(p) {
+        const r = p._overallRating;
+        if (!r || r._startsBonus != null || !p._xiCheck) return;
+        const n = p._xiCheck.filter(x => x.starts).length;
+        r._startsBonus = n * STARTS_NOW_BONUS;
+        if (!n) return;
+        r.score = Math.min(100, r.score + r._startsBonus);
+        if (Array.isArray(r.breakdown)) r.breakdown.push(`Starts in your senior XI today (${p._xiCheck.filter(x => x.starts).map(x => x.format).join(' + ')}) +${r._startsBonus}`);
+    }
     function xiGroupIsSenior(age) { return joinsAsSenior(age) || ageYears(age || 0) >= TRANSFER_MUST_START_AGE; }
     function startingXiCheck(candidate, squadPlayers) {
         const senior = xiGroupIsSenior(candidate.age);
