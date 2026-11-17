@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         FTP Advisor
 // @namespace    http://tampermonkey.net/
-// @version      8.150
+// @version      8.151
 // @description  Tactical/scouting advisor for fromthepavilion.org (cricket sim): team, tactics, pitch, training, transfer market, youth and squad plan advice with projections. Full changelog: github.com/Jadax/ftp-advisor
 // @author       Tushant Sharma
 // @license      MIT
@@ -458,9 +458,11 @@
     // Weighted count of talents that actually matter for THIS player
     // (calculateRank, computeOverallRating) — a mismatched role-specific
     // talent counts 0, see isTalentRoleAligned(); Sturdy via talentWeight().
-    function alignedTalentWeight(player) {
+    const TRAINING_TALENTS = /gifted|prodigy/i;
+    function alignedTalentWeight(player, opts) {
         const primaryName = getPrimarySkillInfo(player).name;
-        return (player.talents || []).filter(t => isTalentRoleAligned(t, primaryName, player))
+        return (player.talents || []).filter(t => isTalentRoleAligned(t, primaryName, player)
+            && !(opts && opts.matchOnly && TRAINING_TALENTS.test(t)))
             .reduce((sum, t) => sum + talentWeight(t, player.age), 0);
     }
 
@@ -615,6 +617,7 @@
         const primaryInfo = getPrimarySkillInfo(player);
         const entry = {
             t: Date.now(),
+            id: player.id != null ? String(player.id) : undefined,
             role: primaryInfo.name, // 'batting' | 'bowling' | 'keeping'
             isYouth: (player.age || 0) < 21,
             age: ageYears(player.age || 0), // v8.57 — pricing scales hugely with age (a 16yo and a 20yo are NOT the same market), so anchors must bucket by age band too; ageYears (floor) so the band matches the player's displayed age-year
@@ -627,7 +630,9 @@
             let hist = loadPriceHistory();
             // Keep only recent entries (60 days) to bound growth
             const cutoff = Date.now() - 60 * 24 * 60 * 60 * 1000;
-            hist = hist.filter(e => e.t >= cutoff);
+            // One entry per listing (latest wins): every render re-records the
+            // whole list, which weighted the median toward whoever was seen most.
+            hist = hist.filter(e => e.t >= cutoff && !(entry.id && e.id === entry.id));
             hist.push(entry);
             if (hist.length > TRANSFER_PRICE_MAX) {
                 hist = hist.slice(hist.length - TRANSFER_PRICE_MAX);
@@ -642,6 +647,7 @@
     // recorded QUALITY (skill-sum) of those listings, so computeFairPrice can
     // scale the price anchor to a specific candidate's quality rather than
     // treating every listing of that archetype as worth the same.
+    const FAIR_PRICE_MIN_LISTINGS = 5;
     function anchorPriceForPlayer(player) {
         if (!player) return null;
         const primaryInfo = getPrimarySkillInfo(player);
@@ -656,17 +662,22 @@
         // out of the 60-day window. Newer entries match the candidate's own
         // rounded age within tolerance.
         const byAge = (e, tol) => e.age == null || Math.abs(e.age - age) <= tol;
-        let matches = loadPriceHistory().filter(e => base(e) && byAge(e, 1) && Math.abs(e.primary - primary) <= 1);
+        // Legacy entries have no id: collapse identical re-recordings.
+        const seen = new Map();
+        loadPriceHistory().forEach(e => seen.set(e.id || [e.role, e.age, e.primary, e.sum, e.price, e.wage].join('|'), e));
+        const hist = [...seen.values()];
+        let matches = hist.filter(e => base(e) && byAge(e, 1) && Math.abs(e.primary - primary) <= 1);
         // Slide both the primary range and the age tolerance wider if too few
-        if (matches.length < 3) {
-            matches = loadPriceHistory().filter(e => base(e) && byAge(e, 2) && Math.abs(e.primary - primary) <= 2);
+        if (matches.length < FAIR_PRICE_MIN_LISTINGS) {
+            matches = hist.filter(e => base(e) && byAge(e, 2) && Math.abs(e.primary - primary) <= 2);
         }
-        if (matches.length === 0) return null;
+        // Two listings gave Arubi a '$441,860' fair price (live 2026-11-17).
+        if (matches.length < FAIR_PRICE_MIN_LISTINGS) return null;
+        const q = (arr, f) => { const i = (arr.length - 1) * f, lo = Math.floor(i); return arr[lo] + (arr[Math.ceil(i)] - arr[lo]) * (i - lo); };
         const prices = matches.map(e => e.price).sort((a, b) => a - b);
-        const mid = i => prices[Math.floor(prices.length * i)];
         const sums = matches.map(e => e.sum).filter(s => s > 0).sort((a, b) => a - b);
-        const sumMed = sums.length ? sums[Math.floor(sums.length / 2)] : null;
-        return { count: prices.length, lo: mid(0.25), med: mid(0.5), hi: mid(0.75), sumMed };
+        const sumMed = sums.length ? q(sums, 0.5) : null;
+        return { count: prices.length, lo: q(prices, 0.25), med: q(prices, 0.5), hi: q(prices, 0.75), sumMed };
     }
 
     // "What should I pay" — the price-aware half of the overall-rating pair.
@@ -1055,10 +1066,12 @@
             valueScore = 6; // wage unknown — neutral, don't punish
         }
 
-        // 5) Talent bonus (0-5) — role-aligned talents add real upside
-        //    already counted in skill-sum, but reward a meaningful talent
-        //    set explicitly here.
-        const talentScore = Math.min(5, alignedTalentWeight(player) * 1.5);
+        // 5) Talent bonus (0-5) — in-match talents only. Gifted/Prodigy are
+        //    training speed (manual), already inside the to-25 projection in
+        //    quality; counting them here too ranked an Expert/Expert Prodigy
+        //    20y14w above an Outstanding/Outstanding 21yo with the same
+        //    projection, and gave a 22yo +1.5 for a youth-only talent.
+        const talentScore = Math.min(5, alignedTalentWeight(player, { matchOnly: true }) * 1.5);
         // Bowlers only, centred on 0 so batters/keepers are unchanged.
         const fit = bowlerTypeFit(player);
         const cls = fit ? paceClass(player.bowlerType) : null;
