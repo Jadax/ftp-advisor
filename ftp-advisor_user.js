@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         FTP Advisor
 // @namespace    http://tampermonkey.net/
-// @version      8.151
+// @version      8.152
 // @description  Tactical/scouting advisor for fromthepavilion.org (cricket sim): team, tactics, pitch, training, transfer market, youth and squad plan advice with projections. Full changelog: github.com/Jadax/ftp-advisor
 // @author       Tushant Sharma
 // @license      MIT
@@ -46,8 +46,6 @@
     //   PLAYER RATINGS:           computePlayerValueSkillSum,
     //       computePlayerValuePerK, computeSpareRating, computeOverallRating,
     //       computePlayerCeiling, weeksToAge20, weeksToAge, classifyProjectedPrimary
-    //   MARKET PRICING:           loadPriceHistory, recordPlayerPrice,
-    //       anchorPriceForPlayer, computeFairPrice, fairPriceLine
     //   CACHE & PAGE ROUTING:     _saveCache/_loadCacheWithAge,
     //       savePlayerCache/loadPlayerCache, isStale, detectPageType,
     //       fetchAllData, _loadCacheRaw
@@ -169,8 +167,8 @@
     // skill), so future searches can anchor a candidate's asking price against
     // "similar archetypes this club has actually seen listed for". Kept small
     // and pruned — this is a rough value anchor, not a full market database.
-    const TRANSFER_PRICE_KEY = 'ftp_transfer_price_history';
-    const TRANSFER_PRICE_MAX = 400; // cap stored entries to bound GM storage
+    // Fair-price ledger removed v8.152 (user: arbitrary); clear its storage.
+    try { GM_deleteValue('ftp_transfer_price_history'); } catch (e) { /* GM_deleteValue may be absent */ }
 
     // Pasted-match history — every match run through the Match Review paste
     // box is kept (parsed scorecard only, no HTML) so the tactics/ground
@@ -595,117 +593,6 @@
         return `<span class="ftp-stat-badge neutral" title="Rating broadly matches visible skills." style="font-size:9px;cursor:help;">\u27A1 Fair value</span>`;
     }
 
-    // ── Transfer price-history ledger (local comparable-pricing anchor) ──
-    // Records every transfer candidate seen, keyed by (role, age-band,
-    // primary skill), so subsequent searches can say "players like this are
-    // typically listed around $X and have sold here before." Records persist
-    // in GM storage between sessions — a lightweight stand-in for a server
-    // market archive. Entries are cheap {t, primary, isYouth, age, sum, role,
-    // price} and capped at TRANSFER_PRICE_MAX (age/sum added v8.57 so fair
-    // prices can be age-banded and quality-scaled).
-    function loadPriceHistory() {
-        try {
-            const raw = GM_getValue(TRANSFER_PRICE_KEY, null);
-            return raw ? JSON.parse(raw) : [];
-        } catch (e) { return []; }
-    }
-
-    function recordPlayerPrice(player) {
-        if (!player) return;
-        const price = player.price || 0;
-        if (price <= 0 && !(player.wage > 0)) return; // nothing meaningful to record
-        const primaryInfo = getPrimarySkillInfo(player);
-        const entry = {
-            t: Date.now(),
-            id: player.id != null ? String(player.id) : undefined,
-            role: primaryInfo.name, // 'batting' | 'bowling' | 'keeping'
-            isYouth: (player.age || 0) < 21,
-            age: ageYears(player.age || 0), // v8.57 — pricing scales hugely with age (a 16yo and a 20yo are NOT the same market), so anchors must bucket by age band too; ageYears (floor) so the band matches the player's displayed age-year
-            primary: primaryInfo.value,
-            sum: computePlayerValueSkillSum(player), // visible-quality baseline so computeFairPrice can scale the anchor to a specific candidate (visible only — talents aren't in the transfer list scrape)
-            price: price || 0,
-            wage: player.wage || 0
-        };
-        try {
-            let hist = loadPriceHistory();
-            // Keep only recent entries (60 days) to bound growth
-            const cutoff = Date.now() - 60 * 24 * 60 * 60 * 1000;
-            // One entry per listing (latest wins): every render re-records the
-            // whole list, which weighted the median toward whoever was seen most.
-            hist = hist.filter(e => e.t >= cutoff && !(entry.id && e.id === entry.id));
-            hist.push(entry);
-            if (hist.length > TRANSFER_PRICE_MAX) {
-                hist = hist.slice(hist.length - TRANSFER_PRICE_MAX);
-            }
-            GM_setValue(TRANSFER_PRICE_KEY, JSON.stringify(hist));
-        } catch (e) { /* non-fatal; ignore storage failures */ }
-    }
-
-    // Returns { count, lo, med, hi, sumMed } of like-archetype listings we've
-    // seen, or null when there's no data. Buckets by role + age band + primary
-    // skill within ±1 (sliding wider when sparse). `sumMed` is the median
-    // recorded QUALITY (skill-sum) of those listings, so computeFairPrice can
-    // scale the price anchor to a specific candidate's quality rather than
-    // treating every listing of that archetype as worth the same.
-    const FAIR_PRICE_MIN_LISTINGS = 5;
-    function anchorPriceForPlayer(player) {
-        if (!player) return null;
-        const primaryInfo = getPrimarySkillInfo(player);
-        const role = primaryInfo.name;
-        const isYouth = (player.age || 0) < 21;
-        const age = ageYears(player.age || 0);
-        const primary = primaryInfo.value;
-        const cutoff = Date.now() - 60 * 24 * 60 * 60 * 1000;
-        const base = (e) => e.t >= cutoff && e.role === role && e.isYouth === isYouth && e.price > 0;
-        // Legacy entries saved before v8.57 have no `age` — match them at any
-        // age (coarser but same role/age-group archetype) until they expire
-        // out of the 60-day window. Newer entries match the candidate's own
-        // rounded age within tolerance.
-        const byAge = (e, tol) => e.age == null || Math.abs(e.age - age) <= tol;
-        // Legacy entries have no id: collapse identical re-recordings.
-        const seen = new Map();
-        loadPriceHistory().forEach(e => seen.set(e.id || [e.role, e.age, e.primary, e.sum, e.price, e.wage].join('|'), e));
-        const hist = [...seen.values()];
-        let matches = hist.filter(e => base(e) && byAge(e, 1) && Math.abs(e.primary - primary) <= 1);
-        // Slide both the primary range and the age tolerance wider if too few
-        if (matches.length < FAIR_PRICE_MIN_LISTINGS) {
-            matches = hist.filter(e => base(e) && byAge(e, 2) && Math.abs(e.primary - primary) <= 2);
-        }
-        // Two listings gave Arubi a '$441,860' fair price (live 2026-11-17).
-        if (matches.length < FAIR_PRICE_MIN_LISTINGS) return null;
-        const q = (arr, f) => { const i = (arr.length - 1) * f, lo = Math.floor(i); return arr[lo] + (arr[Math.ceil(i)] - arr[lo]) * (i - lo); };
-        const prices = matches.map(e => e.price).sort((a, b) => a - b);
-        const sums = matches.map(e => e.sum).filter(s => s > 0).sort((a, b) => a - b);
-        const sumMed = sums.length ? q(sums, 0.5) : null;
-        return { count: prices.length, lo: q(prices, 0.25), med: q(prices, 0.5), hi: q(prices, 0.75), sumMed };
-    }
-
-    // "What should I pay" — the price-aware half of the overall-rating pair.
-    // computeOverallRating() is deliberately price-independent (so it works
-    // identically for owned players who have no price); THIS function answers
-    // the market-only question, scaled from the local price-history ledger's
-    // anchor by how this candidate's quality compares to the archetype's
-    // typical quality (a player well above the usual skill level of similar
-    // listings is worth more than the raw median). Returns { fair, lo, hi,
-    // count } or null when there's no usable comparable data yet.
-    function computeFairPrice(player) {
-        if (!player) return null;
-        const anchor = anchorPriceForPlayer(player);
-        if (!anchor) return null;
-        // Scale by quality ratio when the ledger knows the archetype's typical
-        // quality; fall back to the raw anchor median for legacy entries that
-        // predate the sum field. Clamped so an extreme outlier can't produce a
-        // ludicrous fair price (0.5x-2x the archetype median).
-        const candidateQuality = computePlayerValueSkillSum(player);
-        const ratio = anchor.sumMed ? Math.max(0.5, Math.min(2, candidateQuality / anchor.sumMed)) : 1;
-        return {
-            fair: anchor.med * ratio,
-            lo: anchor.lo * ratio,
-            hi: anchor.hi * ratio,
-            count: anchor.count
-        };
-    }
-
     // Transfer list order = the ★ shown on the card (user, 2026-11-13: "the
     // one at the top is the best … going down like that"). v8.116-v8.139
     // added a price nudge and rank/starts bonuses, which put a cheaper
@@ -730,20 +617,6 @@
     }
     function bestBuyScore(player) {
         return (player._overallRating && player._overallRating.score) || 0;
-    }
-
-    function fairPriceLine(player) {
-        const fp = computeFairPrice(player);
-        if (!fp) return '';
-        const asking = player.price || 0;
-        const ratio = asking > 0 ? asking / fp.fair : 0;
-        let tag = '', color = 'var(--vj-text-muted)';
-        if (asking <= 0) tag = 'no asking price yet';
-        else if (ratio <= 0.85) { tag = 'below market — good deal'; color = 'var(--vj-green)'; }
-        else if (ratio >= 1.15) { tag = 'above market — negotiate or pass'; color = 'var(--vj-red)'; }
-        else tag = 'at market';
-        const range = fp.count >= 6 ? ` ($${Math.round(fp.lo).toLocaleString()}–$${Math.round(fp.hi).toLocaleString()})` : '';
-        return `<div class="vj-text-xs" style="color:${color};line-height:1.4;margin-top:2px;">\u2696 Fair price ~$${Math.round(fp.fair).toLocaleString()}${range} (${fp.count} similar seen)${asking > 0 ? ` \u00B7 asking $${asking.toLocaleString()} \u2192 ${tag}` : ''}</div>`;
     }
 
     // Weeks until this player turns 20 — the youth promotion boundary.
@@ -896,9 +769,7 @@
     //     Buy Rating did (v8.49), and it made the score swing wildly with the
     //     asking price (a $5k vs $50k listing of near-equal quality differed
     //     by ~10 points purely on cost) while saying nothing useful to an
-    //     owner. Instead: this rating = quality of the player, and
-    //     computeFairPrice() (see the price-ledger block above) = "what
-    //     should I actually pay" for a market player.
+    //     owner. Instead: this rating = quality of the player only.
     //
     // One horizon for EVERY age (v8.59 standardization, per the user):
     // quality is the projected skill-sum at age 25 — a 21yo senior is
@@ -1050,9 +921,8 @@
 
         // 4) Value for money (0-15). Quality (skill) per $1k of the real
         //    (discount-adjusted) wage. Cheap+skilled = excellent value.
-        //    NOTE: uses WAGE only — the one-time transfer price is handled
-        //    by computeFairPrice() (see the price-ledger block), not folded
-        //    into the rating, so owned players (no price) and market
+        //    NOTE: uses WAGE only — the one-time transfer price is never
+        //    folded into the rating, so owned players (no price) and market
         //    candidates are rated on the same scale.
         let valueScore = 0;
         const vpk = computePlayerValuePerK(player);
@@ -1094,7 +964,7 @@
         // to-25 projection for every age, age comes from one shared curve,
         // and value/dist/talent are player facts that don't change which
         // squad a player is in. No price, no squad-fit terms — those are
-        // market decisions (computeFairPrice / comparePlayerToSquadPeers),
+        // market decisions (bid cap / comparePlayerToSquadPeers),
         // not player-quality, and leaving them out is what lets this one
         // number be shown identically for an owned player and a market
         // candidate. A curve-meeting youth can now legitimately outrank an
@@ -3989,7 +3859,7 @@
     // page, `page` is 0-based. Targets = the user's buying plan (2026-11:
     // "youth 16-18, senior 20-21 only, I don't want to buy anyone else"),
     // each split by role so the server-side skill filter does the first cut.
-    const TRANSFER_BUY_AGES = [[16, 19], [20, 22]];
+    const TRANSFER_BUY_AGES = [[16, 22]]; // user 2026-11-17
     const BUY_AGES_LABEL = TRANSFER_BUY_AGES.map(([a, b]) => `${a}-${b}`).join(' / ');
     function buyAgeAllowed(age) {
         const y = ageYears(age);
@@ -10684,6 +10554,7 @@ const progMap = { batting: 'batting', bowling: 'bowling', keeping: 'keeperbattin
             if (proj < MIN_PROJECTION_AT_25) problems.push(`${p.name} shown projecting ${Math.round(proj)} (under ${MIN_PROJECTION_AT_25})`);
             const rr = at25RoleRank(p, allPlayers, projOpts);
             if (rr.rank > rr.cap) problems.push(`${p.name} shown as #${rr.rank} ${rr.role} (cap ${rr.cap})`);
+            if (ageYears(p.age || 0) >= TRANSFER_MUST_START_AGE && p._xiCheck && !p._xiCheck.some(x => x.starts)) problems.push(`${p.name} (${ageYears(p.age)}) shown but wouldn't start in your senior XI`);
             if (i < 25) {
                 const fresh = computePlayerCeiling(p, getAcademySpeedForPlayer(p, projOpts.academyInfo), projOpts.squadContext || {}, 25).ceiling;
                 if (Math.abs(fresh - proj) > 0.01) problems.push(`${p.name}: stored projection ${proj} vs fresh ${fresh}`);
@@ -11567,6 +11438,13 @@ const progMap = { batting: 'batting', bowling: 'bowling', keeping: 'keeperbattin
                             e.eval.warnings.push(`At 25 would be your #${rr.rank} ${rr.role === 'keeping' ? 'keeper' : rr.role === 'bowling' ? 'bowler' : 'batter'} — must be top ${cap} by ${TRANSFER_UPGRADE_MARGIN}+ points`);
                             return false;
                         }
+                        if (ageYears(e.age || 0) >= TRANSFER_MUST_START_AGE) {
+                            try { e._xiCheck = startingXiCheck(e, allPlayers); } catch (err) { e._xiCheck = null; }
+                            if (e._xiCheck && !e._xiCheck.some(x => x.starts)) {
+                                e.eval.warnings.push(`Age ${ageYears(e.age)} — wouldn't start in your senior XI today (OD or T20)`);
+                                return false;
+                            }
+                        }
                     }
                     if (isYouth) return true;
                     // Hard filters (base + senior minimums, age-specific) drop a
@@ -11662,10 +11540,6 @@ const progMap = { batting: 'batting', bowling: 'bowling', keeping: 'keeperbattin
                 priorityBuys.forEach(p => { p._rankLines = squadRankLines(p, allPlayers, projOpts); });
 
 
-                // Record every candidate's price into the local price-history
-                // ledger so future searches can anchor asking prices against
-                // "similar listings this club has seen before."
-                evaluated.forEach(p => recordPlayerPrice(p));
 
                 // Sort: best OVERALL RATING first (the price-independent
                 // "how good is this player" verdict), then verdict/rank/price
@@ -11704,7 +11578,7 @@ const progMap = { batting: 'batting', bowling: 'bowling', keeping: 'keeperbattin
                     html += `<div class="vj-text-xs vj-text-muted vj-mb-8">${academyContext}</div>`;
                     const weakSenior = weakestDepartments(false, 2);
                     if (weakSenior.length) html += `<div class="vj-text-xs vj-mb-8" style="color:var(--vj-amber);">Where your seniors lose: you trail the teams that beat you most in ${weakSenior.map(w => `<b>${w.label}</b> (${Math.round(w.gap * 100)}%)`).join(' and ')} \u2014 over ${weakSenior[0].losses} losses.</div>`;
-                    html += `<div class="vj-text-xs vj-text-muted vj-mb-8">Shown: ages ${BUY_AGES_LABEL}, \u2264 $${TRANSFER_MAX_PRICE.toLocaleString()}, \u2265 ${MIN_PROJECTION_AT_25} at 25, your #1 keeper / top ${TRANSFER_MAX_AT25_RANK.batting} batter or bowler in your squad when he's 25 (your youths included), beating the player he'd replace by ${TRANSFER_UPGRADE_MARGIN}+ points — while a role has fewer than an XI's worth projecting ${MIN_PROJECTION_AT_25}+ (${TRANSFER_XI_SLOTS.batting + TRANSFER_SQUAD_COVER} batters / ${TRANSFER_XI_SLOTS.bowling + TRANSFER_SQUAD_COVER} bowlers / ${TRANSFER_XI_SLOTS.keeping + TRANSFER_SQUAD_COVER} keepers), anyone who'd make that XI plus ${TRANSFER_SQUAD_COVER} spare is shown. Each role ranked separately, best \u2192 worst by \u2605 rating (projection at 25 from all skills, experience, talents and your academy; age; skill shape; bowler type; wage value \u2014 hover the badge for the breakdown), then projection, then cheaper bid.</div>`;
+                    html += `<div class="vj-text-xs vj-text-muted vj-mb-8">Shown: ages ${BUY_AGES_LABEL}, \u2264 $${TRANSFER_MAX_PRICE.toLocaleString()}, \u2265 ${MIN_PROJECTION_AT_25} at 25, your #1 keeper / top ${TRANSFER_MAX_AT25_RANK.batting} batter or bowler in your squad when he's 25 (your youths included), beating the player he'd replace by ${TRANSFER_UPGRADE_MARGIN}+ points — while a role has fewer than an XI's worth projecting ${MIN_PROJECTION_AT_25}+ (${TRANSFER_XI_SLOTS.batting + TRANSFER_SQUAD_COVER} batters / ${TRANSFER_XI_SLOTS.bowling + TRANSFER_SQUAD_COVER} bowlers / ${TRANSFER_XI_SLOTS.keeping + TRANSFER_SQUAD_COVER} keepers), anyone who'd make that XI plus ${TRANSFER_SQUAD_COVER} spare is shown. Aged ${TRANSFER_MUST_START_AGE}+: must also start in your senior XI today (OD or T20). Each role ranked separately, best \u2192 worst by \u2605 rating (projection at 25 from all skills, experience, talents and your academy; age; skill shape; bowler type; wage value \u2014 hover the badge for the breakdown), then projection, then cheaper bid.</div>`;
                     if (!detailsFetched) {
                         // Talents aren't shown on the transfer search table
                         // at all (game limitation \u2014 only on the player's
@@ -11838,10 +11712,9 @@ const progMap = { batting: 'batting', bowling: 'bowling', keeping: 'keeperbattin
                                     return `<div class="vj-text-xs vj-text-muted" style="margin-top:2px;">${p.bowlerType && r.role === 'bowling' ? p.bowlerType.toUpperCase() + ' ' : ''}${role} \u00B7 ${primaryName} ${skillLabel(primarySkill)} \u00B7 Tech ${skillLabel(p.technique)}${p.price ? ` \u00B7 $${p.price.toLocaleString()}` : ''}${p.wage ? ` \u00B7 wage $${p.wage.toLocaleString()}/wk` : ''}</div>
                                         ${p.deadlineTs ? `<div class="vj-text-xs vj-fw-700" style="margin-top:2px;color:${p.deadlineTs - Date.now() < 6 * 3600e3 ? 'var(--vj-red)' : 'var(--vj-text)'};">\u23F1 ${deadlineText(p.deadlineTs)}</div>` : ''}
                                         <div class="vj-text-xs" style="margin-top:2px;color:${r.xi ? (startsNow ? 'var(--vj-green)' : 'var(--vj-text-muted)') : col(r.nowRank)};"><b>Now:</b> #${r.nowRank} of ${r.nowOf} ${r.nowGroup} ${role}s${r.xi ? '' : xi(r.nowRank)}${r.seniorSoon != null ? ` <span class="vj-text-muted">(turns 21 in ${r.seniorSoon} wk${r.seniorSoon === 1 ? '' : 's'} — a senior buy)</span>` : ''}${pending}</div>
-                                        ${r.xi ? `<div class="vj-text-xs" style="margin-top:1px;"><b>Starts in your ${r.nowGroup} XI today:</b> ${xiLine}</div>` : ''}
+                                        ${r.xi ? `<div class="vj-text-xs" style="margin-top:1px;"><b>Starts in your ${r.xiGroup} XI today:</b> ${xiLine}</div>` : ''}
                                         <div class="vj-text-xs" style="margin-top:1px;color:${col(r.at25Rank)};"><b>At 25:</b> #${r.at25Rank} of ${r.at25Of} ${role}s in your squad then${xi(r.at25Rank)} <span class="vj-text-muted">(proj ${r.proj})</span></div>`;
                                 })()}
-                                ${fairPriceLine(p)}
                                 <details style="margin-top:2px;"><summary class="vj-text-xs vj-text-muted" style="cursor:pointer;">Details</summary>
                                 <div class="vj-text-xs vj-text-muted" style="line-height:1.4;margin-top:2px;">
                                     ${detailParts.join(' \u00B7 ')}
@@ -12889,8 +12762,12 @@ const progMap = { batting: 'batting', bowling: 'bowling', keeping: 'keeperbattin
     // candidate's aren't known. A skill-sum rank with a top-5 cut (v8.104)
     // couldn't say whether a #6 bowler beats your 5th bowling option.
     const _xiBaselineCache = new Map();
+    // 20+ buys must walk into the SENIOR XI today (user, 2026-11-17: 'for 20+
+    // year olds I'd want them to start'); youths can play senior matches.
+    const TRANSFER_MUST_START_AGE = 20;
+    function xiGroupIsSenior(age) { return joinsAsSenior(age) || ageYears(age || 0) >= TRANSFER_MUST_START_AGE; }
     function startingXiCheck(candidate, squadPlayers) {
-        const senior = joinsAsSenior(candidate.age);
+        const senior = xiGroupIsSenior(candidate.age);
         const neutral = p => ({ ...p, fatigue: 10, form: 5, talents: p.talents || [] });
         const group = squadPlayers.filter(p => p.name !== candidate.name && !(candidate.id != null && p.id === candidate.id)
             && isYouthAge(p.age) !== senior).map(neutral);
@@ -12967,7 +12844,8 @@ const progMap = { batting: 'batting', bowling: 'bowling', keeping: 'keeperbattin
             at25Of: at25.of,
             proj: Math.round(cand.ceiling),
             seniorSoon: isYouthAge(candidate.age) && !youth ? weeksToAge(candidate.age, 21) : null,
-            xi: (() => { try { return startingXiCheck(candidate, squadPlayers); } catch (e) { console.warn('[FTP Transfer] XI check failed', e); return null; } })()
+            xiGroup: xiGroupIsSenior(candidate.age) ? 'senior' : 'youth',
+            xi: candidate._xiCheck || (() => { try { return startingXiCheck(candidate, squadPlayers); } catch (e) { console.warn('[FTP Transfer] XI check failed', e); return null; } })()
         };
     }
 
