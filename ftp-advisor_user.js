@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         FTP Advisor
 // @namespace    http://tampermonkey.net/
-// @version      8.153
+// @version      8.154
 // @description  Tactical/scouting advisor for fromthepavilion.org (cricket sim): team, tactics, pitch, training, transfer market, youth and squad plan advice with projections. Full changelog: github.com/Jadax/ftp-advisor
 // @author       Tushant Sharma
 // @license      MIT
@@ -879,7 +879,7 @@
         // ~40 (ordinary senior) to ~75 (16yo Prodigy Expert bat): the old
         // 1:1 cap at 55, and a later 70, both tied the best youth prospects
         // at the maximum — exactly the players the user buys.
-        const qualityScore = Math.max(0, Math.min(55, qualityRef * 55 / 80));
+        const qualityScore = Math.max(0, Math.min(55, qualityRef * STAR_PER_PROJECTION_POINT));
 
         // 2) Age/trajectory factor (0-10) — ONE continuous lifecycle curve
         //    for EVERY age (v8.65). The old two-curve split (youth declining
@@ -12764,10 +12764,15 @@ const progMap = { batting: 'batting', bowling: 'bowling', keeping: 'keeperbattin
     // 20+ buys are checked against the SENIOR XI today (youths can play
     // senior matches). A bonus, not a filter (user, 2026-11-17: 'I can't
     // expect a 20 year old to replace a 25 year old … it's just better if he
-    // does'): +STARTS_NOW_BONUS per format he'd start in, added to the star
-    // itself so the list order still equals the number on the card.
+    // does'), added to the star so list order = the number on the card.
+    // Sized so starting in BOTH formats stays just under what a
+    // TRANSFER_UPGRADE_MARGIN projection gap is worth: it decides near-ties
+    // (gaps we treat as noise) but never beats a player projecting 2+ higher
+    // at 25 (user: a non-starter can still be the better buy at 25).
+    const TRANSFER_UPGRADE_MARGIN = 2;
+    const STAR_PER_PROJECTION_POINT = 55 / 80; // ★ quality term: full 55 at an 80 projection
     const TRANSFER_MUST_START_AGE = 20;
-    const STARTS_NOW_BONUS = 1.5;
+    const STARTS_NOW_BONUS = Math.floor(TRANSFER_UPGRADE_MARGIN * STAR_PER_PROJECTION_POINT / 2 * 0.85 * 100) / 100; // 0.85: the quality term is rounded to 0.1, so a 2-point gap can show as only 1.3
     function applyStartsNowBonus(p) {
         const r = p._overallRating;
         if (!r || r._startsBonus != null || !p._xiCheck) return;
@@ -12816,7 +12821,6 @@ const progMap = { batting: 'batting', bowling: 'bowling', keeping: 'keeperbattin
     // A buy must beat the player he'd displace by this many points at 25 —
     // 1-point gaps are inside the projection's error (user, 2026-11-16:
     // Sanson/Laggan 66 vs Tete 65 are not upgrades).
-    const TRANSFER_UPGRADE_MARGIN = 2;
     // Rank of a to-25 projection among the future squad of his role. A peer
     // counts as ahead unless the candidate beats him by the margin.
     // cap: normally TRANSFER_MAX_AT25_RANK, but while the role has fewer
