@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         FTP Advisor
 // @namespace    http://tampermonkey.net/
-// @version      8.156
+// @version      8.157
 // @description  Tactical/scouting advisor for fromthepavilion.org (cricket sim): team, tactics, pitch, training, transfer market, youth and squad plan advice with projections. Full changelog: github.com/Jadax/ftp-advisor
 // @author       Tushant Sharma
 // @license      MIT
@@ -12959,6 +12959,13 @@ const progMap = { batting: 'batting', bowling: 'bowling', keeping: 'keeperbattin
         // inside the rating) so the training simulation still runs once per
         // render.
         const overallRating = computeOverallRating(player, { academySpeed, squadContext, seniorCeiling: dynastyCeiling });
+        // Another club's player: same starts-now bonus as his transfer card,
+        // so the two views show one star (live: Workman 68.1 here vs 69.3).
+        if (player.id != null && !squadPlayers.some(p => String(p.id) === String(player.id)) && ageYears(player.age || 0) >= TRANSFER_MUST_START_AGE) {
+            player._overallRating = overallRating;
+            try { player._xiCheck = startingXiCheck(player, squadPlayers); } catch (e) { player._xiCheck = null; }
+            applyStartsNowBonus(player);
+        }
 
         let html = `<div class="vj-flex-between vj-mb-4">
                 <span class="vj-fw-700" style="font-size:14px;">${player.name} <span class="vj-text-xs vj-text-muted">(${formatAgeDisplay(player.age)}yo)</span></span>
