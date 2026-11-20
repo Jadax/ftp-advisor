@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         FTP Advisor
 // @namespace    http://tampermonkey.net/
-// @version      8.158
+// @version      8.159
 // @description  Tactical/scouting advisor for fromthepavilion.org (cricket sim): team, tactics, pitch, training, transfer market, youth and squad plan advice with projections. Full changelog: github.com/Jadax/ftp-advisor
 // @author       Tushant Sharma
 // @license      MIT
@@ -3595,7 +3595,7 @@
             at25Rank: r ? r.at25Rank : null,
             nowRank: r ? r.nowRank : null, nowOf: r ? r.nowOf : null, nowGroup: r ? r.nowGroup : null, xiGroup: r ? r.xiGroup : null,
             xiNow: r && r.xi ? r.xi.filter(x => x.starts).map(x => x.format).join('+') : null,
-            seasons: r && r.seasons ? r.seasons.map(x => [x.age, x.inXi ? 1 : 0]) : null,
+            seasons: r && r.seasons ? r.seasons.map(x => [x.age, x.inXi ? 1 : 0, x.now ? 1 : 0]) : null,
             star: p._overallRating ? Math.round(p._overallRating.score * 10) / 10 : null,
             price: p.price || 0, deadlineTs: p.deadlineTs || (prev && prev.deadlineTs) || 0, clockV: 2,
             addedAt: (prev && prev.addedAt) || Date.now(), seenAt: Date.now()
@@ -3655,7 +3655,7 @@
                 <span style="display:flex;align-items:center;gap:4px;">${badge}<button class="ftp-sl-remove" data-sl="${escapeHtml(e.id)}" title="Remove from shortlist" style="border:none;background:none;cursor:pointer;font-size:14px;">\u2715</button></span></div>
                 <div class="vj-text-xs vj-text-muted">${e.bowlerType && e.role === 'bowling' ? e.bowlerType.toUpperCase() + ' ' : ''}${ROLE[e.role] || e.role} \u00B7 ${skillLabel(e.primary)}${e.star != null ? ` \u00B7 \u2605 ${e.star}` : ''}</div>
                 ${e.nowRank != null && !e.boughtAt ? `<div class="vj-text-xs"><b>Now:</b> #${e.nowRank} of ${e.nowOf} ${e.nowGroup} ${ROLE[e.role] || e.role}s${e.xiNow != null ? ` \u00B7 ${e.xiNow ? `<span style="color:var(--vj-green);">starts in your ${e.xiGroup || ''} XI (${e.xiNow})</span>` : `<span class="vj-text-muted">not in your ${e.xiGroup || ''} XI today</span>`}` : ''}</div>` : ''}
-                ${e.seasons && e.seasons.length > 1 && !e.boughtAt ? `<div class="vj-text-xs"><b>In your XI each season:</b> ${e.seasons.map(([a, inXi], i) => `<span style="color:${inXi ? 'var(--vj-green)' : 'var(--vj-text-muted)'};">${i === 0 ? 'now' : a} ${inXi ? '\u2713' : '\u2717'}</span>`).join(' \u00B7 ')}</div>` : ''}
+                ${e.seasons && e.seasons.length && !(e.seasons.length === 1 && e.seasons[0][2]) && !e.boughtAt ? `<div class="vj-text-xs"><b>In your senior XI each season:</b> ${e.seasons.map(([a, inXi, isNow]) => `<span style="color:${inXi ? 'var(--vj-green)' : 'var(--vj-text-muted)'};">${isNow ? 'now' : a} ${inXi ? '\u2713' : '\u2717'}</span>`).join(' \u00B7 ')}</div>` : ''}
                 ${e.proj != null ? `<div class="vj-text-xs"><b>At 25:</b> proj ${e.proj}${e.boughtAt ? '' : e.at25Rank ? ` \u00B7 <span style="${e.at25Rank > (e.at25Cap || TRANSFER_MAX_AT25_RANK[e.role] || 3) ? 'color:var(--vj-red);font-weight:700;' : ''}">#${e.at25Rank} in your side then${e.aheadOf && e.aheadOf.length ? ' \u2014 behind ' + e.aheadOf.join(', ') : ''}</span>` : ''}</div>` : ''}
                 <div class="vj-text-xs" style="color:${ended ? 'var(--vj-text-muted)' : soon ? 'var(--vj-red)' : 'var(--vj-text)'};">\u23F1 ${e.deadlineTs ? deadlineText(e.deadlineTs) : 'deadline unknown'} \u00B7 bid $${(e.price || 0).toLocaleString()} <span class="vj-text-muted">(as of ${new Date(e.seenAt || e.addedAt).toLocaleString(undefined, { day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit' })})</span></div>
             </div>`;
@@ -11720,7 +11720,7 @@ const progMap = { batting: 'batting', bowling: 'bowling', keeping: 'keeperbattin
                                         ${p.deadlineTs ? `<div class="vj-text-xs vj-fw-700" style="margin-top:2px;color:${p.deadlineTs - Date.now() < 6 * 3600e3 ? 'var(--vj-red)' : 'var(--vj-text)'};">\u23F1 ${deadlineText(p.deadlineTs)}</div>` : ''}
                                         <div class="vj-text-xs" style="margin-top:2px;color:${r.xi ? (startsNow ? 'var(--vj-green)' : 'var(--vj-text-muted)') : col(r.nowRank)};"><b>Now:</b> #${r.nowRank} of ${r.nowOf} ${r.nowGroup} ${role}s${r.xi ? '' : xi(r.nowRank)}${r.seniorSoon != null ? ` <span class="vj-text-muted">(turns 21 in ${r.seniorSoon} wk${r.seniorSoon === 1 ? '' : 's'} — a senior buy)</span>` : ''}${pending}</div>
                                         ${r.xi ? `<div class="vj-text-xs" style="margin-top:1px;"><b>Starts in your ${r.xiGroup} XI today:</b> ${xiLine}</div>` : ''}
-                                        ${r.seasons && r.seasons.length > 1 ? `<div class="vj-text-xs" style="margin-top:1px;"><b>In your XI each season:</b> ${r.seasons.map((x, i) => `<span style="color:${x.inXi ? 'var(--vj-green)' : 'var(--vj-text-muted)'};">${i === 0 ? 'now' : x.age} ${x.inXi ? '\u2713' : '\u2717'}</span>`).join(' \u00B7 ')}</div>` : ''}
+                                        ${r.seasons && r.seasons.length && !(r.seasons.length === 1 && r.seasons[0].now) ? `<div class="vj-text-xs" style="margin-top:1px;"><b>In your senior XI each season:</b> ${r.seasons.map((x, i) => `<span style="color:${x.inXi ? 'var(--vj-green)' : 'var(--vj-text-muted)'};">${x.now ? 'now' : x.age} ${x.inXi ? '\u2713' : '\u2717'}</span>`).join(' \u00B7 ')}</div>` : ''}
                                         <div class="vj-text-xs" style="margin-top:1px;color:${col(r.at25Rank)};"><b>At 25:</b> #${r.at25Rank} of ${r.at25Of} ${role}s in your squad then${xi(r.at25Rank)} <span class="vj-text-muted">(proj ${r.proj})</span></div>`;
                                 })()}
                                 <details style="margin-top:2px;"><summary class="vj-text-xs vj-text-muted" style="cursor:pointer;">Details</summary>
@@ -12809,11 +12809,13 @@ const progMap = { batting: 'batting', bowling: 'bowling', keeping: 'keeperbattin
         const peersBase = squadPlayers.filter(p => p.name !== candidate.name && !(candidate.id != null && String(p.id) === String(candidate.id))
             && getPrimarySkillInfo(p).name === role);
         const out = [];
-        for (let k = 0; age0 + k < 25; k++) {
+        // Senior seasons only (20+): before that he plays in your youth XI,
+        // which the 'starts today' line already covers.
+        for (let k = Math.max(0, TRANSFER_MUST_START_AGE - age0); age0 + k < 25; k++) {
             const mine = projectedValueAfter(candidate, projOpts, k);
             const rank = 1 + peersBase.filter(p => (p.age || 0) + k <= FUTURE_SQUAD_MAX_AGE && projectedValueAfter(p, projOpts, k) > mine).length;
             const inXi = k === 0 && candidate._xiCheck ? candidate._xiCheck.some(x => x.starts) : rank <= slots;
-            out.push({ age: age0 + k, rank, inXi });
+            out.push({ age: age0 + k, rank, inXi, now: k === 0 });
         }
         return out;
     }
@@ -12824,7 +12826,7 @@ const progMap = { batting: 'batting', bowling: 'bowling', keeping: 'keeperbattin
         const seasons = p._xiSeasons && p._xiSeasons.length ? p._xiSeasons : (p._xiCheck ? [{ age: ageYears(p.age || 0) }] : []);
         if (!seasons.length) return { bonus: 0, text: '' };
         const nowShare = p._xiCheck ? p._xiCheck.filter(x => x.starts).length / p._xiCheck.length : (seasons[0].inXi ? 1 : 0);
-        const shares = seasons.map((x, i) => i === 0 ? nowShare : (x.inXi ? 1 : 0));
+        const shares = seasons.map((x, i) => i === 0 && (x.now !== false) ? nowShare : (x.inXi ? 1 : 0));
         const f = shares.reduce((a, b) => a + b, 0) / shares.length;
         const nowTxt = p._xiCheck ? `now ${p._xiCheck.filter(x => x.starts).map(x => x.format).join('+') || '\u2717'}` : `now ${seasons[0].inXi ? '\u2713' : '\u2717'}`;
         const text = [nowTxt].concat(seasons.slice(1).map(x => `${x.age} ${x.inXi ? '\u2713' : '\u2717'}`)).join(', ');
