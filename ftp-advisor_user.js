@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         FTP Advisor
 // @namespace    http://tampermonkey.net/
-// @version      8.157
+// @version      8.158
 // @description  Tactical/scouting advisor for fromthepavilion.org (cricket sim): team, tactics, pitch, training, transfer market, youth and squad plan advice with projections. Full changelog: github.com/Jadax/ftp-advisor
 // @author       Tushant Sharma
 // @license      MIT
@@ -3592,7 +3592,11 @@
         return Object.assign({}, prev || {}, {
             id: String(p.id), name: p.name, age: p.age, role: role.name, primary: role.value, bowlerType: p.bowlerType || '',
             proj: r ? r.proj : (p._dynastyCeiling ? Math.round(p._dynastyCeiling.ceiling) : null),
-            at25Rank: r ? r.at25Rank : null, star: p._overallRating ? Math.round(p._overallRating.score * 10) / 10 : null,
+            at25Rank: r ? r.at25Rank : null,
+            nowRank: r ? r.nowRank : null, nowOf: r ? r.nowOf : null, nowGroup: r ? r.nowGroup : null, xiGroup: r ? r.xiGroup : null,
+            xiNow: r && r.xi ? r.xi.filter(x => x.starts).map(x => x.format).join('+') : null,
+            seasons: r && r.seasons ? r.seasons.map(x => [x.age, x.inXi ? 1 : 0]) : null,
+            star: p._overallRating ? Math.round(p._overallRating.score * 10) / 10 : null,
             price: p.price || 0, deadlineTs: p.deadlineTs || (prev && prev.deadlineTs) || 0, clockV: 2,
             addedAt: (prev && prev.addedAt) || Date.now(), seenAt: Date.now()
         });
@@ -3649,7 +3653,10 @@
             return `<div class="ftp-rec low" style="padding:6px 8px;margin:4px 0;${ended ? 'opacity:.55;' : ''}">
                 <div class="vj-flex-between" style="gap:6px;"><span class="vj-fw-700" style="font-size:12px;">#${i + 1} <a href="${FTP_ORIGIN}/player.htm?playerId=${encodeURIComponent(e.id)}" target="_blank" rel="noopener" style="color:inherit;text-decoration:underline;">${e.name}</a> <span class="vj-text-xs vj-text-muted">(${formatAgeDisplay(e.age)})</span>${firstTag}</span>
                 <span style="display:flex;align-items:center;gap:4px;">${badge}<button class="ftp-sl-remove" data-sl="${escapeHtml(e.id)}" title="Remove from shortlist" style="border:none;background:none;cursor:pointer;font-size:14px;">\u2715</button></span></div>
-                <div class="vj-text-xs vj-text-muted">${e.bowlerType && e.role === 'bowling' ? e.bowlerType.toUpperCase() + ' ' : ''}${ROLE[e.role] || e.role} \u00B7 ${skillLabel(e.primary)}${e.proj != null ? ` \u00B7 proj ${e.proj} at 25${e.boughtAt ? '' : e.at25Rank ? ` (<span style="${e.at25Rank > (e.at25Cap || TRANSFER_MAX_AT25_RANK[e.role] || 3) ? 'color:var(--vj-red);font-weight:700;' : ''}">#${e.at25Rank} in your side${e.aheadOf && e.aheadOf.length ? ' — behind ' + e.aheadOf.join(', ') : ''}</span>)` : ''}` : ''}${e.star != null ? ` \u00B7 \u2605 ${e.star}` : ''}</div>
+                <div class="vj-text-xs vj-text-muted">${e.bowlerType && e.role === 'bowling' ? e.bowlerType.toUpperCase() + ' ' : ''}${ROLE[e.role] || e.role} \u00B7 ${skillLabel(e.primary)}${e.star != null ? ` \u00B7 \u2605 ${e.star}` : ''}</div>
+                ${e.nowRank != null && !e.boughtAt ? `<div class="vj-text-xs"><b>Now:</b> #${e.nowRank} of ${e.nowOf} ${e.nowGroup} ${ROLE[e.role] || e.role}s${e.xiNow != null ? ` \u00B7 ${e.xiNow ? `<span style="color:var(--vj-green);">starts in your ${e.xiGroup || ''} XI (${e.xiNow})</span>` : `<span class="vj-text-muted">not in your ${e.xiGroup || ''} XI today</span>`}` : ''}</div>` : ''}
+                ${e.seasons && e.seasons.length > 1 && !e.boughtAt ? `<div class="vj-text-xs"><b>In your XI each season:</b> ${e.seasons.map(([a, inXi], i) => `<span style="color:${inXi ? 'var(--vj-green)' : 'var(--vj-text-muted)'};">${i === 0 ? 'now' : a} ${inXi ? '\u2713' : '\u2717'}</span>`).join(' \u00B7 ')}</div>` : ''}
+                ${e.proj != null ? `<div class="vj-text-xs"><b>At 25:</b> proj ${e.proj}${e.boughtAt ? '' : e.at25Rank ? ` \u00B7 <span style="${e.at25Rank > (e.at25Cap || TRANSFER_MAX_AT25_RANK[e.role] || 3) ? 'color:var(--vj-red);font-weight:700;' : ''}">#${e.at25Rank} in your side then${e.aheadOf && e.aheadOf.length ? ' \u2014 behind ' + e.aheadOf.join(', ') : ''}</span>` : ''}</div>` : ''}
                 <div class="vj-text-xs" style="color:${ended ? 'var(--vj-text-muted)' : soon ? 'var(--vj-red)' : 'var(--vj-text)'};">\u23F1 ${e.deadlineTs ? deadlineText(e.deadlineTs) : 'deadline unknown'} \u00B7 bid $${(e.price || 0).toLocaleString()} <span class="vj-text-muted">(as of ${new Date(e.seenAt || e.addedAt).toLocaleString(undefined, { day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit' })})</span></div>
             </div>`;
         }).join('') + '<div class="vj-text-xs vj-text-muted vj-mt-4">Bids and deadlines update whenever the player turns up in a market scan.</div></details>';
@@ -10554,7 +10561,7 @@ const progMap = { batting: 'batting', bowling: 'bowling', keeping: 'keeperbattin
             if (proj < MIN_PROJECTION_AT_25) problems.push(`${p.name} shown projecting ${Math.round(proj)} (under ${MIN_PROJECTION_AT_25})`);
             const rr = at25RoleRank(p, allPlayers, projOpts);
             if (rr.rank > rr.cap) problems.push(`${p.name} shown as #${rr.rank} ${rr.role} (cap ${rr.cap})`);
-            if (ageYears(p.age || 0) >= TRANSFER_MUST_START_AGE && p._xiCheck && p._overallRating && p._overallRating._startsBonus !== p._xiCheck.filter(x => x.starts).length * STARTS_NOW_BONUS) problems.push(`${p.name}: starts-now bonus out of step with his XI check`);
+            if (ageYears(p.age || 0) >= TRANSFER_MUST_START_AGE && p._xiCheck && p._overallRating && p._overallRating._startsBonus !== startsBonusFor(p).bonus) problems.push(`${p.name}: plays-in-your-XI bonus out of step with his season check`);
             if (i < 25) {
                 const fresh = computePlayerCeiling(p, getAcademySpeedForPlayer(p, projOpts.academyInfo), projOpts.squadContext || {}, 25).ceiling;
                 if (Math.abs(fresh - proj) > 0.01) problems.push(`${p.name}: stored projection ${proj} vs fresh ${fresh}`);
@@ -11372,9 +11379,10 @@ const progMap = { batting: 'batting', bowling: 'bowling', keeping: 'keeperbattin
                         seniorCeiling: dynastyCeiling
                     });
                     // Fetched 20+ only (pre-fetch skills/talents are partial).
-                    p._xiCheck = undefined;
+                    p._xiCheck = undefined; p._xiSeasons = undefined;
                     if (ageYears(p.age || 0) >= TRANSFER_MUST_START_AGE && ((p.experience || 0) > 0 || (p.wage || 0) > 0)) {
                         try { p._xiCheck = startingXiCheck(p, allPlayers); } catch (err) { p._xiCheck = null; }
+                        try { p._xiSeasons = xiSeasons(p, allPlayers, projOpts); } catch (err) { p._xiSeasons = null; }
                         applyStartsNowBonus(p);
                     }
                     return p;
@@ -11712,6 +11720,7 @@ const progMap = { batting: 'batting', bowling: 'bowling', keeping: 'keeperbattin
                                         ${p.deadlineTs ? `<div class="vj-text-xs vj-fw-700" style="margin-top:2px;color:${p.deadlineTs - Date.now() < 6 * 3600e3 ? 'var(--vj-red)' : 'var(--vj-text)'};">\u23F1 ${deadlineText(p.deadlineTs)}</div>` : ''}
                                         <div class="vj-text-xs" style="margin-top:2px;color:${r.xi ? (startsNow ? 'var(--vj-green)' : 'var(--vj-text-muted)') : col(r.nowRank)};"><b>Now:</b> #${r.nowRank} of ${r.nowOf} ${r.nowGroup} ${role}s${r.xi ? '' : xi(r.nowRank)}${r.seniorSoon != null ? ` <span class="vj-text-muted">(turns 21 in ${r.seniorSoon} wk${r.seniorSoon === 1 ? '' : 's'} — a senior buy)</span>` : ''}${pending}</div>
                                         ${r.xi ? `<div class="vj-text-xs" style="margin-top:1px;"><b>Starts in your ${r.xiGroup} XI today:</b> ${xiLine}</div>` : ''}
+                                        ${r.seasons && r.seasons.length > 1 ? `<div class="vj-text-xs" style="margin-top:1px;"><b>In your XI each season:</b> ${r.seasons.map((x, i) => `<span style="color:${x.inXi ? 'var(--vj-green)' : 'var(--vj-text-muted)'};">${i === 0 ? 'now' : x.age} ${x.inXi ? '\u2713' : '\u2717'}</span>`).join(' \u00B7 ')}</div>` : ''}
                                         <div class="vj-text-xs" style="margin-top:1px;color:${col(r.at25Rank)};"><b>At 25:</b> #${r.at25Rank} of ${r.at25Of} ${role}s in your squad then${xi(r.at25Rank)} <span class="vj-text-muted">(proj ${r.proj})</span></div>`;
                                 })()}
                                 <details style="margin-top:2px;"><summary class="vj-text-xs vj-text-muted" style="cursor:pointer;">Details</summary>
@@ -12773,14 +12782,62 @@ const progMap = { batting: 'batting', bowling: 'bowling', keeping: 'keeperbattin
     const STAR_PER_PROJECTION_POINT = 55 / 80; // ★ quality term: full 55 at an 80 projection
     const TRANSFER_MUST_START_AGE = 20;
     const STARTS_NOW_BONUS = Math.floor(TRANSFER_UPGRADE_MARGIN * STAR_PER_PROJECTION_POINT / 2 * 0.85 * 100) / 100; // 0.85: the quality term is rounded to 0.1, so a 2-point gap can show as only 1.3
+    // Value-sum after `yearsAhead` years, replayed from the player's one
+    // to-25 simulation (its logged level-ups), so ranking every season costs
+    // no extra simulation.
+    function projectedValueAfter(player, projOpts, yearsAhead) {
+        const c = projectionAt25(player, projOpts);
+        if (!c || !c.weeks || !c.plan) return c ? c.current : computePlayerValueSkillSum(player);
+        const w = Math.round(yearsAhead * 14);
+        if (w <= 0) return c.current;
+        if (w >= c.weeks) return c.ceiling;
+        const s = Object.assign({}, player);
+        (c.plan.levelUps || []).forEach(u => { if (u.week <= w) s[u.skill] = u.newLevel; });
+        const e0 = player.experience || 0;
+        const e1 = c.projectedSkills && c.projectedSkills.experience != null ? c.projectedSkills.experience : e0;
+        s.experience = Math.round(e0 + (e1 - e0) * w / c.weeks);
+        return computePlayerValueSkillSum(s);
+    }
+    // Every season from his current age-year to 24: would he be in your XI
+    // (top TRANSFER_XI_SLOTS of his role, your squad projected the same
+    // years ahead)? User 2026-11-20: 'between 20-25 I still need them to
+    // play'. Season 0 uses the real selector (_xiCheck) when it ran.
+    function xiSeasons(candidate, squadPlayers, projOpts) {
+        const role = getPrimarySkillInfo(candidate).name;
+        const slots = TRANSFER_XI_SLOTS[role] || 5;
+        const age0 = ageYears(candidate.age || 0);
+        const peersBase = squadPlayers.filter(p => p.name !== candidate.name && !(candidate.id != null && String(p.id) === String(candidate.id))
+            && getPrimarySkillInfo(p).name === role);
+        const out = [];
+        for (let k = 0; age0 + k < 25; k++) {
+            const mine = projectedValueAfter(candidate, projOpts, k);
+            const rank = 1 + peersBase.filter(p => (p.age || 0) + k <= FUTURE_SQUAD_MAX_AGE && projectedValueAfter(p, projOpts, k) > mine).length;
+            const inXi = k === 0 && candidate._xiCheck ? candidate._xiCheck.some(x => x.starts) : rank <= slots;
+            out.push({ age: age0 + k, rank, inXi });
+        }
+        return out;
+    }
+    // The bonus scales with the share of seasons to 25 he'd play (today
+    // counted per format), capped at 2 x STARTS_NOW_BONUS — still under a
+    // 2-point projection gap, so the projection keeps deciding.
+    function startsBonusFor(p) {
+        const seasons = p._xiSeasons && p._xiSeasons.length ? p._xiSeasons : (p._xiCheck ? [{ age: ageYears(p.age || 0) }] : []);
+        if (!seasons.length) return { bonus: 0, text: '' };
+        const nowShare = p._xiCheck ? p._xiCheck.filter(x => x.starts).length / p._xiCheck.length : (seasons[0].inXi ? 1 : 0);
+        const shares = seasons.map((x, i) => i === 0 ? nowShare : (x.inXi ? 1 : 0));
+        const f = shares.reduce((a, b) => a + b, 0) / shares.length;
+        const nowTxt = p._xiCheck ? `now ${p._xiCheck.filter(x => x.starts).map(x => x.format).join('+') || '\u2717'}` : `now ${seasons[0].inXi ? '\u2713' : '\u2717'}`;
+        const text = [nowTxt].concat(seasons.slice(1).map(x => `${x.age} ${x.inXi ? '\u2713' : '\u2717'}`)).join(', ');
+        return { bonus: Math.round(2 * STARTS_NOW_BONUS * f * 100) / 100, text };
+    }
     function applyStartsNowBonus(p) {
         const r = p._overallRating;
-        if (!r || r._startsBonus != null || !p._xiCheck) return;
-        const n = p._xiCheck.filter(x => x.starts).length;
-        r._startsBonus = n * STARTS_NOW_BONUS;
-        if (!n) return;
-        r.score = Math.min(100, Math.round((r.score + r._startsBonus) * 10) / 10);
-        if (Array.isArray(r.breakdown)) r.breakdown.push(`Starts in your senior XI today (${p._xiCheck.filter(x => x.starts).map(x => x.format).join(' + ')}) +${r._startsBonus}`);
+        if (!r || r._startsBonus != null || !(p._xiCheck || p._xiSeasons)) return;
+        const { bonus, text } = startsBonusFor(p);
+        r._startsBonus = bonus;
+        if (!bonus) return;
+        r.score = Math.min(100, Math.round((r.score + bonus) * 10) / 10);
+        if (Array.isArray(r.breakdown)) r.breakdown.push(`Plays in your senior XI to 25 (${text}) +${bonus}`);
     }
     function xiGroupIsSenior(age) { return joinsAsSenior(age) || ageYears(age || 0) >= TRANSFER_MUST_START_AGE; }
     function startingXiCheck(candidate, squadPlayers) {
@@ -12861,6 +12918,7 @@ const progMap = { batting: 'batting', bowling: 'bowling', keeping: 'keeperbattin
             proj: Math.round(cand.ceiling),
             seniorSoon: isYouthAge(candidate.age) && !youth ? weeksToAge(candidate.age, 21) : null,
             xiGroup: xiGroupIsSenior(candidate.age) ? 'senior' : 'youth',
+            seasons: candidate._xiSeasons || (() => { try { return xiSeasons(candidate, squadPlayers, projOpts); } catch (e) { return null; } })(),
             xi: candidate._xiCheck || (() => { try { return startingXiCheck(candidate, squadPlayers); } catch (e) { console.warn('[FTP Transfer] XI check failed', e); return null; } })()
         };
     }
@@ -12963,7 +13021,9 @@ const progMap = { batting: 'batting', bowling: 'bowling', keeping: 'keeperbattin
         // so the two views show one star (live: Workman 68.1 here vs 69.3).
         if (player.id != null && !squadPlayers.some(p => String(p.id) === String(player.id)) && ageYears(player.age || 0) >= TRANSFER_MUST_START_AGE) {
             player._overallRating = overallRating;
+            player._dynastyCeiling = dynastyCeiling;
             try { player._xiCheck = startingXiCheck(player, squadPlayers); } catch (e) { player._xiCheck = null; }
+            try { player._xiSeasons = xiSeasons(player, squadPlayers, { academyInfo, squadContext }); } catch (e) { player._xiSeasons = null; }
             applyStartsNowBonus(player);
         }
 
